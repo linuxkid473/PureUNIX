@@ -164,8 +164,4 @@ calculator
 - LFN (long filename) support in the FAT16 driver
 - Dynamic heap expansion through VMM
 
----
 
-## License
-
-No license file is currently included. All rights reserved by the author unless otherwise noted.
