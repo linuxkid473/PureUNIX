@@ -1,52 +1,223 @@
 # Developer Guide
 
-## Directory Map
+## Coding Style
 
-- `boot/`: Multiboot headers, bootstrap assembly, linker script, GRUB config
-- `arch/i386/`: x86 descriptor tables, interrupts, PIC/PIT, syscalls, context switch
-- `kernel/`: main kernel services, memory, heap, tasks, ELF loader, panic/reboot
-- `drivers/`: VGA, keyboard, ATA
-- `fs/`: VFS and FAT16
-- `libc/`: freestanding C helpers
-- `shell/`: parser, line editor, built-ins, shell executor
-- `editor/`: terminal text editor
-- `user/`: demo ELF programs and tiny syscall library
-- `tools/`: host-side FAT16 image builder
-- `docs/`: architecture and developer documentation
+- C99 with GCC extensions (`-std=gnu99`).
+- 4-space indentation; no tabs in C files.
+- Function names: `module_verb_noun` (e.g., `fat16_read_file`, `pit_sleep`).
+- Struct types: `snake_case_t`.
+- Enum constants: `ALL_CAPS`.
+- `#define` constants: `ALL_CAPS`, prefixed with module name.
+- Header guards: `__PUREUNIX_MODULE_H__`.
+- Kernel-only declarations guarded with `#ifdef __PUREUNIX_KERNEL__`.
+- No dynamic dispatch; function pointers only where unavoidable (VFS, disk_device_t).
 
-## Milestones
+---
 
-1. Bootloader: Multiboot2 header and `_start`.
-2. VGA output: text terminal, scrolling, cursor, ANSI basics.
-3. GDT/IDT: protected-mode descriptors and interrupt dispatch.
-4. Keyboard: IRQ1 scancode driver and key queue.
-5. Memory manager: Multiboot memory map parsing and frame bitmap.
-6. Paging: identity-mapped 32-bit paging.
-7. Heap: splitting/coalescing allocator.
-8. ATA driver: primary-master PIO sector I/O.
-9. FAT16: writable 8.3 filesystem with directories.
-10. Shell: parser, history, completion, redirection, built-ins.
-11. System calls: `int 0x80` ABI.
-12. ELF loader: ELF32 `PT_LOAD` support for demos.
-13. Multitasking: cooperative task structures and context switch.
-14. Text editor: Nano-like terminal editor.
-15. Userland utilities: seeded ELF demos in `/bin`.
+## Adding a Device Driver
 
-## Design Decisions
+1. Create `drivers/<name>.c` and `include/pureunix/<name>.h`.
+2. Write an init function (`<name>_init()`).
+3. If the driver needs an IRQ:
+   - Register with `idt_set_irq_handler(irq_num, handler_fn)` (or call `idt_register_irq` if that wrapper exists — check `arch/i386/idt.c`).
+   - Enable the IRQ line with `irq_enable(irq_num)` from `arch/i386/pic.c`.
+4. Call `<name>_init()` from `kernel/main.c` in the appropriate sequence (after `arch_init()` for hardware access, after `heap_init()` if the driver needs `kmalloc`).
+5. Add the new `.c` file to one of the directories already included in the Makefile's `find` glob (`drivers/` is already covered).
 
-- Keep architecture-specific code under `arch/i386` to leave room for `arch/x86_64`.
-- Use QEMU direct kernel loading for rapid local development, while preserving GRUB Multiboot2 compatibility.
-- Start with identity paging so hardware drivers and early ELF loading are easy to reason about.
-- Implement FAT16 before a richer VFS because it gives immediate persistent shell behavior.
-- Use 8.3 filenames first; long filenames require checksum-linked LFN slots and are best added after the core filesystem is stable.
-- Keep ELF demos simple until ring 3, per-process page tables, and process file descriptors are added.
+No Makefile changes are needed; the build discovers all `.c` files under `kernel/`, `arch/`, `drivers/`, `fs/`, `libc/`, `shell/`, and `editor/` automatically.
 
-## Next Work
+---
 
-- Add ring 3 transitions with TSS and user segments.
-- Give each process a page directory.
-- Replace in-memory shell pipelines with stream/file-descriptor based pipes.
-- Add preemptive scheduling from the PIT tick.
-- Implement FAT long filename create/read support.
-- Add a serial console and automated boot smoke tests.
+## Adding a System Call
 
+1. Add a new constant to `include/pureunix/syscall.h`:
+   ```c
+   SYS_<NAME> = <next_number>,
+   ```
+2. Add a case to `syscall_dispatch` in `arch/i386/syscall.c`. The function returns `uint32_t`; use `return` not `break`:
+   ```c
+   case SYS_<NAME>: {
+       /* read args from regs->ebx, regs->ecx, regs->edx */
+       return (uint32_t)<result>;
+   }
+   ```
+3. If the syscall is called from user programs, add a wrapper to `user/libpure.c` and declare it in `user/libpure.h`. All wrappers go through the shared `syscall3` helper — no new inline assembly needed.
+4. Mirror the same constant in `user/libpure.h` (the `SYS_*` defines are duplicated there because user programs cannot include kernel headers).
+
+The INT 0x80 gate is already installed with DPL=3; no IDT changes are required for new syscall numbers.
+
+---
+
+## Adding a Shell Built-in
+
+1. Write a function with the signature:
+   ```c
+   static int cmd_<name>(shell_context_t *ctx, shell_command_t *cmd,
+                          const char *input, shell_output_t *out);
+   ```
+2. Add an entry to the `builtins[]` table in `shell/builtins.c`:
+   ```c
+   { "<name>", "<one-line description>", cmd_<name> },
+   ```
+3. All output must go through `shell_out_printf` or `shell_out_puts` — do not call `vga_write` directly. This is required for pipeline output to work correctly.
+4. Access arguments via `cmd->argv[0..argc-1]` and `cmd->argc`.
+
+---
+
+## Adding a User Program
+
+1. Create `user/<name>.c`. Include `user/libpure.h` for the runtime library.
+2. Write a `main(void)` function returning `int`.
+3. Add the program name to `USER_PROGRAMS` in `Makefile`:
+   ```makefile
+   USER_PROGRAMS := hello calc viewer editor sh <name>
+   ```
+4. `make` will compile, link, and include it in the FAT16 image under `/BIN/<NAME>.ELF`.
+
+**Constraints**:
+- No standard library. Only `libpure` functions are available.
+- Programs run in kernel address space with no memory protection.
+- File I/O is `O_RDONLY` only. `pu_open`, `pu_close`, `pu_lseek`, and `pu_stat` work; writing to an open fd via syscall is not yet implemented.
+- Stack is the kernel boot stack; deep recursion may corrupt kernel data.
+
+---
+
+## Initialization Order
+
+The `kernel_main` function in `kernel/main.c` initializes subsystems in this order:
+
+```
+serial_init()       # COM1; needed for early debug output
+vga_init()          # text mode; screen cleared
+arch_init()         # GDT + IDT installed; interrupts still disabled
+pmm_init()          # parses Multiboot memory map; bitmap populated
+vmm_init()          # paging enabled
+heap_init()         # kmalloc available after this point
+tasking_init()      # initial "kernel" task created
+syscall_init()      # INT 0x80 gate installed
+pit_init(100)       # IRQ0 handler registered; 100 Hz tick counter
+keyboard_init()     # IRQ1 handler registered
+ata_init()          # ATA probed; IRQ14 registered
+vfs_init()          # VFS state initialized (no disk yet)
+fat16_mount()       # filesystem mounted on ATA primary master
+arch_enable_interrupts()  # STI; hardware interrupts now active
+shell_run()         # interactive shell loop; never returns
+```
+
+Subsystems may not be called out of order. In particular:
+- `kmalloc` before `heap_init()` will dereference null.
+- `irq_enable` before `arch_init()` will modify an uninitialized IDT.
+- `shell_run` before `arch_enable_interrupts()` will hang on the first keyboard read.
+
+---
+
+## Memory Regions
+
+| Range | Owner |
+|---|---|
+| `0x00000000–0x000FFFFF` | BIOS/VGA/reserved; PMM never allocates here |
+| `0x00100000–__kernel_end` | Kernel image; PMM marks as used |
+| `__kernel_end – __kernel_end+4MB` | Kernel heap (fixed 8 MiB) |
+| `0x00400000–0x006FFFFF` | ELF user program load range |
+| `0x00B8000` | VGA framebuffer (within identity-mapped 128 MiB) |
+
+---
+
+## Debugging
+
+### Serial Console
+
+Run QEMU with `-serial stdio` (already in `make run`). All VGA output is mirrored to COM1 at 38400 baud. Serial output can be redirected:
+
+```sh
+make run 2>/dev/null | tee boot.log
+```
+
+### Kernel Panics
+
+`panic(fmt, ...)` in `kernel/panic.c`:
+- Disables interrupts.
+- Writes white-on-red text to VGA.
+- Writes the same text to serial.
+- Halts indefinitely.
+
+QEMU's `-no-reboot -no-shutdown` prevents the window from closing on a triple fault.
+
+### GDB
+
+QEMU supports remote GDB:
+
+```sh
+qemu-system-i386 \
+    -m 128M \
+    -kernel build/pureunix.elf \
+    -drive file=build/pureunix.img,format=raw,if=ide,index=0 \
+    -serial stdio \
+    -no-reboot -no-shutdown \
+    -s -S
+```
+
+`-s`: listens on `localhost:1234` for GDB.  
+`-S`: pauses CPU at startup until GDB connects.
+
+Connect with:
+
+```sh
+gdb build/pureunix.elf
+(gdb) target remote localhost:1234
+(gdb) break kernel_main
+(gdb) continue
+```
+
+The ELF has debug symbols if compiled without stripping (the Makefile does not strip).
+
+---
+
+## Known Pitfalls
+
+### No User/Kernel Separation
+
+User ELF programs run at ring 0 in the kernel address space. A bad pointer in a user program corrupts kernel data structures. There is no page fault handler for user errors.
+
+### Stack Overflow in Tasks
+
+Task stacks are 16 KiB with no guard page. Deep recursion or large stack frames silently overwrite adjacent heap blocks. The heap magic value (`0xC0FFEE42`) in adjacent `heap_block_t` headers may be used to detect corruption manually.
+
+### Cooperative Scheduling Only
+
+The PIT IRQ0 handler only increments `ticks`. A task that does not call `task_yield()` holds the CPU indefinitely. Any blocking loop without a yield will hang the system.
+
+### SYS_EXIT Does Not Kill the Task
+
+Calling `syscall3(SYS_EXIT, code, 0, 0)` returns `code` from `syscall_dispatch` but does not terminate or zombie the current task. The task continues executing. Programs relying on `exit()` semantics must explicitly avoid this.
+
+### 8MB Heap, No Growth
+
+The heap is fixed at 8 MiB starting at `__kernel_end`. Large `kmalloc` calls will fail (return null) if the heap is exhausted. There is no `sbrk` or heap extension.
+
+### FAT16 8.3 Only
+
+Filenames longer than 8 characters or extensions longer than 3 characters are truncated or rejected by `name_to_83`. Files created by other OS tools with LFN entries will be ignored (their LFN slots are skipped; only the 8.3 short entry is used if present).
+
+### Single-Level Undo in Editor
+
+The editor (`editor/editor.c`) keeps only one undo level. After a second edit, the previous undo state is permanently lost.
+
+---
+
+## Testing
+
+There is no automated test suite. Manual testing procedure:
+
+1. `make` — verify zero errors and zero warnings.
+2. `make run` — observe boot sequence on serial output and VGA.
+3. At the shell prompt:
+   - `help` — verify builtin list appears.
+   - `ls /` — verify FAT16 root is readable.
+   - `cat /README.TXT` — verify file read works.
+   - `echo hello > /test.txt && cat /test.txt` — verify write and pipeline.
+   - `/bin/hello.elf` — verify ELF execution.
+   - `/bin/opentest.elf` — verify file syscalls; all lines should end in `OK`, `fd=3`, or expected negative error codes.
+   - `ps` — verify task list.
+   - `vim /test.txt` — verify editor opens and `:q` exits.
+   - `reboot` — verify reboot via keyboard controller.

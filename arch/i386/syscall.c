@@ -1,8 +1,14 @@
 #include <pureunix/arch.h>
+#include <pureunix/errno.h>
+#include <pureunix/fcntl.h>
 #include <pureunix/keyboard.h>
+#include <pureunix/memory.h>
+#include <pureunix/stat.h>
 #include <pureunix/stdio.h>
+#include <pureunix/string.h>
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
+#include <pureunix/vfs.h>
 
 void syscall_init(void)
 {
@@ -18,7 +24,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         const char *buf = (const char *)regs->ecx;
         size_t len = regs->edx;
         if (fd != 1 && fd != 2) {
-            return (uint32_t)-1;
+            return (uint32_t)-EBADF;
         }
         for (size_t i = 0; i < len; ++i) {
             putchar(buf[i]);
@@ -30,7 +36,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         char *buf = (char *)regs->ecx;
         size_t len = regs->edx;
         if (fd != 0) {
-            return (uint32_t)-1;
+            return (uint32_t)-EBADF;
         }
         size_t i = 0;
         while (i < len) {
@@ -50,6 +56,112 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     case SYS_YIELD:
         task_yield();
         return 0;
+    case SYS_OPEN: {
+        const char *path  = (const char *)regs->ebx;
+        int         flags = (int)regs->ecx;
+
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        /* Only O_RDONLY is implemented. */
+        if (flags != O_RDONLY) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+
+        vfs_stat_t st;
+        if (vfs_stat(path, &st) != 0) {
+            return (uint32_t)-ENOENT;
+        }
+        if (st.type != VFS_FILE) {
+            return (uint32_t)-EISDIR;
+        }
+
+        task_t *t = task_current();
+        int fd = -1;
+        for (int i = 3; i < MAX_OPEN_FILES; i++) {
+            if (!t->fds[i].used) {
+                fd = i;
+                break;
+            }
+        }
+        if (fd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+
+        uint8_t *data = NULL;
+        size_t   size = 0;
+        if (vfs_read_file(path, &data, &size) != 0) {
+            return (uint32_t)-ENOENT;
+        }
+
+        t->fds[fd].used   = true;
+        t->fds[fd].data   = data;
+        t->fds[fd].size   = size;
+        t->fds[fd].offset = 0;
+        strncpy(t->fds[fd].path, path, PUREUNIX_MAX_PATH - 1);
+        t->fds[fd].path[PUREUNIX_MAX_PATH - 1] = '\0';
+
+        return (uint32_t)fd;
+    }
+    case SYS_CLOSE: {
+        int fd = (int)regs->ebx;
+        task_t *t = task_current();
+        if (fd < 3 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        kfree(t->fds[fd].data);
+        memset(&t->fds[fd], 0, sizeof(t->fds[fd]));
+        return 0;
+    }
+    case SYS_LSEEK: {
+        int fd     = (int)regs->ebx;
+        int offset = (int)regs->ecx;
+        int whence = (int)regs->edx;
+        task_t *t = task_current();
+        if (fd < 3 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        int new_offset;
+        switch (whence) {
+        case SEEK_SET:
+            new_offset = offset;
+            break;
+        case SEEK_CUR:
+            new_offset = (int)t->fds[fd].offset + offset;
+            break;
+        case SEEK_END:
+            new_offset = (int)t->fds[fd].size + offset;
+            break;
+        default:
+            return (uint32_t)-EINVAL;
+        }
+        if (new_offset < 0) {
+            return (uint32_t)-EINVAL;
+        }
+        t->fds[fd].offset = (size_t)new_offset;
+        return (uint32_t)new_offset;
+    }
+    case SYS_STAT: {
+        const char *path = (const char *)regs->ebx;
+        struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
+        if (!path || !st) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        vfs_stat_t vst;
+        if (vfs_stat(path, &vst) != 0) {
+            return (uint32_t)-ENOENT;
+        }
+        st->st_size = vst.size;
+        st->st_type = (uint32_t)vst.type;
+        st->st_attr = vst.mode;
+        return 0;
+    }
     default:
         return (uint32_t)-1;
     }

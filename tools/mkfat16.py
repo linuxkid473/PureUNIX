@@ -11,6 +11,28 @@ FATS = 2
 ROOT_ENTRIES = 512
 MEDIA = 0xF8
 
+# Short-name aliases for docs files (8.3 limit)
+DOC_ALIASES = {
+    "architecture.md": "ARCH.MD",
+    "boot.md":         "BOOT.MD",
+    "memory.md":       "MEMORY.MD",
+    "interrupts.md":   "INTRS.MD",
+    "scheduler.md":    "SCHED.MD",
+    "filesystem.md":   "FS.MD",
+    "syscalls.md":     "SYSCALL.MD",
+    "drivers.md":      "DRIVERS.MD",
+    "shell.md":        "SHELL.MD",
+    "userland.md":     "USERLAND.MD",
+    "build.md":        "BUILD.MD",
+    "developer-guide.md": "DEVGUIDE.MD",
+    "project-layout.md":  "LAYOUT.MD",
+    # api/ subdirectory
+    "README.md":  "README.MD",
+    "task.md":    "TASK.MD",
+    "vfs.md":     "VFS.MD",
+    "libc.md":    "LIBC.MD",
+}
+
 
 def le16(x):
     return struct.pack("<H", x)
@@ -141,6 +163,14 @@ class Fat16:
         self.put_entry(cluster, 1, self.dir_entry("..", 0x10, 0, 0))
         return cluster
 
+    def mkdir_sub(self, parent_cluster, name):
+        cluster = self.alloc_chain(bytes(SPC * SECTOR))
+        self.put_entry(parent_cluster, self.next_dir_index(parent_cluster),
+                       self.dir_entry(name, 0x10, cluster, 0))
+        self.put_entry(cluster, 0, self.dir_entry(".", 0x10, cluster, 0))
+        self.put_entry(cluster, 1, self.dir_entry("..", 0x10, parent_cluster, 0))
+        return cluster
+
     def next_root_index(self):
         root = self.sector_off(self.root_sector)
         for i in range(ROOT_ENTRIES):
@@ -157,7 +187,8 @@ class Fat16:
 
     def add_file(self, dir_cluster, name, data):
         cluster = self.alloc_chain(data)
-        self.put_entry(dir_cluster, self.next_dir_index(dir_cluster), self.dir_entry(name, 0x20, cluster, len(data)))
+        self.put_entry(dir_cluster, self.next_dir_index(dir_cluster),
+                       self.dir_entry(name, 0x20, cluster, len(data)))
 
     def add_root_file(self, name, data):
         cluster = self.alloc_chain(data)
@@ -168,31 +199,92 @@ class Fat16:
             f.write(self.image)
 
 
+def add_docs(image, docs_dir):
+    """Add docs/ tree to /DOCS/ on the image."""
+    docs_cluster = image.mkdir_root("DOCS")
+
+    # Build index listing short names -> description
+    index_lines = [
+        b"PureUnix documentation\r\n",
+        b"cat /docs/<file> to read\r\n",
+        b"\r\n",
+        b"DOCS/\r\n",
+    ]
+
+    # Top-level .md files
+    for fname in sorted(os.listdir(docs_dir)):
+        fpath = os.path.join(docs_dir, fname)
+        if os.path.isfile(fpath) and fname.endswith(".md"):
+            short = DOC_ALIASES.get(fname, image.name83(fname).strip().replace("       ", "."))
+            with open(fpath, "rb") as f:
+                data = f.read()
+            # Normalize line endings to CRLF so the VGA terminal displays cleanly
+            data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            image.add_file(docs_cluster, short, data)
+            index_lines.append(f"  {short:<12} {fname}\r\n".encode())
+
+    # api/ subdirectory
+    api_src = os.path.join(docs_dir, "api")
+    if os.path.isdir(api_src):
+        api_cluster = image.mkdir_sub(docs_cluster, "API")
+        index_lines.append(b"DOCS/API/\r\n")
+        for fname in sorted(os.listdir(api_src)):
+            fpath = os.path.join(api_src, fname)
+            if os.path.isfile(fpath) and fname.endswith(".md"):
+                short = DOC_ALIASES.get(fname, image.name83(fname).strip().replace("       ", "."))
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                image.add_file(api_cluster, short, data)
+                index_lines.append(f"  {short:<12} api/{fname}\r\n".encode())
+
+    image.add_file(docs_cluster, "INDEX.TXT", b"".join(index_lines))
+
+
 def main(argv):
     if len(argv) < 2:
-        print("usage: mkfat16.py OUT.img [program.elf ...]", file=sys.stderr)
+        print("usage: mkfat16.py OUT.img [--docs DIR] [program.elf ...]", file=sys.stderr)
         return 2
     out = argv[1]
+    rest = argv[2:]
+
+    docs_dir = None
+    programs = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--docs" and i + 1 < len(rest):
+            docs_dir = rest[i + 1]
+            i += 2
+        else:
+            programs.append(rest[i])
+            i += 1
+
     image = Fat16()
     image.add_root_file(
         "README.TXT",
-        b"PureUnix FAT16 root filesystem\n"
-        b"Commands: help, ls, cat, touch, mkdir, rm, nano, hello, calc\n"
-        b"FAT16 names are limited to 8.3 in this milestone.\n",
+        b"PureUnix FAT16 root filesystem\r\n"
+        b"Commands: help, ls, cat, touch, mkdir, rm, vim, hello, calc\r\n"
+        b"FAT16 names are limited to 8.3 in this milestone.\r\n"
+        b"Type: cat /docs/INDEX.TXT  for a list of documentation files.\r\n",
     )
     bin_cluster = image.mkdir_root("BIN")
     aliases = {
-        "calc.elf": "CALC.ELF",
-        "hello.elf": "HELLO.ELF",
+        "calc.elf":   "CALC.ELF",
+        "hello.elf":  "HELLO.ELF",
         "viewer.elf": "VIEWER.ELF",
         "editor.elf": "EDITOR.ELF",
-        "sh.elf": "SH.ELF",
+        "sh.elf":     "SH.ELF",
     }
-    for program in argv[2:]:
+    for program in programs:
         base = os.path.basename(program).lower()
         name = aliases.get(base, base.upper())
         with open(program, "rb") as f:
             image.add_file(bin_cluster, name, f.read())
+
+    if docs_dir and os.path.isdir(docs_dir):
+        add_docs(image, docs_dir)
+        print(f"added docs from {docs_dir}")
+
     image.write(out)
     print(f"created {out}: FAT16 {TOTAL_SECTORS * SECTOR // (1024 * 1024)} MiB")
     return 0

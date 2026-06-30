@@ -9,12 +9,32 @@ static int syscall3(int n, int a, int b, int c)
 
 int pu_write(int fd, const char *buf, size_t len)
 {
-    return syscall3(2, fd, (int)buf, (int)len);
+    return syscall3(SYS_WRITE, fd, (int)buf, (int)len);
 }
 
 int pu_read(int fd, char *buf, size_t len)
 {
-    return syscall3(3, fd, (int)buf, (int)len);
+    return syscall3(SYS_READ, fd, (int)buf, (int)len);
+}
+
+int pu_open(const char *path, int flags)
+{
+    return syscall3(SYS_OPEN, (int)path, flags, 0);
+}
+
+int pu_close(int fd)
+{
+    return syscall3(SYS_CLOSE, fd, 0, 0);
+}
+
+int pu_lseek(int fd, int offset, int whence)
+{
+    return syscall3(SYS_LSEEK, fd, offset, whence);
+}
+
+int pu_stat(const char *path, struct stat *st)
+{
+    return syscall3(SYS_STAT, (int)path, (int)st, 0);
 }
 
 size_t pu_strlen(const char *s)

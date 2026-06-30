@@ -19,6 +19,14 @@ static void task_bootstrap(void)
     task_exit();
 }
 
+static void reserve_stdio(task_t *task)
+{
+    /* fds 0/1/2 are stdin/stdout/stderr; handled by SYS_READ/SYS_WRITE */
+    task->fds[0].used = true;
+    task->fds[1].used = true;
+    task->fds[2].used = true;
+}
+
 void tasking_init(void)
 {
     memset(&main_task, 0, sizeof(main_task));
@@ -26,6 +34,7 @@ void tasking_init(void)
     strcpy(main_task.name, "kernel");
     main_task.state = TASK_RUNNING;
     main_task.next = &main_task;
+    reserve_stdio(&main_task);
     current = &main_task;
     task_list_head = &main_task;
 }
@@ -46,6 +55,7 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg)
     task->state = TASK_READY;
     task->entry = entry;
     task->arg = arg;
+    reserve_stdio(task);
 
     uint32_t *sp = (uint32_t *)(task->stack_base + TASK_STACK_SIZE);
     *--sp = (uint32_t)task_bootstrap;

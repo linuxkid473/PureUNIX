@@ -24,7 +24,7 @@ KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 	$(patsubst %.S,$(BUILD)/%.o,$(KERNEL_AS_SRCS))
 DEPS := $(KERNEL_OBJS:.o=.d)
 
-USER_PROGRAMS := hello calc viewer editor sh
+USER_PROGRAMS := hello calc viewer editor sh opentest
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
 .PHONY: all run iso clean disk docs
@@ -58,8 +58,11 @@ $(BUILD)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(AS) $(KERNEL_CFLAGS) -MMD -MP -c $< -o $@
 
-$(DISK): $(USER_ELFS) tools/mkfat16.py
-	$(PYTHON) tools/mkfat16.py $@ $(USER_ELFS)
+DOCS_DIR := docs
+DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
+
+$(DISK): $(USER_ELFS) tools/mkfat16.py $(DOCS_MD)
+	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
 
 disk: $(DISK)
 
