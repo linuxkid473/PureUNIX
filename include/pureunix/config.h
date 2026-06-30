@@ -1,0 +1,13 @@
+#ifndef PUREUNIX_CONFIG_H
+#define PUREUNIX_CONFIG_H
+
+#define PUREUNIX_NAME "PureUnix"
+#define PUREUNIX_VERSION "0.1.0"
+#define PUREUNIX_ARCH "i686"
+#define PUREUNIX_PROMPT "$ "
+
+#define PUREUNIX_PAGE_SIZE 4096U
+#define PUREUNIX_MAX_PATH 256
+#define PUREUNIX_MAX_NAME 64
+
+#endif
