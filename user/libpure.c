@@ -7,6 +7,25 @@ static int syscall3(int n, int a, int b, int c)
     return r;
 }
 
+/* Exposes the raw syscall gate for callers that need to probe a syscall
+ * number directly (e.g. an unrecognized number's -1 return, or SYS_EXIT's
+ * pass-through return value) rather than through one of the named
+ * wrappers below. */
+int pu_syscall_raw(int n, int a, int b, int c)
+{
+    return syscall3(n, a, b, c);
+}
+
+int pu_getpid(void)
+{
+    return syscall3(SYS_GETPID, 0, 0, 0);
+}
+
+int pu_yield(void)
+{
+    return syscall3(SYS_YIELD, 0, 0, 0);
+}
+
 int pu_write(int fd, const char *buf, size_t len)
 {
     return syscall3(SYS_WRITE, fd, (int)buf, (int)len);

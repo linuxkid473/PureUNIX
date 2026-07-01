@@ -378,7 +378,14 @@ int vfs_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx)
 
     char sub[PUREUNIX_MAX_PATH];
     const vfs_mount_t *m = vfs_dispatch(resolved, sub, sizeof(sub));
-    if (!m || !m->ops->readdir || m->ops->readdir(sub, cb, ctx) != 0) {
+    if (!m || !m->ops->readdir) { set_error("readdir failed"); return -EIO; }
+    /* A driver's readdir returns 0 for "visited every entry" or a positive
+     * value for "the callback asked to stop early" (e.g. the caller's
+     * output buffer filled up) — both are successful completions, not
+     * errors, per vfs_readdir_cb_t's "return non-zero to stop iteration"
+     * contract. Only a negative return is an actual driver failure (bad
+     * inode, not a directory, I/O error). */
+    if (m->ops->readdir(sub, cb, ctx) < 0) {
         set_error("readdir failed");
         return -EIO;
     }

@@ -123,6 +123,14 @@ struct dirent {
     unsigned int size;
 };
 
+/* Raw syscall gate, for probing a syscall directly rather than through one
+ * of the named wrappers below (e.g. an unrecognized syscall number's -1
+ * return, or SYS_EXIT's pass-through return value with the current task
+ * left running — see docs/syscalls.md's SYS_EXIT section). */
+int    pu_syscall_raw(int n, int a, int b, int c);
+int    pu_getpid(void);
+int    pu_yield(void);
+
 int    pu_write(int fd, const char *buf, size_t len);
 int    pu_read(int fd, char *buf, size_t len);
 int    pu_open(const char *path, int flags);

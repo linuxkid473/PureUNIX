@@ -120,12 +120,16 @@ class Ext2Builder:
     # ------------------------------------------------------------------
     # High-level filesystem operations
     # ------------------------------------------------------------------
-    def mkdir(self, parent_ino, name: str) -> int:
-        """Create a directory inside parent_ino; return the new inode number."""
+    def mkdir(self, parent_ino, name: str, mode=None) -> int:
+        """Create a directory inside parent_ino; return the new inode number.
+
+        mode defaults to DEFAULT_DIR_MODE (0755); pass an explicit
+        S_IFDIR|0oNNN for a differently-permissioned directory (e.g. one
+        with no execute bit, to exercise ancestor X_OK traversal denial)."""
         ino = self._alloc_inode()
         self._dirs[ino] = []
         self._inodes[ino] = {
-            'mode': DEFAULT_DIR_MODE, 'size': 0, 'blocks': [],
+            'mode': mode if mode is not None else DEFAULT_DIR_MODE, 'size': 0, 'blocks': [],
             'nlinks': 2, 'uid': 0, 'gid': 0
         }
         self._parent[ino] = parent_ino
@@ -609,6 +613,13 @@ def main(argv):
         mode=S_IFREG | 0o640, uid=0, gid=100)
 
     fs.mkdir(perm_ino, 'emptydir')  # directory with nothing but '.' and '..'
+
+    # A directory with no execute bit anywhere (0600, not even for root — the
+    # permission engine's root exception for X_OK requires *some* x bit to be
+    # set), so a path through it exercises ancestor X_OK traversal denial.
+    # The file inside is unreachable by design; its content is never checked.
+    noxdir_ino = fs.mkdir(perm_ino, 'noxdir', mode=S_IFDIR | 0o600)
+    fs.add_file(noxdir_ino, 'hidden.txt', b'unreachable\n', mode=S_IFREG | 0o644, uid=0, gid=0)
 
     # ------------------------------------------------------------------ build
     fs.build(out)

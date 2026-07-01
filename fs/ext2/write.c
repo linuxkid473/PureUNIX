@@ -464,7 +464,22 @@ int ext2_write_file(const char *path, const uint8_t *data, size_t size, uint32_t
     ext2_inode_free_all_blocks(&inode);
     int rc = write_data_blocks(&inode, final_data, final_size);
     kfree(combined);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        /* write_data_blocks() can fail partway (e.g. -ENOSPC), after having
+         * already allocated some new blocks into inode.i_block[] (in
+         * memory only) — and the old blocks were already freed on disk by
+         * ext2_inode_free_all_blocks() above. Returning here without
+         * persisting anything would leave the on-disk inode still
+         * pointing at those now-freed old blocks, which the allocator is
+         * free to hand to an unrelated file next: a later read of this
+         * file would then silently return someone else's data. Free
+         * whatever the failed attempt did manage to allocate and persist
+         * the inode as the empty file it now actually is, so nothing is
+         * left dangling or leaked. */
+        ext2_inode_free_all_blocks(&inode);
+        ext2_write_inode(ino, &inode);
+        return rc;
+    }
 
     inode.i_size = (uint32_t)final_size;
     inode.i_mtime = inode.i_ctime = time_now();

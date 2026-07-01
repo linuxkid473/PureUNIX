@@ -25,7 +25,7 @@ KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 	$(patsubst %.S,$(BUILD)/%.o,$(KERNEL_AS_SRCS))
 DEPS := $(KERNEL_OBJS:.o=.d)
 
-USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test
+USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test systest
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
 .PHONY: all run iso clean disk docs
