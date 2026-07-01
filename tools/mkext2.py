@@ -365,21 +365,95 @@ class Ext2Builder:
               f"{self.next_inode - ROOT_INO - 1} user inodes")
 
 
+# Short-name aliases for docs files, mirrored from tools/mkfat16.py so both
+# filesystems present the same lookup names under /docs and /fat/docs.
+DOC_ALIASES = {
+    "architecture.md": "arch.md",
+    "boot.md":         "boot.md",
+    "memory.md":       "memory.md",
+    "interrupts.md":   "intrs.md",
+    "scheduler.md":    "sched.md",
+    "filesystem.md":   "fs.md",
+    "syscalls.md":     "syscall.md",
+    "drivers.md":      "drivers.md",
+    "shell.md":        "shell.md",
+    "userland.md":     "userland.md",
+    "build.md":        "build.md",
+    "developer-guide.md": "devguide.md",
+    "project-layout.md":  "layout.md",
+    # api/ subdirectory
+    "README.md":  "readme.md",
+    "task.md":    "task.md",
+    "vfs.md":     "vfs.md",
+    "libc.md":    "libc.md",
+}
+
+
+def add_docs(fs, docs_dir):
+    """Add the docs/ tree to /docs on the EXT2 image."""
+    docs_ino = fs.mkdir(ROOT_INO, 'docs')
+
+    index_lines = [b'PureUnix documentation\n', b'cat /docs/<file> to read\n', b'\n']
+
+    for fname in sorted(os.listdir(docs_dir)):
+        fpath = os.path.join(docs_dir, fname)
+        if os.path.isfile(fpath) and fname.endswith('.md'):
+            short = DOC_ALIASES.get(fname, fname.lower())
+            with open(fpath, 'rb') as f:
+                fs.add_file(docs_ino, short, f.read())
+            index_lines.append(f'  {short}\n'.encode())
+
+    api_src = os.path.join(docs_dir, 'api')
+    if os.path.isdir(api_src):
+        api_ino = fs.mkdir(docs_ino, 'api')
+        for fname in sorted(os.listdir(api_src)):
+            fpath = os.path.join(api_src, fname)
+            if os.path.isfile(fpath) and fname.endswith('.md'):
+                short = DOC_ALIASES.get(fname, fname.lower())
+                with open(fpath, 'rb') as f:
+                    fs.add_file(api_ino, short, f.read())
+                index_lines.append(f'  api/{short}\n'.encode())
+
+    fs.add_file(docs_ino, 'index.txt', b''.join(index_lines))
+
+
+def add_bin(fs, programs):
+    """Add the ELF program store to /bin on the EXT2 image."""
+    bin_ino = fs.mkdir(ROOT_INO, 'bin')
+    for program in programs:
+        name = os.path.basename(program).lower()
+        with open(program, 'rb') as f:
+            fs.add_file(bin_ino, name, f.read())
+
+
 def main(argv):
     if len(argv) < 2:
-        print("usage: mkext2.py OUT.img", file=sys.stderr)
+        print("usage: mkext2.py OUT.img [--docs DIR] [program.elf ...]", file=sys.stderr)
         return 2
 
     out = argv[1]
+    rest = argv[2:]
+
+    docs_dir = None
+    programs = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == '--docs' and i + 1 < len(rest):
+            docs_dir = rest[i + 1]
+            i += 2
+        else:
+            programs.append(rest[i])
+            i += 1
+
     fs  = Ext2Builder()
 
     # ------------------------------------------------------------------ root
-    # README.TXT in root — same content as FAT16 for cross-filesystem tests
     fs.add_file(ROOT_INO, 'README.TXT',
         b'PureUnix EXT2 root filesystem\r\n'
-        b'This file is served from the EXT2 data disk (ATA slave).\r\n'
-        b'The FAT16 disk (ATA master) holds the kernel and programs.\r\n'
-        b'Type: cat /README.TXT  to verify EXT2 is the active VFS.\r\n')
+        b'This file is served from the EXT2 data disk (ATA slave, ata1).\r\n'
+        b'EXT2 is the primary root filesystem: /, /bin, /docs, /etc all live here.\r\n'
+        b'FAT16 (ATA master, ata0) is mounted read/write at /fat for compatibility.\r\n'
+        b'Type: cat /README.TXT  to verify EXT2 is serving the root VFS.\r\n')
 
     # ------------------------------------------------------------------ /etc
     etc_ino = fs.mkdir(ROOT_INO, 'etc')
@@ -390,6 +464,14 @@ def main(argv):
 
     fs.add_file(etc_ino, 'hostname',
         b'pureunix\n')
+
+    # ------------------------------------------------------------------ /bin
+    if programs:
+        add_bin(fs, programs)
+
+    # ------------------------------------------------------------------ /docs
+    if docs_dir and os.path.isdir(docs_dir):
+        add_docs(fs, docs_dir)
 
     # ------------------------------------------------------------------ /home
     home_ino = fs.mkdir(ROOT_INO, 'home')

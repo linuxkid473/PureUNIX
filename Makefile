@@ -65,8 +65,8 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
 
-$(DISK2): tools/mkext2.py
-	$(PYTHON) tools/mkext2.py $@
+$(DISK2): $(USER_ELFS) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
 
 disk: $(DISK) $(DISK2)
 

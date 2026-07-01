@@ -32,21 +32,21 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     ata_init();
     vfs_init();
 
-    /* FAT16 on primary master (program store) */
+    /* FAT16 on primary master (ata0) — compatibility/testing only, mounted at /fat */
     disk_device_t *disk = ata_primary_master();
     if (disk->present && fat16_mount(disk) == 0) {
-        printf("FAT16 mounted on %s\n", disk->name);
+        printf("FAT16 mounted on /fat\n");
     } else {
-        printf("No FAT16 disk found; filesystem commands may fail.\n");
+        printf("No FAT16 disk found; /fat will be unavailable.\n");
     }
 
-    /* EXT2 on primary slave (data filesystem — takes priority in VFS reads) */
+    /* EXT2 on primary slave (ata1) — primary root filesystem */
     disk_device_t *disk2 = ata_primary_slave();
     if (disk2->present) {
         if (ext2_mount(disk2) == 0) {
-            printf("EXT2 mounted on %s\n", disk2->name);
+            printf("EXT2 mounted on /\n");
         } else {
-            printf("EXT2 mount failed on %s\n", disk2->name);
+            printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
         }
     }
 
