@@ -22,6 +22,16 @@ enum {
      * permission logic while running as non-root; nothing outside the
      * regression suite should ever call it. See ext2test.c section [22]. */
     SYS_DEBUG_SETCRED = 14,
+
+    /* Stage 4: symlinks, hard links, and a writable EXT2. */
+    SYS_READLINK = 15,
+    SYS_LSTAT    = 16,
+    SYS_MKDIR    = 17,
+    SYS_UNLINK   = 18,
+    SYS_RMDIR    = 19,
+    SYS_RENAME   = 20,
+    SYS_LINK     = 21,
+    SYS_SYMLINK  = 22,
 };
 
 #endif

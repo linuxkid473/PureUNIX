@@ -47,13 +47,52 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         int fd = (int)regs->ebx;
         const char *buf = (const char *)regs->ecx;
         size_t len = regs->edx;
-        if (fd != 1 && fd != 2) {
+
+        if (fd == 1 || fd == 2) {
+            for (size_t i = 0; i < len; ++i) {
+                putchar(buf[i]);
+            }
+            return len;
+        }
+
+        /* Stage 4: writable file descriptors. Writes accumulate in a
+         * kmalloc'd in-memory buffer (growing it as needed) and are flushed
+         * to the underlying filesystem in one shot on close() — the same
+         * "whole file lives in memory" model the read side already uses,
+         * just mirrored for writes. */
+        if (fd < 3 || fd >= MAX_OPEN_FILES) {
             return (uint32_t)-EBADF;
         }
-        for (size_t i = 0; i < len; ++i) {
-            putchar(buf[i]);
+
+        task_t *t = task_current();
+        fd_entry_t *f = &t->fds[fd];
+        if (!f->used || !(f->flags & O_WRONLY)) {
+            return (uint32_t)-EBADF;
         }
-        return len;
+        if (!buf) {
+            return (uint32_t)-EINVAL;
+        }
+        if (len == 0) {
+            return 0;
+        }
+
+        size_t new_end = f->offset + len;
+        if (new_end > f->size) {
+            uint8_t *grown = kmalloc(new_end);
+            if (!grown) {
+                return (uint32_t)-ENOSPC;
+            }
+            memset(grown, 0, new_end);
+            if (f->data) {
+                memcpy(grown, f->data, f->size);
+            }
+            kfree(f->data);
+            f->data = grown;
+            f->size = new_end;
+        }
+        memcpy(f->data + f->offset, buf, len);
+        f->offset += len;
+        return (uint32_t)len;
     }
     case SYS_READ: {
         int fd = (int)regs->ebx;
@@ -128,24 +167,13 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (!path) {
             return (uint32_t)-EINVAL;
         }
-        /* Only O_RDONLY is implemented. */
-        if (flags != O_RDONLY) {
-            return (uint32_t)-EINVAL;
-        }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
 
-        vfs_stat_t st;
-        if (vfs_stat(path, &st) != 0) {
-            return (uint32_t)-ENOENT;
-        }
-        if (st.type != VFS_FILE) {
-            return (uint32_t)-EISDIR;
-        }
-        if (!vfs_access(&st, current_uid(), current_gid(), R_OK)) {
-            return (uint32_t)-EACCES;
-        }
+        bool want_write  = (flags & O_WRONLY) != 0;
+        bool want_creat  = (flags & O_CREAT) != 0;
+        bool want_append = (flags & O_APPEND) != 0;
 
         task_t *t = task_current();
         int fd = -1;
@@ -159,20 +187,71 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EMFILE;
         }
 
+        if (!want_write) {
+            /* Read-only open (unchanged since Stage 3A). */
+            vfs_stat_t st;
+            if (vfs_stat(path, &st) != 0) {
+                return (uint32_t)-ENOENT;
+            }
+            if (st.type != VFS_FILE) {
+                return (uint32_t)-EISDIR;
+            }
+            if (!vfs_access(&st, current_uid(), current_gid(), R_OK)) {
+                return (uint32_t)-EACCES;
+            }
+
+            uint8_t *data = NULL;
+            size_t   size = 0;
+            if (vfs_read_file(path, &data, &size) != 0) {
+                return (uint32_t)-ENOENT;
+            }
+
+            t->fds[fd].used   = true;
+            t->fds[fd].flags  = flags;
+            t->fds[fd].data   = data;
+            t->fds[fd].size   = size;
+            t->fds[fd].offset = 0;
+            strncpy(t->fds[fd].path, path, PUREUNIX_MAX_PATH - 1);
+            t->fds[fd].path[PUREUNIX_MAX_PATH - 1] = '\0';
+            return (uint32_t)fd;
+        }
+
+        /* Writable open (Stage 4): the whole file is buffered in memory and
+         * flushed to the filesystem in one shot on close(). */
+        vfs_stat_t st;
+        bool exists = (vfs_stat(path, &st) == 0);
+        if (!exists) {
+            if (!want_creat) {
+                return (uint32_t)-ENOENT;
+            }
+            int cr = vfs_create(path);
+            if (cr != 0 && cr != -EEXIST) {
+                return (uint32_t)cr;
+            }
+            if (vfs_stat(path, &st) != 0) {
+                return (uint32_t)-ENOENT;
+            }
+        }
+        if (st.type != VFS_FILE) {
+            return (uint32_t)-EISDIR;
+        }
+        if (!vfs_access(&st, current_uid(), current_gid(), W_OK)) {
+            return (uint32_t)-EACCES;
+        }
+
         uint8_t *data = NULL;
         size_t   size = 0;
-        if (vfs_read_file(path, &data, &size) != 0) {
-            return (uint32_t)-ENOENT;
+        if (want_append) {
+            vfs_read_file(path, &data, &size); /* best-effort; empty is fine */
         }
 
         t->fds[fd].used   = true;
         t->fds[fd].flags  = flags;
         t->fds[fd].data   = data;
         t->fds[fd].size   = size;
-        t->fds[fd].offset = 0;
+        t->fds[fd].offset = want_append ? size : 0;
         strncpy(t->fds[fd].path, path, PUREUNIX_MAX_PATH - 1);
         t->fds[fd].path[PUREUNIX_MAX_PATH - 1] = '\0';
-
         return (uint32_t)fd;
     }
     case SYS_CLOSE: {
@@ -181,9 +260,15 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (fd < 3 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
             return (uint32_t)-EBADF;
         }
-        kfree(t->fds[fd].data);
-        memset(&t->fds[fd], 0, sizeof(t->fds[fd]));
-        return 0;
+        fd_entry_t *f = &t->fds[fd];
+        int rc = 0;
+        if (f->flags & O_WRONLY) {
+            int wr = vfs_write_file(f->path, f->data ? f->data : (const uint8_t *)"", f->size, 0);
+            if (wr != 0) rc = wr;
+        }
+        kfree(f->data);
+        memset(f, 0, sizeof(*f));
+        return (uint32_t)rc;
     }
     case SYS_LSEEK: {
         int fd     = (int)regs->ebx;
@@ -223,8 +308,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-ENOENT;
         }
         vfs_stat_t vst;
-        if (vfs_stat(path, &vst) != 0) {
-            return (uint32_t)-ENOENT;
+        int src = vfs_stat(path, &vst);
+        if (src != 0) {
+            return (uint32_t)src;
         }
         st->st_size = vst.size;
         st->st_type = (uint32_t)vst.type;
@@ -252,13 +338,118 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-ENOENT;
         }
         vfs_stat_t st;
-        if (vfs_stat(path, &st) != 0) {
-            return (uint32_t)-ENOENT;
+        int sra = vfs_stat(path, &st);
+        if (sra != 0) {
+            return (uint32_t)sra;
         }
         if (!vfs_access(&st, current_uid(), current_gid(), mode)) {
             return (uint32_t)-EACCES;
         }
         return 0;
+    }
+    case SYS_LSTAT: {
+        const char *path = (const char *)regs->ebx;
+        struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
+        if (!path || !st) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        vfs_stat_t vst;
+        int rc = vfs_lstat(path, &vst);
+        if (rc != 0) {
+            return (uint32_t)rc;
+        }
+        st->st_size = vst.size;
+        st->st_type = (uint32_t)vst.type;
+        st->st_attr = vst.mode;
+        st->st_mode = vst.st_mode;
+        st->st_uid = vst.st_uid;
+        st->st_gid = vst.st_gid;
+        st->st_nlink = vst.st_nlink;
+        st->st_ino = vst.st_ino;
+        st->st_atime = vst.st_atime;
+        st->st_mtime = vst.st_mtime;
+        st->st_ctime = vst.st_ctime;
+        st->st_blocks = vst.st_blocks;
+        st->st_blksize = vst.st_blksize;
+        return 0;
+    }
+    case SYS_READLINK: {
+        const char *path = (const char *)regs->ebx;
+        char *buf = (char *)regs->ecx;
+        size_t bufsize = (size_t)regs->edx;
+        if (!path || !buf) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_readlink(path, buf, bufsize);
+    }
+    case SYS_MKDIR: {
+        const char *path = (const char *)regs->ebx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_mkdir(path);
+    }
+    case SYS_UNLINK: {
+        const char *path = (const char *)regs->ebx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_unlink(path);
+    }
+    case SYS_RMDIR: {
+        const char *path = (const char *)regs->ebx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_rmdir(path);
+    }
+    case SYS_RENAME: {
+        const char *old_path = (const char *)regs->ebx;
+        const char *new_path = (const char *)regs->ecx;
+        if (!old_path || !new_path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_rename(old_path, new_path);
+    }
+    case SYS_LINK: {
+        const char *old_path = (const char *)regs->ebx;
+        const char *new_path = (const char *)regs->ecx;
+        if (!old_path || !new_path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_link(old_path, new_path);
+    }
+    case SYS_SYMLINK: {
+        const char *target = (const char *)regs->ebx;
+        const char *path = (const char *)regs->ecx;
+        if (!target || !path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_symlink(target, path);
     }
     case SYS_CHMOD: {
         const char *path = (const char *)regs->ebx;

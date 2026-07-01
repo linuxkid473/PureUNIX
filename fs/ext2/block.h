@@ -21,6 +21,12 @@
    Repeated calls for the same blk_no return the cached copy without I/O. */
 const uint8_t *ext2_read_block(uint32_t blk_no);
 
+/* Write exactly one block's worth of data (fs->block_size bytes) to disk at
+   blk_no. If blk_no is currently cached, the cache slot is updated in place
+   so a subsequent ext2_read_block() sees the new content without a stale
+   read. Returns 0 on success, -1 on I/O error or if blk_no == 0. */
+int ext2_write_block(uint32_t blk_no, const uint8_t *data);
+
 /* Invalidate all cache slots.  Must be called on unmount or remount so stale
    data from the previous disk is not returned for the same block number. */
 void ext2_block_cache_flush(void);

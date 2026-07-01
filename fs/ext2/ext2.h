@@ -195,6 +195,12 @@ typedef struct ext2_fs {
     uint32_t            total_blocks;
     uint32_t            rev_level;          /* 0 or 1                        */
 
+    /* Location of the on-disk BGDT, so the write path can persist updated
+     * bg_free_blocks_count/bg_free_inodes_count/bg_used_dirs_count back to
+     * disk after every allocation/free (Stage 4). */
+    uint32_t            bgdt_block;         /* first block of the BGDT       */
+    uint32_t            bgdt_blocks;        /* number of blocks it occupies  */
+
     ext2_bgdt_entry_t  *bgdt;              /* kmalloc'd BGDT array          */
 } ext2_fs_t;
 

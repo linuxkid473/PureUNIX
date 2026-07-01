@@ -714,6 +714,574 @@ int main(void)
     else
         fail("FATAL: failed to restore root credentials, R_OK=", pu_access("/perm/noaccess.bin", R_OK));
 
+    /* ================================================================
+     * Stage 4 — symlinks, pathname resolution, and a writable EXT2.
+     * Everything below runs as root (confirmed just above).
+     * ================================================================ */
+
+    /* ----------------------------------------------------------------- 25 */
+    pu_puts("\n[25] readlink(): absolute target, relative target, truncation\n");
+
+    r = pu_readlink("/abslink", buf, sizeof(buf));
+    if (r == 11 && xstrncmp(buf, "/README.TXT", 11) == 0)
+        pass("readlink('/abslink') returns the raw absolute target '/README.TXT'");
+    else
+        fail("expected 11-byte '/README.TXT', got n=", r);
+
+    r = pu_readlink("/readme.link", buf, sizeof(buf));
+    if (r == 10 && xstrncmp(buf, "README.TXT", 10) == 0)
+        pass("readlink('/readme.link') returns the raw relative target 'README.TXT'");
+    else
+        fail("expected 10-byte 'README.TXT', got n=", r);
+
+    r = pu_readlink("/testdir/uplink", buf, sizeof(buf));
+    if (r == 13 && xstrncmp(buf, "../README.TXT", 13) == 0)
+        pass("readlink('/testdir/uplink') returns raw '../README.TXT'");
+    else
+        fail("expected 13-byte '../README.TXT', got n=", r);
+
+    {
+        char small[4];
+        r = pu_readlink("/readme.link", small, sizeof(small));
+        if (r == 4 && xmemcmp(small, "READ", 4) == 0)
+            pass("readlink() truncates to the caller's buffer size (4 bytes of 'README.TXT')");
+        else
+            fail("expected 4-byte truncated 'READ', got n=", r);
+    }
+
+    r = pu_readlink("/README.TXT", buf, sizeof(buf));
+    if (r == EINVAL)
+        pass("readlink() on a non-symlink returns EINVAL");
+    else
+        fail("expected EINVAL for readlink on a regular file, got ", r);
+
+    r = pu_readlink("/no/such/link", buf, sizeof(buf));
+    if (r == ENOENT)
+        pass("readlink() on a nonexistent path returns ENOENT");
+    else
+        fail("expected ENOENT, got ", r);
+
+    /* ----------------------------------------------------------------- 26 */
+    pu_puts("\n[26] symlinks are followed transparently by open/read and stat\n");
+
+    fd = pu_open("/readme.link", O_RDONLY);
+    if (fd < 3) {
+        fail("expected open('/readme.link') to follow through to README.TXT, fd=", fd);
+    } else {
+        n = pu_read(fd, buf, 12);
+        if (n == 12 && xstrncmp(buf, "PureUnix EXT", 12) == 0)
+            pass("reading through readme.link yields README.TXT's real content");
+        else
+            fail("content read through symlink mismatch, n=", n);
+        pu_close(fd);
+    }
+
+    r = pu_stat("/readme.link", &st);
+    if (r == 0 && st.st_type == 1)
+        pass("stat('/readme.link') follows the link and reports type=FILE(1)");
+    else
+        fail("expected stat to follow to a FILE, got type=", (int)st.st_type);
+
+    r = pu_stat("/abslink", &st);
+    if (r == 0 && st.st_type == 1 && st.st_size > 0)
+        pass("stat('/abslink') follows the absolute-target link to README.TXT");
+    else
+        fail("expected abslink to resolve to a nonempty FILE, got type=", (int)st.st_type);
+
+    /* ----------------------------------------------------------------- 27 */
+    pu_puts("\n[27] lstat() never follows the final component\n");
+
+    r = pu_lstat("/readme.link", &st);
+    if (r == 0 && st.st_type == 3 && S_ISLNK(st.st_mode))
+        pass("lstat('/readme.link') reports the symlink itself, type=SYMLINK(3)");
+    else
+        fail("expected lstat to report SYMLINK, got type=", (int)st.st_type);
+
+    if (r == 0 && (st.st_mode & 0777) == 0777)
+        pass("lstat sees the symlink's own conventional 0777 permission bits");
+    else
+        fail("expected 0777 on the symlink inode, got ", (int)(st.st_mode & 0777));
+
+    r = pu_lstat("/README.TXT", &st);
+    if (r == 0 && st.st_type == 1)
+        pass("lstat on a non-symlink behaves exactly like stat");
+    else
+        fail("expected lstat(README.TXT) type=FILE, got ", (int)st.st_type);
+
+    /* ----------------------------------------------------------------- 28 */
+    pu_puts("\n[28] symlink loop detection (A -> B -> A) hits ELOOP\n");
+
+    r = pu_stat("/loop_a", &st);
+    if (r == ELOOP)
+        pass("stat('/loop_a') gives up with ELOOP instead of recursing forever");
+    else
+        fail("expected ELOOP from stat on a symlink loop, got ", r);
+
+    r = pu_open("/loop_b", O_RDONLY);
+    if (r == ELOOP)
+        pass("open('/loop_b') also reports ELOOP");
+    else
+        fail("expected ELOOP from open on a symlink loop, got ", r);
+
+    r = pu_access("/loop_a", F_OK);
+    if (r == ELOOP)
+        pass("access('/loop_a', F_OK) reports ELOOP rather than ENOENT");
+    else
+        fail("expected ELOOP from access on a symlink loop, got ", r);
+
+    /* ----------------------------------------------------------------- 29 */
+    pu_puts("\n[29] writable EXT2: create, write, close, reopen, read, verify\n");
+
+    fd = pu_creat("/newfile.txt");
+    if (fd < 3) {
+        fail("FATAL: pu_creat('/newfile.txt') failed, fd=", fd);
+    } else {
+        const char *msg = "Hello from a writable EXT2 filesystem!\n";
+        int msg_len = (int)pu_strlen(msg);
+        n = pu_write(fd, msg, msg_len);
+        if (n == msg_len)
+            pass("write() wrote the full buffer to the new file");
+        else
+            fail("short write, expected full message, got n=", n);
+        pu_close(fd);
+
+        r = pu_stat("/newfile.txt", &st);
+        if (r == 0 && (int)st.st_size == msg_len)
+            pass("stat() after close() reports the correct new file size");
+        else
+            fail("expected size=", msg_len);
+
+        fd = pu_open("/newfile.txt", O_RDONLY);
+        if (fd < 3) {
+            fail("cannot reopen /newfile.txt for reading, fd=", fd);
+        } else {
+            n = pu_read(fd, buf, sizeof(buf) - 1);
+            if (n == msg_len && xstrncmp(buf, msg, msg_len) == 0)
+                pass("reopened file's content matches exactly what was written");
+            else
+                fail("content mismatch after reopen, n=", n);
+            pu_close(fd);
+        }
+    }
+
+    /* ----------------------------------------------------------------- 30 */
+    pu_puts("\n[30] mkdir(): '.'/'..' entries, parent link count, traversal\n");
+
+    r = pu_stat("/", &st);
+    uint32_t root_nlink_before = st.st_nlink;
+
+    r = pu_mkdir("/newdir");
+    if (r == 0)
+        pass("mkdir('/newdir') succeeds");
+    else
+        fail("mkdir('/newdir') failed, r=", r);
+
+    r = pu_stat("/", &st);
+    if (r == 0 && st.st_nlink == root_nlink_before + 1)
+        pass("parent (/) link count increased by one for the new subdirectory's '..'");
+    else
+        fail("expected root nlink to increase by 1, got ", (int)st.st_nlink);
+
+    {
+        struct dirent entries[8];
+        int count = pu_readdir("/newdir", entries, 8);
+        if (count == 2 && find_name(entries, count, ".") >= 0 && find_name(entries, count, "..") >= 0)
+            pass("new directory contains exactly '.' and '..'");
+        else
+            fail("expected exactly 2 entries in new dir, got ", count);
+    }
+
+    fd = pu_creat("/newdir/inside.txt");
+    if (fd >= 3) {
+        pu_write(fd, "nested", 6);
+        pu_close(fd);
+        fd = pu_open("/newdir/inside.txt", O_RDONLY);
+        n = fd >= 3 ? pu_read(fd, buf, 6) : -1;
+        if (fd >= 3 && n == 6 && xmemcmp(buf, "nested", 6) == 0)
+            pass("traversal into a freshly-created directory reaches a freshly-created file");
+        else
+            fail("traversal into new directory failed, n=", n);
+        if (fd >= 3) pu_close(fd);
+    } else {
+        fail("cannot create file inside new directory, fd=", fd);
+    }
+
+    /* ----------------------------------------------------------------- 31 */
+    pu_puts("\n[31] unlink(): directory entry removed, inode disappears\n");
+
+    fd = pu_creat("/unlink_me.txt");
+    if (fd >= 3) pu_close(fd);
+
+    r = pu_unlink("/unlink_me.txt");
+    if (r == 0)
+        pass("unlink('/unlink_me.txt') succeeds");
+    else
+        fail("unlink failed, r=", r);
+
+    r = pu_stat("/unlink_me.txt", &st);
+    if (r == ENOENT)
+        pass("unlinked file no longer stats successfully");
+    else
+        fail("expected ENOENT after unlink, got ", r);
+
+    {
+        struct dirent entries[64];
+        int count = pu_readdir("/", entries, 64);
+        if (count >= 0 && find_name(entries, count, "unlink_me.txt") < 0)
+            pass("unlinked file no longer appears in its parent's directory listing");
+        else
+            fail("unlinked file still present in readdir, count=", count);
+    }
+
+    /* ----------------------------------------------------------------- 32 */
+    pu_puts("\n[32] hard links: same inode, shared data, correct link count\n");
+
+    fd = pu_creat("/hardlink_a.txt");
+    if (fd >= 3) {
+        pu_write(fd, "original-content", 16);
+        pu_close(fd);
+    }
+
+    r = pu_link("/hardlink_a.txt", "/hardlink_b.txt");
+    if (r == 0)
+        pass("link() creates a second name for the same file");
+    else
+        fail("link() failed, r=", r);
+
+    struct stat sa, sb;
+    pu_stat("/hardlink_a.txt", &sa);
+    pu_stat("/hardlink_b.txt", &sb);
+    if (sa.st_ino == sb.st_ino)
+        pass("hard-linked names share the same inode number");
+    else
+        fail("hard link has a different inode number: ", (int)sb.st_ino);
+
+    if (sa.st_nlink == 2 && sb.st_nlink == 2)
+        pass("both names report link count 2");
+    else
+        fail("expected nlink=2 on both names, got sa=", (int)sa.st_nlink);
+
+    /* Write through B, verify A observes the same new content (proves
+       shared data, not a copy). */
+    fd = pu_open("/hardlink_b.txt", O_WRONLY | O_TRUNC);
+    if (fd >= 3) {
+        pu_write(fd, "via-b", 5);
+        pu_close(fd);
+    }
+    fd = pu_open("/hardlink_a.txt", O_RDONLY);
+    n = fd >= 3 ? pu_read(fd, buf, 5) : -1;
+    if (fd >= 3 && n == 5 && xmemcmp(buf, "via-b", 5) == 0)
+        pass("write through the second hard-linked name is visible via the first");
+    else
+        fail("hard links do not share data as expected, n=", n);
+    if (fd >= 3) pu_close(fd);
+
+    r = pu_unlink("/hardlink_a.txt");
+    pu_stat("/hardlink_b.txt", &sb);
+    if (r == 0 && sb.st_nlink == 1)
+        pass("unlinking one hard-linked name drops the link count to 1, file still accessible");
+    else
+        fail("expected nlink=1 after unlinking one of two links, got ", (int)sb.st_nlink);
+
+    fd = pu_open("/hardlink_b.txt", O_RDONLY);
+    n = fd >= 3 ? pu_read(fd, buf, 5) : -1;
+    if (fd >= 3 && n == 5 && xmemcmp(buf, "via-b", 5) == 0)
+        pass("remaining hard-linked name still reads the shared content correctly");
+    else
+        fail("remaining hard link unreadable/corrupted, n=", n);
+    if (fd >= 3) pu_close(fd);
+
+    r = pu_unlink("/hardlink_b.txt");
+    if (r == 0 && pu_stat("/hardlink_b.txt", &sb) == ENOENT)
+        pass("unlinking the last hard link frees the inode (ENOENT afterward)");
+    else
+        fail("expected the inode to disappear once nlink reached 0", 0);
+
+    r = pu_link("/hardlink_a.txt", "/should_fail.txt");
+    if (r == ENOENT)
+        pass("link() on an already-fully-unlinked source correctly fails with ENOENT");
+    else
+        fail("expected ENOENT linking a gone file, got ", r);
+
+    r = pu_link("/", "/root_link_should_fail");
+    if (r == EPERM)
+        pass("link() refuses to hard-link a directory (EPERM)");
+    else
+        fail("expected EPERM linking a directory, got ", r);
+
+    /* ----------------------------------------------------------------- 33 */
+    pu_puts("\n[33] rename(): within a directory, across directories, over a target, EXDEV\n");
+
+    fd = pu_creat("/rename_src.txt");
+    if (fd >= 3) { pu_write(fd, "rename-me", 9); pu_close(fd); }
+
+    r = pu_rename("/rename_src.txt", "/rename_dst.txt");
+    if (r == 0 && pu_stat("/rename_src.txt", &st) == ENOENT && pu_stat("/rename_dst.txt", &st) == 0)
+        pass("rename() within the same directory moves the name, old name gone");
+    else
+        fail("same-directory rename failed, r=", r);
+
+    r = pu_rename("/rename_dst.txt", "/testdir/rename_moved.txt");
+    if (r == 0 && pu_stat("/rename_dst.txt", &st) == ENOENT) {
+        fd = pu_open("/testdir/rename_moved.txt", O_RDONLY);
+        n = fd >= 3 ? pu_read(fd, buf, 9) : -1;
+        if (fd >= 3 && n == 9 && xmemcmp(buf, "rename-me", 9) == 0)
+            pass("cross-directory rename moved both the name and the content");
+        else
+            fail("moved file unreadable/corrupted after cross-directory rename, n=", n);
+        if (fd >= 3) pu_close(fd);
+    } else {
+        fail("cross-directory rename failed, r=", r);
+    }
+
+    fd = pu_creat("/rename_over_target.txt");
+    if (fd >= 3) { pu_write(fd, "target-original", 15); pu_close(fd); }
+    pu_stat("/testdir/rename_moved.txt", &sa);
+
+    r = pu_rename("/testdir/rename_moved.txt", "/rename_over_target.txt");
+    if (r == 0) {
+        pu_stat("/rename_over_target.txt", &sb);
+        fd = pu_open("/rename_over_target.txt", O_RDONLY);
+        n = fd >= 3 ? pu_read(fd, buf, 9) : -1;
+        if (sa.st_ino == sb.st_ino && n == 9 && xmemcmp(buf, "rename-me", 9) == 0)
+            pass("rename() over an existing file replaces it, inode carried over from the source");
+        else
+            fail("rename-over-existing did not replace correctly, n=", n);
+        if (fd >= 3) pu_close(fd);
+    } else {
+        fail("rename over an existing destination failed, r=", r);
+    }
+
+    fd = pu_creat("/cross_device.txt");
+    if (fd >= 3) pu_close(fd);
+    r = pu_rename("/cross_device.txt", "/fat/cross_device.txt");
+    if (r == EXDEV)
+        pass("rename() across filesystems (EXT2 -> FAT16 /fat) correctly fails with EXDEV");
+    else
+        fail("expected EXDEV for a cross-filesystem rename, got ", r);
+    pu_unlink("/cross_device.txt");
+
+    /* ----------------------------------------------------------------- 34 */
+    pu_puts("\n[34] rmdir(): rejects non-empty, accepts empty\n");
+
+    r = pu_mkdir("/rmdir_test");
+    fd = pu_creat("/rmdir_test/occupant.txt");
+    if (fd >= 3) pu_close(fd);
+
+    r = pu_rmdir("/rmdir_test");
+    if (r == ENOTEMPTY)
+        pass("rmdir() on a non-empty directory fails with ENOTEMPTY");
+    else
+        fail("expected ENOTEMPTY for a non-empty directory, got ", r);
+
+    pu_unlink("/rmdir_test/occupant.txt");
+    r = pu_rmdir("/rmdir_test");
+    if (r == 0 && pu_stat("/rmdir_test", &st) == ENOENT)
+        pass("rmdir() on an now-empty directory succeeds and it disappears");
+    else
+        fail("rmdir of an empty directory failed, r=", r);
+
+    /* ----------------------------------------------------------------- 35 */
+    pu_puts("\n[35] symlink(): absolute, relative, fast vs block-based\n");
+
+    r = pu_symlink("/README.TXT", "/newlink_abs");
+    if (r == 0) {
+        n = pu_readlink("/newlink_abs", buf, sizeof(buf));
+        if (n == 11 && xstrncmp(buf, "/README.TXT", 11) == 0)
+            pass("symlink() creates an absolute-target link readlink() reads back correctly");
+        else
+            fail("newlink_abs readlink mismatch, n=", n);
+
+        r = pu_stat("/newlink_abs", &st);
+        if (r == 0 && st.st_type == 1)
+            pass("the new absolute symlink is followed correctly by stat()");
+        else
+            fail("expected stat to follow newlink_abs to a FILE, got ", (int)st.st_type);
+    } else {
+        fail("symlink('/README.TXT', '/newlink_abs') failed, r=", r);
+    }
+
+    r = pu_symlink("../README.TXT", "/testdir/newlink_rel");
+    if (r == 0) {
+        fd = pu_open("/testdir/newlink_rel", O_RDONLY);
+        n = fd >= 3 ? pu_read(fd, buf, 12) : -1;
+        if (fd >= 3 && n == 12 && xstrncmp(buf, "PureUnix EXT", 12) == 0)
+            pass("relative symlink resolves from its own parent directory, not cwd");
+        else
+            fail("relative symlink did not resolve correctly, n=", n);
+        if (fd >= 3) pu_close(fd);
+    } else {
+        fail("symlink('../README.TXT', '/testdir/newlink_rel') failed, r=", r);
+    }
+
+    r = pu_lstat("/newlink_abs", &st);
+    if (r == 0 && st.st_blocks == 0)
+        pass("a short (fast) symlink target allocates zero data blocks");
+    else
+        fail("expected a fast symlink to have st_blocks=0, got ", (int)st.st_blocks);
+
+    {
+        /* Every "./" is a resolver no-op (see fs/vfs.c's resolve_path), so
+           this target is 80 raw bytes but still ultimately resolves to
+           /README.TXT — long enough to force real data-block allocation
+           instead of the 60-byte inline fast-symlink path. */
+        const char *long_target =
+            "./././././././././././././././././././././././././././././././././././././"
+            "README.TXT";
+        r = pu_symlink(long_target, "/longlink");
+        if (r == 0) {
+            n = pu_readlink("/longlink", buf, sizeof(buf));
+            int tlen = (int)pu_strlen(long_target);
+            if (n == tlen && xstrncmp(buf, long_target, tlen) == 0)
+                pass("long (block-based) symlink target reads back byte-for-byte");
+            else
+                fail("long symlink readlink mismatch, n=", n);
+
+            r = pu_lstat("/longlink", &st);
+            if (r == 0 && st.st_blocks > 0)
+                pass("a long symlink target allocates at least one real data block");
+            else
+                fail("expected st_blocks>0 for a long symlink, got ", (int)st.st_blocks);
+
+            fd = pu_open("/longlink", O_RDONLY);
+            n = fd >= 3 ? pu_read(fd, buf, 12) : -1;
+            if (fd >= 3 && n == 12 && xstrncmp(buf, "PureUnix EXT", 12) == 0)
+                pass("the long symlink still resolves through all its './' components to README.TXT");
+            else
+                fail("long symlink did not resolve to README.TXT, n=", n);
+            if (fd >= 3) pu_close(fd);
+        } else {
+            fail("symlink() with a >60-byte target failed, r=", r);
+        }
+    }
+
+    /* ----------------------------------------------------------------- 36 */
+    pu_puts("\n[36] stress test: hundreds of creates/deletes, allocator stays consistent\n");
+
+    {
+        enum { STRESS_COUNT = 200 };
+        r = pu_mkdir("/stress");
+        if (r != 0) {
+            fail("FATAL: mkdir('/stress') failed, r=", r);
+        } else {
+            int created = 0;
+            for (int i = 0; i < STRESS_COUNT; i++) {
+                char name[32];
+                int p = 0;
+                const char *prefix = "/stress/f";
+                for (int k = 0; prefix[k]; k++) name[p++] = prefix[k];
+                if (i >= 100) name[p++] = (char)('0' + (i / 100) % 10);
+                if (i >= 10) name[p++] = (char)('0' + (i / 10) % 10);
+                name[p++] = (char)('0' + i % 10);
+                name[p++] = '\0';
+
+                fd = pu_creat(name);
+                if (fd >= 3) {
+                    pu_write(fd, "x", 1);
+                    pu_close(fd);
+                    created++;
+                }
+            }
+            if (created == STRESS_COUNT)
+                pass("created 200 files in a fresh directory");
+            else
+                fail("expected to create 200 files, only succeeded for ", created);
+
+            struct dirent entries[256];
+            int count = pu_readdir("/stress", entries, 256);
+            if (count == STRESS_COUNT + 2) /* plus '.' and '..' */
+                pass("directory listing shows exactly 200 files plus '.' and '..'");
+            else
+                fail("expected 202 directory entries, got ", count);
+
+            /* Delete every other file, freeing roughly half the inodes and
+               blocks this directory's contents used. */
+            int deleted = 0;
+            for (int i = 0; i < STRESS_COUNT; i += 2) {
+                char name[32];
+                int p = 0;
+                const char *prefix = "/stress/f";
+                for (int k = 0; prefix[k]; k++) name[p++] = prefix[k];
+                if (i >= 100) name[p++] = (char)('0' + (i / 100) % 10);
+                if (i >= 10) name[p++] = (char)('0' + (i / 10) % 10);
+                name[p++] = (char)('0' + i % 10);
+                name[p++] = '\0';
+                if (pu_unlink(name) == 0) deleted++;
+            }
+            if (deleted == STRESS_COUNT / 2)
+                pass("deleted every other file (100 of 200) successfully");
+            else
+                fail("expected 100 deletions, got ", deleted);
+
+            /* Recreate them, reusing the freed inodes/blocks; if the
+               allocator double-books anything this will corrupt data or
+               fail outright. */
+            int recreated = 0;
+            for (int i = 0; i < STRESS_COUNT; i += 2) {
+                char name[32];
+                int p = 0;
+                const char *prefix = "/stress/f";
+                for (int k = 0; prefix[k]; k++) name[p++] = prefix[k];
+                if (i >= 100) name[p++] = (char)('0' + (i / 100) % 10);
+                if (i >= 10) name[p++] = (char)('0' + (i / 10) % 10);
+                name[p++] = (char)('0' + i % 10);
+                name[p++] = '\0';
+
+                fd = pu_creat(name);
+                if (fd >= 3) {
+                    pu_write(fd, "y", 1);
+                    pu_close(fd);
+                    recreated++;
+                }
+            }
+            if (recreated == STRESS_COUNT / 2)
+                pass("reused freed inodes/blocks to recreate 100 files");
+            else
+                fail("expected 100 recreations to succeed, got ", recreated);
+
+            count = pu_readdir("/stress", entries, 256);
+            if (count == STRESS_COUNT + 2)
+                pass("directory entry count is back to 202 after delete+recreate");
+            else
+                fail("expected 202 entries after recreate cycle, got ", count);
+
+            /* Verify a sample of both never-deleted and recreated files
+               still (or again) read back their expected content. */
+            fd = pu_open("/stress/f001", O_RDONLY); /* never deleted (odd index) */
+            n = fd >= 3 ? pu_read(fd, buf, 1) : -1;
+            int sample1_ok = (fd >= 3 && n == 1 && buf[0] == 'x');
+            if (fd >= 3) pu_close(fd);
+
+            fd = pu_open("/stress/f000", O_RDONLY); /* deleted then recreated */
+            n = fd >= 3 ? pu_read(fd, buf, 1) : -1;
+            int sample2_ok = (fd >= 3 && n == 1 && buf[0] == 'y');
+            if (fd >= 3) pu_close(fd);
+
+            if (sample1_ok && sample2_ok)
+                pass("both untouched and recreated files read back correct, uncorrupted content");
+            else
+                fail("stress-test content verification failed", 0);
+
+            /* Tear everything down and confirm rmdir succeeds once empty. */
+            for (int i = 0; i < STRESS_COUNT; i++) {
+                char name[32];
+                int p = 0;
+                const char *prefix = "/stress/f";
+                for (int k = 0; prefix[k]; k++) name[p++] = prefix[k];
+                if (i >= 100) name[p++] = (char)('0' + (i / 100) % 10);
+                if (i >= 10) name[p++] = (char)('0' + (i / 10) % 10);
+                name[p++] = (char)('0' + i % 10);
+                name[p++] = '\0';
+                pu_unlink(name);
+            }
+            r = pu_rmdir("/stress");
+            if (r == 0)
+                pass("after deleting all 200 files, rmdir('/stress') succeeds");
+            else
+                fail("expected rmdir to succeed once /stress was emptied, r=", r);
+        }
+    }
+
     pu_puts("\n=== ext2test complete ===\n");
     return 0;
 }

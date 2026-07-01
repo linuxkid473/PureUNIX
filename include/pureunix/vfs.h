@@ -68,6 +68,14 @@ typedef struct vfs_ops {
      * filesystem can plug in without any VFS-level API change. */
     int (*chmod)(const char *path, mode_t mode);
     int (*chown)(const char *path, uid_t uid, gid_t gid);
+    /* Symlink/hardlink support (Stage 4). NULL on any driver that can't
+     * store them (FAT16 has neither concept). readlink returns the number
+     * of bytes copied into buf (never NUL-terminated, truncated to
+     * bufsize), or a negative errno. link/symlink return 0 or a negative
+     * errno. */
+    int (*readlink)(const char *path, char *buf, size_t bufsize);
+    int (*link)(const char *old_path, const char *new_path);
+    int (*symlink)(const char *target, const char *path);
 } vfs_ops_t;
 
 typedef struct vfs_mount {
@@ -89,6 +97,11 @@ int vfs_init(void);
 bool vfs_mounted(void);
 int vfs_mount_root(void);
 int vfs_stat(const char *path, vfs_stat_t *st);
+/* Like vfs_stat, but never follows a symlink in the final path component
+ * (ancestor directories are still resolved through any symlinks they
+ * contain, exactly like every other call here). If the final component is
+ * itself a symlink, *st describes the symlink inode, not its target. */
+int vfs_lstat(const char *path, vfs_stat_t *st);
 int vfs_read_file(const char *path, uint8_t **out_data, size_t *out_size);
 int vfs_write_file(const char *path, const uint8_t *data, size_t size, uint32_t flags);
 int vfs_create(const char *path);
@@ -99,6 +112,25 @@ int vfs_rename(const char *old_path, const char *new_path);
 int vfs_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 const char *vfs_last_error(void);
 void vfs_normalize(char *out, const char *cwd, const char *path);
+
+/* -------------------------------------------------------------------------
+ * Symbolic / hard links (Stage 4)
+ * ---------------------------------------------------------------------- */
+
+/* Read the raw target of the symlink at path (which must itself be a
+ * symlink — its final component is never followed to get here) into buf.
+ * Never appends a NUL terminator; copies at most bufsize bytes. Returns the
+ * number of bytes copied (>= 0), or a negative errno. */
+int vfs_readlink(const char *path, char *buf, size_t bufsize);
+
+/* Create a new hard link at new_path referring to the same inode as
+ * old_path. Neither path follows a trailing symlink. Refuses directories.
+ * Returns 0 or a negative errno. */
+int vfs_link(const char *old_path, const char *new_path);
+
+/* Create a new symlink at path whose target text is exactly target (not
+ * validated or resolved at creation time). Returns 0 or a negative errno. */
+int vfs_symlink(const char *target, const char *path);
 
 /* -------------------------------------------------------------------------
  * Permissions (Stage 3A)

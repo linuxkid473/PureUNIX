@@ -6,6 +6,7 @@
 #include <pureunix/memory.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/time.h>
 
 /* -------------------------------------------------------------------------
  * Public mount / is-mounted
@@ -93,7 +94,12 @@ int ext2_read_file(const char *path, uint8_t **out_data, size_t *out_size)
     if (ext2_read_inode(ino, &inode) != 0) return -1;
     if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) return -1;
 
-    return ext2_read_file_ino(ino, out_data, out_size);
+    if (ext2_read_file_ino(ino, out_data, out_size) != 0) return -1;
+
+    /* Unix semantics: reading a file's data updates its atime. */
+    inode.i_atime = time_now();
+    ext2_write_inode(ino, &inode);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -111,21 +117,25 @@ int ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx)
 }
 
 /* -------------------------------------------------------------------------
- * VFS mount-table registration — EXT2 is read-only, so the write/create/
- * unlink/rename slots are left NULL; the VFS treats a NULL op as
- * "unsupported" rather than crashing on a missing function pointer.
+ * VFS mount-table registration (Stage 4: EXT2 is now writable — see
+ * fs/ext2/write.c for create/unlink/rename/link/symlink/readlink/
+ * write_file). chmod/chown remain NULL: no on-disk mutable-ownership path
+ * was added for this stage, so they still resolve to -EROFS.
  * ---------------------------------------------------------------------- */
 
 static const vfs_ops_t ext2_vfs_ops_table = {
     .stat = ext2_stat,
     .read_file = ext2_read_file,
-    .write_file = NULL,
-    .create = NULL,
-    .unlink = NULL,
-    .rename = NULL,
+    .write_file = ext2_write_file,
+    .create = ext2_create,
+    .unlink = ext2_unlink,
+    .rename = ext2_rename,
     .readdir = ext2_readdir,
     .chmod = NULL,
     .chown = NULL,
+    .readlink = ext2_readlink,
+    .link = ext2_link,
+    .symlink = ext2_symlink,
 };
 
 const vfs_ops_t *ext2_vfs_ops(void)

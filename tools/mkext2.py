@@ -473,6 +473,15 @@ def add_bin(fs, programs):
         with open(program, 'rb') as f:
             fs.add_file(bin_ino, name, f.read(), mode=EXEC_MODE)
 
+    # Stage 4: a symlink to an ELF, exercised by ext2test's "exec through a
+    # symlink" regression check ("/bin/hello -> hello.elf must execute
+    # correctly. Permission checks happen on the resolved inode."). The
+    # symlink itself carries no execute bit at all (conventionally 0777,
+    # but permission bits on a symlink are never consulted by anyone) —
+    # elf_exec()'s X_OK check runs against hello.elf's own resolved mode.
+    if any(os.path.basename(p).lower() == 'hello.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'hello', 'hello.elf')
+
 
 def main(argv):
     if len(argv) < 2:
@@ -514,9 +523,20 @@ def main(argv):
         b'pureunix\n')
 
     # Stage 2D: a real symlink inode, to exercise S_ISLNK()/ls -l "l"
-    # recognition end to end. Not followed or readable — see
-    # fs/ext2/mount.c's ext2_read_file, which refuses non-regular inodes.
+    # recognition end to end. Stage 4 makes path resolution actually follow
+    # it — `cat readme.link` now transparently reads README.TXT.
     fs.add_symlink(ROOT_INO, 'readme.link', 'README.TXT')
+
+    # Stage 4: an absolute-target symlink, alongside readme.link's
+    # relative target, so ext2test can exercise both forms of readlink()
+    # and path-resolution symlink-following.
+    fs.add_symlink(ROOT_INO, 'abslink', '/README.TXT')
+
+    # Stage 4: a symlink loop (A -> B -> A) for ELOOP detection — following
+    # either endpoint must give up after 40 hops rather than recursing
+    # forever.
+    fs.add_symlink(ROOT_INO, 'loop_a', 'loop_b')
+    fs.add_symlink(ROOT_INO, 'loop_b', 'loop_a')
 
     # ------------------------------------------------------------------ /bin
     if programs:
@@ -538,6 +558,11 @@ def main(argv):
     testdir_ino = fs.mkdir(ROOT_INO, 'testdir')
     for name in ['alpha.txt', 'beta.txt', 'gamma.txt']:
         fs.add_file(testdir_ino, name, f'Content of {name}\n'.encode())
+
+    # Stage 4: a relative symlink target using "..", resolved from the
+    # symlink's own parent directory (/testdir) exactly like Unix — this
+    # must land on /README.TXT, not /testdir/README.TXT.
+    fs.add_symlink(testdir_ino, 'uplink', '../README.TXT')
 
     # ------------------------------------------------------------------ bigfile.bin
     # 5 KB = 5 direct blocks — tests multi-block direct reads.

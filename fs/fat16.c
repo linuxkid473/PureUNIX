@@ -898,9 +898,14 @@ static const vfs_ops_t fat16_vfs_ops_table = {
     .readdir = fat16_readdir,
     /* FAT16 has no on-disk permission/ownership storage — its stat() only
      * synthesizes uid=gid=0 and a fixed mode, so there is nothing for
-     * chmod/chown to persist yet. */
+     * chmod/chown to persist yet. FAT16 also has no symlink or hard-link
+     * concept at all (Stage 4 adds these only to EXT2 — "Do NOT modify
+     * FAT16" per the stage spec), so all three are unconditionally NULL. */
     .chmod = NULL,
     .chown = NULL,
+    .readlink = NULL,
+    .link = NULL,
+    .symlink = NULL,
 };
 
 const vfs_ops_t *fat16_vfs_ops(void)

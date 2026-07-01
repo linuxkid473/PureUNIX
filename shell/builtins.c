@@ -226,11 +226,15 @@ static int ls_cb(const vfs_dirent_t *entry, void *ctx_)
 
     /* "." and ".." are real directory entries here (the EXT2 driver no
      * longer hides them), so they get stat'd like anything else;
-     * vfs_normalize resolves them to the actual directory/parent path. */
+     * vfs_normalize resolves them to the actual directory/parent path.
+     * Uses lstat, not stat (Stage 4): a real `ls -l` shows a symlink's own
+     * type/permissions/size, never the target it points at — vfs_stat now
+     * transparently follows the final component, which would otherwise
+     * make every symlink entry masquerade as its target here. */
     char path[PUREUNIX_MAX_PATH];
     vfs_normalize(path, ctx->dir, entry->name);
     vfs_stat_t st;
-    if (vfs_stat(path, &st) != 0) {
+    if (vfs_lstat(path, &st) != 0) {
         shell_out_printf(ctx->out, "?????????? ? ? ? %u %s\n", entry->size, entry->name);
         return 0;
     }
@@ -274,12 +278,18 @@ static int cmd_ls(shell_context_t *ctx, shell_command_t *cmd, const char *input,
         return -1;
     }
     if (st.type != VFS_DIR) {
+        /* A symlink argument that doesn't resolve to a directory is shown
+         * with its own type/mode (via lstat), not the target's — matching
+         * real `ls` on a symlink (the directory-listing branch above still
+         * transparently follows a symlink-to-directory, same as `cd`). */
+        vfs_stat_t lst = st;
+        vfs_lstat(path, &lst);
         if (long_fmt) {
             char modestr[11];
-            mode_to_string(st.st_mode, modestr);
-            shell_out_printf(out, "%s %u %u %u %u %s\n", modestr, st.st_nlink, st.st_uid, st.st_gid, st.size, path);
+            mode_to_string(lst.st_mode, modestr);
+            shell_out_printf(out, "%s %u %u %u %u %s\n", modestr, lst.st_nlink, lst.st_uid, lst.st_gid, lst.size, path);
         } else {
-            shell_out_printf(out, "%c %s %u\n", short_type_char(st.type), path, st.size);
+            shell_out_printf(out, "%c %s %u\n", short_type_char(lst.type), path, lst.size);
         }
         return 0;
     }

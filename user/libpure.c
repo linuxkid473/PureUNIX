@@ -62,6 +62,51 @@ int pu_debug_setcred(uid_t uid, gid_t gid)
     return syscall3(SYS_DEBUG_SETCRED, (int)uid, (int)gid, 0);
 }
 
+int pu_lstat(const char *path, struct stat *st)
+{
+    return syscall3(SYS_LSTAT, (int)path, (int)st, 0);
+}
+
+int pu_readlink(const char *path, char *buf, size_t bufsize)
+{
+    return syscall3(SYS_READLINK, (int)path, (int)buf, (int)bufsize);
+}
+
+int pu_mkdir(const char *path)
+{
+    return syscall3(SYS_MKDIR, (int)path, 0, 0);
+}
+
+int pu_unlink(const char *path)
+{
+    return syscall3(SYS_UNLINK, (int)path, 0, 0);
+}
+
+int pu_rmdir(const char *path)
+{
+    return syscall3(SYS_RMDIR, (int)path, 0, 0);
+}
+
+int pu_rename(const char *old_path, const char *new_path)
+{
+    return syscall3(SYS_RENAME, (int)old_path, (int)new_path, 0);
+}
+
+int pu_link(const char *old_path, const char *new_path)
+{
+    return syscall3(SYS_LINK, (int)old_path, (int)new_path, 0);
+}
+
+int pu_symlink(const char *target, const char *path)
+{
+    return syscall3(SYS_SYMLINK, (int)target, (int)path, 0);
+}
+
+int pu_creat(const char *path)
+{
+    return pu_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+}
+
 size_t pu_strlen(const char *s)
 {
     size_t len = 0;

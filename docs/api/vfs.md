@@ -2,7 +2,7 @@
 
 **Header**: `<pureunix/vfs.h>`
 
-All path arguments must be absolute (begin with `/`). All functions return `0` on success and `-1` on failure. On failure, `vfs_last_error()` returns a description string. (The three permission-infrastructure calls added in Stage 3A — `vfs_chmod`, `vfs_chown` — are the exception: they return a negative errno directly, since callers need to distinguish `-ENOENT` from `-EROFS`.)
+All path arguments must be absolute (begin with `/`). Every function returns `0` on success and a **negative errno** on failure (`-ENOENT`, `-EACCES`, `-ELOOP`, `-EEXIST`, `-ENOTEMPTY`, `-EXDEV`, `-EROFS`, `-EISDIR`, `-ENOTDIR`, `-EPERM`, ...) — this became uniform in Stage 4; earlier stages had a handful of calls that only returned bare `0`/`-1`. `vfs_last_error()` additionally returns a human-readable description string for shell error messages.
 
 ## Mount Table
 
@@ -24,8 +24,8 @@ Current mounts, registered in `kernel_main` after each driver's own `_mount()` c
 
 | Mountpoint | Driver | Notes |
 |---|---|---|
-| `/` | EXT2 (ATA primary slave, read-only) | Primary root filesystem |
-| `/fat` | FAT16 (ATA primary master, read/write) | Compatibility/testing only |
+| `/` | EXT2 (ATA primary slave, read/write since Stage 4) | Primary root filesystem |
+| `/fat` | FAT16 (ATA primary master, read/write) | Compatibility/testing only — Stage 4 did not change it |
 
 Adding a future filesystem requires only a new driver plus a `vfs_mount()` call — no changes to the dispatch logic below.
 
@@ -44,8 +44,14 @@ typedef struct vfs_ops {
     int (*readdir)(const char *path, vfs_readdir_cb_t cb, void *ctx);
     int (*chmod)(const char *path, mode_t mode);   // NULL on every driver today
     int (*chown)(const char *path, uid_t uid, gid_t gid); // NULL on every driver today
+    // Stage 4 — symlinks/hardlinks. NULL on FAT16 (no such concept there).
+    int (*readlink)(const char *path, char *buf, size_t bufsize);
+    int (*link)(const char *old_path, const char *new_path);
+    int (*symlink)(const char *target, const char *path);
 } vfs_ops_t;
 ```
+
+EXT2's table now fills every slot except `chmod`/`chown` (still `-EROFS` — Stage 4 didn't add mutable ownership/permission storage, only content and directory-structure writes). FAT16's table is completely unchanged from Stage 3A.
 
 ---
 
@@ -142,13 +148,16 @@ Returns `true` if at least one mount is registered.
 
 See "Mount Table" above.
 
-### `vfs_stat`
+### `vfs_stat` / `vfs_lstat`
 
 ```c
 int vfs_stat(const char *path, vfs_stat_t *st);
+int vfs_lstat(const char *path, vfs_stat_t *st);
 ```
 
-Resolves `path` to its mount (checking `X_OK` on every ancestor directory along the way — see "Permissions" below) and fills `*st`. Returns `-1` if the path doesn't resolve to a mount, the driver has no path there, or a traversal permission check fails.
+Both resolve `path` through the pathname resolver (see "Pathname resolution and symlinks" below) and fill `*st`. `vfs_stat` follows a symlink named by the *final* path component (ancestors are always followed, in both functions); `vfs_lstat` does not — if the final component is itself a symlink, `*st` describes the symlink inode (`type == VFS_SYMLINK`, `st_mode` has `S_IFLNK`), not whatever it points to. This is the only difference between them.
+
+Returns `0`, or `-ENOENT`/`-EACCES`/`-ELOOP` from resolution.
 
 ### `vfs_read_file`
 
@@ -156,9 +165,9 @@ Resolves `path` to its mount (checking `X_OK` on every ancestor directory along 
 int vfs_read_file(const char *path, uint8_t **out_data, size_t *out_size);
 ```
 
-Reads the entire contents of a file: checks ancestor `X_OK`, then `R_OK` on the file itself, then calls the resolved driver's `read_file`. On success, allocates a buffer via `kmalloc`, writes its address to `*out_data` and its size to `*out_size`. The caller must free the buffer with `kfree`.
+Resolves `path` (following a trailing symlink, so reading through one is transparent), checks `R_OK` on the resolved file, then calls the driver's `read_file`. On success, allocates a buffer via `kmalloc`, writes its address to `*out_data` and its size to `*out_size`. The caller must free the buffer with `kfree`. On EXT2, a successful read also updates the file's `atime` (see "EXT2 write path" in `docs/filesystem.md`).
 
-Returns `-1` if the path doesn't resolve, isn't a regular file the driver will read, or either permission check fails.
+Returns `0`, or a negative errno.
 
 ### `vfs_readdir`
 
@@ -166,13 +175,11 @@ Returns `-1` if the path doesn't resolve, isn't a regular file the driver will r
 int vfs_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 ```
 
-Enumerates all entries in the directory at `path` through its resolved mount: checks ancestor `X_OK`, then `R_OK` on the directory itself, then calls `cb` once per entry. Stops if `cb` returns non-zero.
+Resolves `path` (following a trailing symlink to a directory, like `cd`), checks `R_OK`, then calls `cb` once per entry. Stops if `cb` returns non-zero.
 
-`.` and `..` are ordinary entries here — no filtering happens at this layer (see "Permissions" and EXT2's directory notes). A caller that wants to hide them (like the shell's plain `ls`, as opposed to `ls -a`) filters them out itself.
+`.` and `..` are ordinary entries here — no filtering happens at this layer. A caller that wants to hide them (like the shell's plain `ls`, as opposed to `ls -a`) filters them out itself.
 
-Returns `0` on success, `-1` if the path doesn't resolve to a directory or a permission check fails.
-
-### `vfs_write_file` / `vfs_create` / `vfs_mkdir` / `vfs_unlink` / `vfs_rmdir` / `vfs_rename`
+### `vfs_write_file` / `vfs_create` / `vfs_mkdir` / `vfs_unlink` / `vfs_rmdir` / `vfs_rename` / `vfs_link` / `vfs_symlink`
 
 ```c
 int vfs_write_file(const char *path, const uint8_t *data, size_t size, uint32_t flags);
@@ -181,13 +188,35 @@ int vfs_mkdir(const char *path);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_rename(const char *old_path, const char *new_path);
+int vfs_link(const char *old_path, const char *new_path);
+int vfs_symlink(const char *target, const char *path);
 ```
 
-Every write-side call checks ancestor `X_OK` first, then `W_OK` on whichever directory the operation actually modifies (the parent, for create/mkdir/unlink/rmdir/rename; the target file itself if it already exists, for `vfs_write_file`). This runs unconditionally even though EXT2 is read-only (its ops table has these slots `NULL`, so they simply fail after the permission check) — a future writable filesystem gets enforcement for free.
+Every write-side call checks `W_OK` on whichever directory the operation actually modifies (the parent, for create/mkdir/unlink/rmdir/rename/link/symlink; the target file itself if it already exists, for `vfs_write_file`).
 
-`vfs_write_file`: if `flags & VFS_O_APPEND`, appends; if `flags & VFS_O_TRUNC` or `flags == 0`, replaces existing content; creates the file first if it doesn't exist.
+Which final component gets followed differs by call, matching POSIX:
 
-`vfs_rename`: both old and new paths must resolve to the *same* mount.
+| Call | Final-component symlink handling |
+|---|---|
+| `vfs_write_file` | followed (write-through-symlink works, mirroring `vfs_read_file`) |
+| `vfs_create` / `vfs_mkdir` / `vfs_symlink` / `vfs_link` (new name) | followed, purely to detect an existing target — `-EEXIST` either way |
+| `vfs_unlink` / `vfs_rmdir` / `vfs_rename` (both paths) / `vfs_link` (old name) | **not** followed — these name the entry itself, never its target |
+
+`vfs_write_file`: if `flags & VFS_O_APPEND`, appends; otherwise replaces existing content; creates the file first if it doesn't exist.
+
+`vfs_rename`: both paths must resolve to the *same* mount, or the call fails with `-EXDEV` (this is checked with the fully-resolved paths, so a symlinked ancestor that redirects across a mount boundary is still caught correctly). The destination, if it already exists, is replaced: same-type only (file-for-file, empty-directory-for-empty-directory), the moved inode's number is unchanged, and `-ENOTEMPTY`/-`EISDIR`/`-ENOTDIR` cover the mismatched cases. EXT2's `ext2_rename` (see `docs/filesystem.md`) implements the actual entry-replacement and `..`-repointing logic; the VFS layer here only handles resolution, permission checks, and the cross-mount guard.
+
+`vfs_link`: refuses to hard-link a directory (`-EPERM`), and — like rename — requires both paths to resolve to the same mount (`-EXDEV` otherwise).
+
+`vfs_symlink`: `target` is stored verbatim, unresolved and unvalidated — a symlink may legitimately point at nothing.
+
+### `vfs_readlink`
+
+```c
+int vfs_readlink(const char *path, char *buf, size_t bufsize);
+```
+
+`path` must itself be a symlink (its final component is never followed to get here — same resolution policy as `vfs_lstat`). Copies at most `bufsize` raw bytes of the target into `buf` — **never** NUL-terminated, exactly like POSIX `readlink(2)`. Returns the number of bytes copied (`>= 0`), or `-EINVAL` if `path` isn't a symlink, or `-ENOENT`/`-EACCES`/`-ELOOP` from resolving its ancestors.
 
 ### `vfs_last_error`
 
@@ -211,6 +240,22 @@ Resolves `path` into an absolute path written to `out` (max `PUREUNIX_MAX_PATH` 
 - `..` components pop the last path segment; clamped at root.
 
 Purely lexical — does not consult the filesystem, so it works the same whether or not the resulting path actually exists.
+
+---
+
+## Pathname resolution and symlinks (Stage 4)
+
+Every public entry point above is built on one internal resolver in `fs/vfs.c` (`resolve_path`, `static`, not exported) — pathname resolution, including symlink-following, exists in exactly one place, and no filesystem driver ever sees an unresolved symlink-containing path.
+
+`resolve_path(path, out, out_size, follow_final, uid, gid)` walks `path` component by component, maintaining the absolute path resolved so far:
+
+- **Every ancestor directory is followed through any symlink it names.** `X_OK` is required on each directory actually consulted along the way (root bypasses, as always — see "Permissions" below).
+- **The final component is followed only if `follow_final` is true.** Callers that name an entity itself rather than its target (`lstat`, `readlink`, `unlink`, `rmdir`, `rename`'s and `link`'s "old" side) pass `false`; everything else (`stat`, `open`/`read_file`, `readdir`, `write_file`, and the "does this name already exist" check inside `create`/`mkdir`/`symlink`/`link`'s "new" side) passes `true`.
+- **Absolute symlink targets** (`/etc/passwd`) reset resolution to `/` and continue from there. **Relative targets** (`../docs/readme`) resolve relative to the symlink's own parent directory — never the caller's current working directory — exactly like Unix.
+- **Loop detection**: a counter increments on every symlink actually followed; exceeding **40** follows returns `-ELOOP` immediately rather than recursing or looping forever. This catches both direct two-node cycles (`A -> B`, `B -> A`) and longer chains.
+- **A dangling final component is not a resolution error.** If the last component doesn't exist on disk, `resolve_path` still succeeds, returning the would-be path — it's each caller's job to `stat` that result and decide whether non-existence is expected (`create`/`mkdir`/`symlink`) or fatal (`open`/`unlink`/...).
+
+Symlink target bytes themselves are fetched via each driver's `ops->readlink` — a symlink's own mode bits are never consulted for this (conventionally `0777` and universally ignored, matching every real Unix).
 
 ---
 

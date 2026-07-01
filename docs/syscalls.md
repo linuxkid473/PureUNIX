@@ -51,6 +51,14 @@ static int syscall3(int n, int a, int b, int c)
 | 12 | `SYS_CHOWN` | path pointer | uid | gid | `-EROFS` (infrastructure only, see below) |
 | 13 | `SYS_READDIR` | path pointer | `struct dirent *` buffer | max entries | entry count or negative error |
 | 14 | `SYS_DEBUG_SETCRED` | uid | gid | — | 0 (test hook — see below) |
+| 15 | `SYS_READLINK` | path pointer | buffer pointer | buffer size | bytes copied or negative error |
+| 16 | `SYS_LSTAT` | path pointer | `struct stat *` | — | 0 or negative error |
+| 17 | `SYS_MKDIR` | path pointer | — | — | 0 or negative error |
+| 18 | `SYS_UNLINK` | path pointer | — | — | 0 or negative error |
+| 19 | `SYS_RMDIR` | path pointer | — | — | 0 or negative error |
+| 20 | `SYS_RENAME` | old path pointer | new path pointer | — | 0 or negative error |
+| 21 | `SYS_LINK` | old path pointer | new path pointer | — | 0 or negative error |
+| 22 | `SYS_SYMLINK` | target pointer | path pointer | — | 0 or negative error |
 
 ---
 
@@ -101,34 +109,36 @@ Calls `task_yield()`, which finds the next ready task in the circular list and p
 
 ## SYS_OPEN (6)
 
-Opens a file for reading and allocates a file descriptor.
+Opens a file and allocates a file descriptor — read-only or writable, depending on flags.
 
 **Arguments**:
 - `EBX`: pointer to null-terminated absolute path string
-- `ECX`: flags — only `O_RDONLY` (0) is accepted
+- `ECX`: flags — `O_RDONLY` (0), or `O_WRONLY` (0x001) combined with any of `O_CREAT` (0x100) / `O_TRUNC` (0x200) / `O_APPEND` (0x400)
 
 **Returns**: file descriptor (≥ 3) on success, or a negative error code:
 
 | Code | Value | Meaning |
 |---|---|---|
-| `-EINVAL` | -22 | null path pointer, or flags other than `O_RDONLY` |
-| `-ENOENT` | -2 | path does not exist on either filesystem |
+| `-EINVAL` | -22 | null path pointer |
+| `-ENOENT` | -2 | path does not exist, and (for a write open) `O_CREAT` wasn't given |
 | `-EISDIR` | -21 | path refers to a directory |
+| `-EACCES` | -13 | missing `R_OK` (read open) or `W_OK` (write open) |
 | `-EMFILE` | -24 | all fd slots (3–15) are in use |
+| *(create failure)* | | any negative errno `vfs_create()` returns, if `O_CREAT` was needed and failed for a reason other than the file already existing |
+
+**Read opens** (`flags` without `O_WRONLY`, unchanged since Stage 3A): `vfs_read_file()` loads the entire file into a `kmalloc`'d buffer at open time; `SYS_READ` never touches disk.
+
+**Write opens** (Stage 4, `flags & O_WRONLY`): if the path doesn't exist and `O_CREAT` is set, `vfs_create()` runs first (a harmless `-EEXIST` from a race is ignored — POSIX `creat()`/`open(O_CREAT)` without `O_EXCL` never errors just because the file already exists). The descriptor then starts with an **empty** in-memory buffer (`O_APPEND` instead pre-loads the existing content and seeks to its end) that `SYS_WRITE` grows as data is written; nothing reaches the filesystem until `SYS_CLOSE`. `pu_creat(path)` is `pu_open(path, O_WRONLY|O_CREAT|O_TRUNC)` — this kernel's equivalent of POSIX `creat()`.
 
 **Descriptor allocation**: the lowest available index in the range 3–`MAX_OPEN_FILES-1` (16) is used. Indices 0, 1, 2 are permanently reserved for stdin, stdout, and stderr.
 
-**Implementation**: `vfs_read_file()` is called at open time (EXT2-first, then FAT16 fallback), loading the entire file into a `kmalloc`'d buffer. The buffer and a read offset are stored in the task's `fd_entry_t`.
-
-**Limitations**:
-- `O_RDONLY` only; `O_WRONLY` and `O_RDWR` return `-EINVAL`.
-- Path pointer is accepted without bounds-checking (no user/kernel memory separation).
+**Limitations**: path pointer is accepted without bounds-checking (no user/kernel memory separation); there is no `O_RDWR` (read-modify-write of an existing file requires read, then a separate truncating write).
 
 ---
 
 ## SYS_CLOSE (7)
 
-Closes an open file descriptor and frees its kernel buffer.
+Closes an open file descriptor, flushing buffered writes first, then frees its kernel buffer.
 
 **Arguments**:
 - `EBX`: file descriptor to close
@@ -138,6 +148,9 @@ Closes an open file descriptor and frees its kernel buffer.
 | Code | Value | Meaning |
 |---|---|---|
 | `-EBADF` | -9 | fd is not in range 3–15, or not currently open |
+| *(flush failure)* | | any negative errno `vfs_write_file()` returns, if the descriptor was opened writable |
+
+If the descriptor was opened with `O_WRONLY` (Stage 4), its entire in-memory write buffer is flushed to the filesystem via one `vfs_write_file()` call before the buffer is freed — the fd's whole write lifetime is "accumulate in memory, commit once on close," mirroring the read side's "load whole file into memory on open."
 
 Descriptors 0, 1, and 2 cannot be closed. After a successful close the descriptor slot is zeroed and available for reuse.
 
@@ -209,7 +222,7 @@ struct stat {
 
 `st_mode`/`st_uid`/`st_gid`/`st_nlink`/`st_ino`/timestamps/`st_blocks`/`st_blksize` come directly from the EXT2 inode; FAT16 synthesizes them (uid=gid=0, mode derived from file/dir type, nlink=1 — see `docs/filesystem.md`). `st_atime`/`st_mtime`/`st_ctime` are 0 only if the underlying filesystem genuinely has no timestamp for that entry.
 
-`vfs_stat` also enforces `X_OK` on every ancestor directory in `path` before returning metadata — see `SYS_ACCESS` and `docs/api/vfs.md`'s Permissions section for the full model.
+`vfs_stat` enforces `X_OK` on every ancestor directory in `path` before returning metadata (see `SYS_ACCESS` and `docs/api/vfs.md`'s Permissions section), and — Stage 4 — transparently follows a symlink named by `path`'s final component: `stat()` on a symlink describes what it points to, never the link itself. Use `SYS_LSTAT` for the link's own metadata. A path resolving through more than 40 symlink hops (including cycles like `A -> B -> A`) fails with `-ELOOP` instead of `-ENOENT`.
 
 ---
 
@@ -273,6 +286,71 @@ struct dirent {
 **Test-only.** Overwrites the calling task's `uid`/`gid` outright, with **no privilege check whatsoever** — there is no login system yet to check against, so this is not a real `setuid()`. It exists solely so `user/ext2test.c` can exercise owner/group/other permission logic while running as non-root. Nothing outside the regression suite should call it, and it must not be treated as a real syscall going forward.
 
 **Arguments**: `EBX`: new uid, `ECX`: new gid. **Returns**: always `0`.
+
+---
+
+## SYS_READLINK (15)
+
+Reads the raw target of a symlink, mirroring POSIX `readlink(2)`.
+
+**Arguments**:
+- `EBX`: pointer to the symlink's path
+- `ECX`: buffer pointer
+- `EDX`: buffer size
+
+**Returns**: number of bytes copied (`>= 0`), never NUL-terminated and truncated to the buffer size if the target is longer; or a negative error code (`-EINVAL` if `path` isn't a symlink, `-ENOENT`, `-EACCES`, `-ELOOP`).
+
+`path`'s own final component is never followed (it names the symlink, not its target) — only ancestor directories are resolved through any symlinks *they* contain.
+
+---
+
+## SYS_LSTAT (16)
+
+Identical to `SYS_STAT` except the final path component is never followed — if it names a symlink, the returned `struct stat` describes the symlink itself (`st_type == 3`, `st_mode` has the `S_IFLNK` bit, permission bits read as the conventional `0777`).
+
+**Arguments**: `EBX`: path pointer, `ECX`: `struct stat *`. **Returns**: `0` or a negative error code, same set as `SYS_STAT`.
+
+---
+
+## SYS_MKDIR (17) / SYS_UNLINK (18) / SYS_RMDIR (19)
+
+Thin wrappers over `vfs_mkdir`/`vfs_unlink`/`vfs_rmdir` (`docs/api/vfs.md`) — each takes just a path pointer in `EBX` and returns `0` or the negative errno the VFS call produced.
+
+| Syscall | Notable failure modes |
+|---|---|
+| `SYS_MKDIR` | `-EEXIST` (already exists), `-EACCES`, `-ENOSPC` |
+| `SYS_UNLINK` | `-EISDIR` (use `SYS_RMDIR` instead), `-ENOENT`, `-EACCES` |
+| `SYS_RMDIR` | `-ENOTDIR`, `-ENOTEMPTY`, `-ENOENT`, `-EACCES` |
+
+`SYS_UNLINK`/`SYS_RMDIR` never follow a trailing symlink — they act on the named entry itself.
+
+---
+
+## SYS_RENAME (20)
+
+**Arguments**: `EBX`: old path pointer, `ECX`: new path pointer. **Returns**: `0` or a negative errno (`vfs_rename`).
+
+Neither path follows a trailing symlink. Both must resolve to the same mounted filesystem — `-EXDEV` otherwise (e.g. renaming from EXT2 `/` to FAT16 `/fat` always fails this way; there is no cross-filesystem move). If the destination already exists it is replaced (same-type only: file-for-file, empty-directory-for-empty-directory), with the moved inode's number unchanged. See `docs/filesystem.md`'s EXT2 write-path section for the on-disk entry-replacement and `..`-repointing details.
+
+---
+
+## SYS_LINK (21)
+
+Creates a second directory entry (a hard link) referring to the same inode.
+
+**Arguments**: `EBX`: existing path, `ECX`: new path. **Returns**: `0` or a negative errno.
+
+The existing path is not followed if it's a symlink (the link points at the symlink inode itself, not its target). The new path must not already exist (`-EEXIST`), and must resolve to the same filesystem as the existing path (`-EXDEV`). Hard-linking a directory always fails with `-EPERM`.
+
+---
+
+## SYS_SYMLINK (22)
+
+Creates a new symlink whose target text is stored verbatim (never validated or resolved at creation time — a symlink may point at nothing).
+
+**Arguments**: `EBX`: target text pointer, `ECX`: new symlink path. **Returns**: `0` or a negative errno (`-EEXIST` if the path is already taken, `-EACCES`, `-ENOSPC`).
+
+On EXT2, a target of 60 bytes or less is stored inline in the inode (a "fast symlink" — no data block allocated, `st_blocks == 0`); longer targets get a real data block chain like a regular file (`st_blocks > 0`). Both are transparent to every reader — `SYS_READLINK`/path resolution don't care which representation was used.
 
 ---
 

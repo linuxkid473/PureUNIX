@@ -77,15 +77,15 @@ run: $(KERNEL) $(DISK) $(DISK2)
 		-serial stdio -no-reboot -no-shutdown
 
 iso: $(KERNEL) $(DISK)
-	@command -v grub-mkrescue >/dev/null 2>&1 || { \
-		echo "grub-mkrescue is required for make iso. Install GRUB tools and rerun make iso."; \
+	@command -v x86_64-elf-grub-mkrescue >/dev/null 2>&1 || { \
+		echo "x86_64-elf-grub-mkrescue is required for make iso. Install GRUB tools and rerun make iso."; \
 		exit 1; \
 	}
 	@rm -rf $(BUILD)/iso
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/pureunix.elf
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO) $(BUILD)/iso
+	x86_64-elf-grub-mkrescue -o $(ISO) $(BUILD)/iso
 
 clean:
 	rm -rf $(BUILD)

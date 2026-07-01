@@ -33,6 +33,7 @@
 #define ATA_DEV_SLAVE  0x10
 
 static int ata_slave_read(uint32_t lba, uint8_t *buffer);
+static int ata_slave_write(uint32_t lba, const uint8_t *buffer);
 
 static disk_device_t primary = {
     .name = "ata0",  .sector_size = 512, .present = false,
@@ -40,7 +41,7 @@ static disk_device_t primary = {
 };
 static disk_device_t slave_dev = {
     .name = "ata1",  .sector_size = 512, .present = false,
-    .read = ata_slave_read,  .write = NULL,
+    .read = ata_slave_read,  .write = ata_slave_write,
 };
 
 static void ata_irq(interrupt_regs_t *regs)
@@ -149,7 +150,9 @@ int ata_write_sector(uint32_t lba, const uint8_t *buffer)
     return 0;
 }
 
-/* ---- slave read-only ------------------------------------------------ */
+/* ---- slave r/w (Stage 4: EXT2 is mounted on the slave disk and is now
+ * writable, so the slave needs a real write path too — mirrors
+ * ata_write_sector() above, just selecting the slave device). ----------- */
 
 static int ata_slave_read(uint32_t lba, uint8_t *buffer)
 {
@@ -158,6 +161,19 @@ static int ata_slave_read(uint32_t lba, uint8_t *buffer)
     if (ata_wait_ready() != 0) return -1;
     uint16_t *w = (uint16_t *)buffer;
     for (int i = 0; i < 256; ++i) w[i] = inw(ATA_PRIMARY_IO + ATA_REG_DATA);
+    ata_delay();
+    return 0;
+}
+
+static int ata_slave_write(uint32_t lba, const uint8_t *buffer)
+{
+    if (!slave_dev.present || ata_select_lba28(1, lba, 1) != 0) return -1;
+    outb(ATA_PRIMARY_IO + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
+    if (ata_wait_ready() != 0) return -1;
+    const uint16_t *w = (const uint16_t *)buffer;
+    for (int i = 0; i < 256; ++i) outw(ATA_PRIMARY_IO + ATA_REG_DATA, w[i]);
+    outb(ATA_PRIMARY_IO + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+    if (ata_bsy_wait() != 0) return -1;
     ata_delay();
     return 0;
 }

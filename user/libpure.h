@@ -19,9 +19,21 @@
 #define SYS_CHOWN  12
 #define SYS_READDIR 13
 #define SYS_DEBUG_SETCRED 14
+#define SYS_READLINK 15
+#define SYS_LSTAT    16
+#define SYS_MKDIR    17
+#define SYS_UNLINK   18
+#define SYS_RMDIR    19
+#define SYS_RENAME   20
+#define SYS_LINK     21
+#define SYS_SYMLINK  22
 
-/* open() flags */
+/* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
+#define O_WRONLY 0x001
+#define O_CREAT  0x100
+#define O_TRUNC  0x200
+#define O_APPEND 0x400
 
 /* lseek() whence values */
 #define SEEK_SET 0
@@ -35,13 +47,21 @@
 #define R_OK 4
 
 /* Negative error codes returned by syscalls */
+#define EPERM   (-1)
 #define ENOENT  (-2)
 #define EACCES  (-13)
 #define EBADF   (-9)
+#define EEXIST  (-17)
+#define EXDEV   (-18)
+#define ENOTDIR (-20)
 #define EISDIR  (-21)
 #define EINVAL  (-22)
 #define EMFILE  (-24)
+#define ENOSPC  (-28)
 #define EROFS   (-30)
+#define ENAMETOOLONG (-36)
+#define ENOTEMPTY (-39)
+#define ELOOP   (-40)
 
 /* Must match PUREUNIX_MAX_NAME in include/pureunix/config.h. */
 #define PU_MAX_NAME 64
@@ -109,6 +129,10 @@ int    pu_open(const char *path, int flags);
 int    pu_close(int fd);
 int    pu_lseek(int fd, int offset, int whence);
 int    pu_stat(const char *path, struct stat *st);
+/* Like pu_stat, but never follows a symlink named by the final path
+ * component (ancestor directories are still resolved through any symlinks
+ * they contain). */
+int    pu_lstat(const char *path, struct stat *st);
 int    pu_access(const char *path, int mode);
 int    pu_chmod(const char *path, mode_t mode);
 int    pu_chown(const char *path, uid_t uid, gid_t gid);
@@ -120,6 +144,23 @@ int    pu_readdir(const char *path, struct dirent *entries, int max_entries);
  * this exists solely for the ext2test regression suite and must not be
  * used anywhere else. */
 int    pu_debug_setcred(uid_t uid, gid_t gid);
+
+/* -------------------------------------------------------------------- */
+/* Stage 4: symlinks, hard links, writable EXT2                          */
+/* -------------------------------------------------------------------- */
+
+/* Reads the raw target of the symlink at path into buf. Never appends a
+ * NUL terminator; truncates to bufsize. Returns the number of bytes copied
+ * (>= 0), or a negative errno. Fails with EINVAL if path is not a symlink. */
+int    pu_readlink(const char *path, char *buf, size_t bufsize);
+int    pu_mkdir(const char *path);
+int    pu_unlink(const char *path);
+int    pu_rmdir(const char *path);
+int    pu_rename(const char *old_path, const char *new_path);
+int    pu_link(const char *old_path, const char *new_path);
+int    pu_symlink(const char *target, const char *path);
+/* Equivalent to open(path, O_WRONLY|O_CREAT|O_TRUNC) — POSIX creat(). */
+int    pu_creat(const char *path);
 void   pu_puts(const char *s);
 void   pu_puti(int value);
 size_t pu_strlen(const char *s);

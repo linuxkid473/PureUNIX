@@ -108,6 +108,9 @@ int ext2_super_read(disk_device_t *disk)
     uint32_t bgdt_blocks = (bgdt_bytes + block_size - 1) / block_size;
     uint32_t bgdt_alloc  = bgdt_blocks * block_size;   /* safe: covers all sector reads */
 
+    g_ext2_fs.bgdt_block  = bgdt_block;
+    g_ext2_fs.bgdt_blocks = bgdt_blocks;
+
     g_ext2_fs.bgdt = kmalloc(bgdt_alloc);
     if (!g_ext2_fs.bgdt) {
         printf("[ext2] super: out of memory for BGDT (%u bytes)\n",
@@ -138,4 +141,37 @@ int ext2_super_read(disk_device_t *disk)
            (unsigned)num_groups,
            (unsigned)inode_size);
     return 0;
+}
+
+void ext2_super_adjust_free(int32_t block_delta, int32_t inode_delta)
+{
+    ext2_fs_t *fs = ext2_get_fs();
+    if (!fs->mounted) return;
+
+    /* The superblock always lives at byte offset 1024 regardless of block
+     * size, so — exactly as ext2_super_read() does — address it by raw
+     * 512-byte sectors (2 and 3) rather than through the block cache. */
+    uint8_t raw[1024];
+    if (fs->disk->read(2, raw) != 0 || fs->disk->read(3, raw + 512) != 0) return;
+
+    uint32_t free_blocks, free_inodes;
+    memcpy(&free_blocks, raw + 12, sizeof(uint32_t));
+    memcpy(&free_inodes, raw + 16, sizeof(uint32_t));
+    free_blocks = (uint32_t)((int32_t)free_blocks + block_delta);
+    free_inodes = (uint32_t)((int32_t)free_inodes + inode_delta);
+    memcpy(raw + 12, &free_blocks, sizeof(uint32_t));
+    memcpy(raw + 16, &free_inodes, sizeof(uint32_t));
+
+    fs->disk->write(2, raw);
+    fs->disk->write(3, raw + 512);
+}
+
+void ext2_bgdt_write_back(void)
+{
+    ext2_fs_t *fs = ext2_get_fs();
+    if (!fs->mounted || !fs->bgdt) return;
+
+    for (uint32_t b = 0; b < fs->bgdt_blocks; b++) {
+        ext2_write_block(fs->bgdt_block + b, (const uint8_t *)fs->bgdt + b * fs->block_size);
+    }
 }
