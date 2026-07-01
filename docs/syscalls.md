@@ -122,9 +122,12 @@ Opens a file and allocates a file descriptor — read-only or writable, dependin
 | `-EINVAL` | -22 | null path pointer |
 | `-ENOENT` | -2 | path does not exist, and (for a write open) `O_CREAT` wasn't given |
 | `-EISDIR` | -21 | path refers to a directory |
-| `-EACCES` | -13 | missing `R_OK` (read open) or `W_OK` (write open) |
+| `-EACCES` | -13 | missing `R_OK` (read open) or `W_OK` (write open), or missing `X_OK` on an ancestor directory during resolution |
+| `-ELOOP` | -40 | path resolution followed more than 40 symlinks (see `docs/api/vfs.md`'s Loop detection) |
 | `-EMFILE` | -24 | all fd slots (3–15) are in use |
 | *(create failure)* | | any negative errno `vfs_create()` returns, if `O_CREAT` was needed and failed for a reason other than the file already existing |
+
+Both the initial `vfs_stat()`/`vfs_create()` check and the subsequent `vfs_read_file()` load return whatever negative errno pathname resolution actually produced — `SYS_OPEN` never collapses a resolution failure like `-ELOOP` or an ancestor's `-EACCES` down to a generic `-ENOENT`; only a genuinely missing path is reported as `-ENOENT`.
 
 **Read opens** (`flags` without `O_WRONLY`, unchanged since Stage 3A): `vfs_read_file()` loads the entire file into a `kmalloc`'d buffer at open time; `SYS_READ` never touches disk.
 
@@ -239,10 +242,11 @@ Checks whether the calling task's credentials would permit the requested access 
 | Code | Value | Meaning |
 |---|---|---|
 | `-EINVAL` | -22 | null path pointer |
-| `-ENOENT` | -2 | path does not exist (or an ancestor directory denies `X_OK`, folded into the same `vfs_stat` failure) |
-| `-EACCES` | -13 | path exists but the requested access is denied |
+| `-ENOENT` | -2 | path does not exist |
+| `-EACCES` | -13 | path exists but the requested access is denied, or an ancestor directory denies `X_OK` during resolution |
+| `-ELOOP` | -40 | path resolution followed more than 40 symlinks |
 
-**Implementation**: `vfs_stat(path, &st)` followed by `vfs_access(&st, current_uid(), current_gid(), mode)` — the same central permission engine every other permission check in the kernel uses.
+**Implementation**: `vfs_stat(path, &st)` followed by `vfs_access(&st, current_uid(), current_gid(), mode)` — the same central permission engine every other permission check in the kernel uses. `vfs_stat()`'s own return code (not just its 0/non-zero-ness) is passed straight back, so an ancestor's `-EACCES` or a symlink loop's `-ELOOP` reaches the caller as such rather than being reported as `-ENOENT`.
 
 ---
 
@@ -265,7 +269,7 @@ Enumerates a directory's entries into a flat, caller-supplied buffer — no curs
 - `ECX`: pointer to an array of `struct dirent`
 - `EDX`: capacity of that array (max entries to write)
 
-**Returns**: the number of entries written (`>= 0`), or a negative error code (`-EINVAL`, `-ENOENT`).
+**Returns**: the number of entries written (`>= 0`), or a negative error code (`-EINVAL`, `-ENOENT`, `-EACCES`, `-ELOOP`) — the real code `vfs_readdir()`'s pathname resolution produced, not folded into a generic `-ENOENT`.
 
 **`struct dirent` layout** (`include/pureunix/dirent.h` / `user/libpure.h`):
 
@@ -366,15 +370,23 @@ Defined in `include/pureunix/errno.h` (kernel) and `user/libpure.h` (user progra
 
 | Constant | Value | Meaning |
 |---|---|---|
+| `EPERM` | 1 | operation not permitted (e.g. `SYS_LINK` on a directory) |
 | `ENOENT` | 2 | no such file or directory |
 | `EIO` | 5 | I/O error |
 | `EBADF` | 9 | bad file descriptor |
 | `EACCES` | 13 | permission denied |
+| `EEXIST` | 17 | file already exists |
+| `EXDEV` | 18 | cross-device link/rename (e.g. EXT2 -> FAT16) |
+| `ENOTDIR` | 20 | not a directory |
 | `EISDIR` | 21 | is a directory |
 | `EINVAL` | 22 | invalid argument |
 | `EMFILE` | 24 | too many open files |
+| `ENOSPC` | 28 | no space left on device (allocator exhausted) |
 | `EROFS` | 30 | read-only filesystem |
+| `ENAMETOOLONG` | 36 | path or component too long |
 | `ENOSYS` | 38 | function not implemented |
+| `ENOTEMPTY` | 39 | directory not empty (`SYS_RMDIR`) |
+| `ELOOP` | 40 | too many symbolic links encountered during resolution (> 40 follows) |
 
 Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
@@ -382,7 +394,9 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 ## Unimplemented Syscalls
 
-`fstat`, `mmap`, `munmap`, `brk`, `fork`, `exec`, `wait`, `waitpid`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `mkdir`, `unlink`, `rename`, `readlink`, `symlink`, `setuid`, `setgid`, `getuid`, `getgid`.
+`fstat`, `mmap`, `munmap`, `brk`, `fork`, `exec`, `wait`, `waitpid`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
+
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above.)
 
 `SYS_CHMOD`/`SYS_CHOWN` exist as syscall numbers but currently always return `-EROFS` — see above.
 

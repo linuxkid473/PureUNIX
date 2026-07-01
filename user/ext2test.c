@@ -577,11 +577,16 @@ int main(void)
         fail("expected directory nlink>=2, got ", (int)st.st_nlink);
 
     /* ----------------------------------------------------------------- 22 */
-    pu_puts("\n[22] symlinks: detected, not followed, not readable as a file\n");
+    pu_puts("\n[22] symlinks: lstat reports the link itself; stat/open follow it (POSIX)\n");
 
-    r = pu_stat("/readme.link", &st);
+    /* Stage 4 replaced Stage 3A's "symlinks are inert" behavior with real
+       POSIX semantics: stat() and open() both follow the final symlink,
+       and only lstat() reports the link itself. See tests 25-27 for the
+       full follow-through/readlink/lstat coverage; this section just
+       confirms the non-following view via lstat() still works. */
+    r = pu_lstat("/readme.link", &st);
     if (r == 0 && st.st_type == 3)
-        pass("stat('/readme.link') reports type=SYMLINK(3)");
+        pass("lstat('/readme.link') reports type=SYMLINK(3)");
     else
         fail("expected st_type=3, got ", (int)st.st_type);
 
@@ -596,13 +601,11 @@ int main(void)
         fail("expected symlink perm bits 0777, got ", (int)(st.st_mode & 0777));
 
     fd = pu_open("/readme.link", O_RDONLY);
-    if (fd < 0)
-        pass("open('/readme.link') fails — readlink() is not implemented, "
-             "and a symlink must not be readable as a regular file");
-    else {
-        fail("expected open(symlink) to fail, got fd=", fd);
+    if (fd >= 3) {
+        pass("open('/readme.link') follows the symlink to a readable regular file");
         pu_close(fd);
-    }
+    } else
+        fail("expected open(symlink) to follow through and succeed, got fd=", fd);
 
     /* ----------------------------------------------------------------- 23 */
     pu_puts("\n[23] access(): F_OK/R_OK/W_OK/X_OK as root\n");
@@ -1247,12 +1250,12 @@ int main(void)
 
             /* Verify a sample of both never-deleted and recreated files
                still (or again) read back their expected content. */
-            fd = pu_open("/stress/f001", O_RDONLY); /* never deleted (odd index) */
+            fd = pu_open("/stress/f1", O_RDONLY); /* never deleted (odd index) */
             n = fd >= 3 ? pu_read(fd, buf, 1) : -1;
             int sample1_ok = (fd >= 3 && n == 1 && buf[0] == 'x');
             if (fd >= 3) pu_close(fd);
 
-            fd = pu_open("/stress/f000", O_RDONLY); /* deleted then recreated */
+            fd = pu_open("/stress/f0", O_RDONLY); /* deleted then recreated */
             n = fd >= 3 ? pu_read(fd, buf, 1) : -1;
             int sample2_ok = (fd >= 3 && n == 1 && buf[0] == 'y');
             if (fd >= 3) pu_close(fd);

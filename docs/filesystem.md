@@ -4,14 +4,14 @@
 
 The filesystem layer has three components:
 
-- **EXT2 driver** (`fs/ext2/`) — read-only driver for the ATA primary slave disk. Handles superblock parsing, block group descriptor table, inode reads, directory traversal, direct and singly-indirect block iteration, and a 4-slot LRU block cache. Primary root filesystem, mounted at `/`.
-- **FAT16 driver** (`fs/fat16.c`) — read/write driver for the ATA primary master disk. Handles cluster allocation/freeing, file and directory CRUD, and all write operations. Mounted at `/fat` for compatibility/testing only.
-- **VFS** (`fs/vfs.c`) — a mount-table router, *not* a dual-dispatch/union layer: every path resolves via longest-prefix match to exactly one mount, and that mount's driver alone serves the call (see `docs/api/vfs.md` for the full mount-table API). Stage 3A adds Unix permission enforcement at this same layer.
+- **EXT2 driver** (`fs/ext2/`) — read/write driver for the ATA primary slave disk (Stage 4 made it writable; see `fs/ext2/alloc.c`/`fs/ext2/write.c`). Handles superblock parsing, block group descriptor table, inode reads/writes, block and inode allocation/freeing, directory traversal/insertion/removal, direct and singly-indirect block iteration, symbolic and hard links, and a 4-slot LRU block cache. Primary root filesystem, mounted at `/`.
+- **FAT16 driver** (`fs/fat16.c`) — read/write driver for the ATA primary master disk. Handles cluster allocation/freeing, file and directory CRUD, and all write operations. Mounted at `/fat` for compatibility/testing only. Unlike EXT2, it has no concept of symlinks or hard links.
+- **VFS** (`fs/vfs.c`) — a mount-table router, *not* a dual-dispatch/union layer: every path resolves via longest-prefix match to exactly one mount, and that mount's driver alone serves the call (see `docs/api/vfs.md` for the full mount-table API). Stage 3A added Unix permission enforcement at this same layer; Stage 4 added the centralized `resolve_path()` pathname resolver (symlink-following, `.`/`..`, loop detection) that every `vfs_*` entry point is now built on.
 
 | Disk | Role | Filesystem | Mountpoint |
 |---|---|---|---|
 | ATA primary master (`index=0`) | Compatibility/testing store | FAT16 (read/write) | `/fat` |
-| ATA primary slave (`index=1`) | Primary root filesystem | EXT2 (read-only) | `/` |
+| ATA primary slave (`index=1`) | Primary root filesystem | EXT2 (read/write) | `/` |
 
 ---
 
@@ -31,7 +31,7 @@ Every `vfs_*` call also runs the calling task's credentials (`current_uid()`/`cu
 
 - Ancestor directories in `path` need `X_OK` (search permission) — enforced for every call, read or write.
 - `vfs_read_file`/`vfs_readdir` additionally require `R_OK` on the target.
-- The write-side calls (`vfs_write_file`, `vfs_create`, `vfs_mkdir`, `vfs_unlink`, `vfs_rmdir`, `vfs_rename`) require `W_OK` on whichever directory/file the operation modifies — enforced unconditionally, even though EXT2 is read-only (its ops table just has those slots `NULL`), so a future writable filesystem is covered automatically.
+- The write-side calls (`vfs_write_file`, `vfs_create`, `vfs_mkdir`, `vfs_unlink`, `vfs_rmdir`, `vfs_rename`, `vfs_link`, `vfs_symlink`) require `W_OK` on whichever directory/file the operation modifies — enforced unconditionally, so any mounted filesystem gets enforcement for free, regardless of whether its `vfs_ops_t` actually implements the operation (a driver that doesn't leaves the slot `NULL` and the VFS reports `-EROFS`).
 - uid 0 (root) always gets read/write; execute additionally requires at least one execute bit set somewhere on the file.
 
 Neither driver knows anything about permissions — `vfs_access()` operates purely on the `vfs_stat_t` metadata drivers already hand back. See `docs/api/vfs.md`'s "Permissions" section for the full model, and `include/pureunix/task.h` for process credentials.
@@ -44,6 +44,7 @@ bool vfs_mounted(void);
 int  vfs_mount_root(void);
 
 int  vfs_stat(const char *path, vfs_stat_t *st);
+int  vfs_lstat(const char *path, vfs_stat_t *st);
 int  vfs_read_file(const char *path, uint8_t **out_data, size_t *out_size);
 int  vfs_write_file(const char *path, const uint8_t *data, size_t size, uint32_t flags);
 int  vfs_create(const char *path);
@@ -51,12 +52,15 @@ int  vfs_mkdir(const char *path);
 int  vfs_unlink(const char *path);
 int  vfs_rmdir(const char *path);
 int  vfs_rename(const char *old_path, const char *new_path);
+int  vfs_link(const char *old_path, const char *new_path);
+int  vfs_symlink(const char *target, const char *path);
+int  vfs_readlink(const char *path, char *buf, size_t bufsize);
 int  vfs_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 const char *vfs_last_error(void);
 void vfs_normalize(char *out, const char *cwd, const char *path);
 ```
 
-All path arguments must be absolute (begin with `/`). Return value is `0` on success, `-1` on failure.
+All path arguments must be absolute (begin with `/`). Every function returns `0` on success and a negative errno on failure (uniform since Stage 4 — see `docs/api/vfs.md` for the full list of codes and the `resolve_path()` pathname resolver every entry point above is built on, including symlink-following, `.`/`..`, and `-ELOOP` loop detection).
 
 ### Write Flags
 
@@ -85,9 +89,11 @@ See `docs/api/vfs.md` for the full, current `vfs_stat_t` (Unix metadata: mode, u
 
 ## EXT2 Driver
 
-**Sources**: `fs/ext2/super.c`, `fs/ext2/block.c`, `fs/ext2/inode.c`, `fs/ext2/dir.c`, `fs/ext2/file.c`, `fs/ext2/mount.c`
+**Sources**: `fs/ext2/super.c`, `fs/ext2/block.c`, `fs/ext2/alloc.c`, `fs/ext2/inode.c`, `fs/ext2/dir.c`, `fs/ext2/file.c`, `fs/ext2/write.c`, `fs/ext2/mount.c`
 **Internal headers**: `fs/ext2/*.h`
 **Public header**: `include/pureunix/ext2.h`
+
+`fs/ext2/alloc.c` and `fs/ext2/write.c` (Stage 4) hold the write path: block/inode bitmap allocation and freeing, directory entry insertion/removal (including growing a directory by allocating additional blocks as it fills up), and `create`/`unlink`/`rename`/`link`/`symlink`/`readlink`/`write_file`.
 
 ### On-Disk Layout
 
@@ -178,7 +184,9 @@ typedef struct {
 
 `ext2_path_to_inode(path, out_ino)` in `fs/ext2/dir.c` walks the directory tree from root inode (inode 2), splitting the path on `/` and calling `ext2_dir_lookup` at each step.
 
-`ext2_readdir_ino(dir_ino, cb, ctx)` enumerates all non-`.`/`..` entries in a directory. For each file entry it reads the file's inode to obtain `i_size`. The inode table block is typically in the block cache after the first read, making this cheap.
+`ext2_readdir_ino(dir_ino, cb, ctx)` enumerates **every** entry in a directory, including `.` and `..` — they are real on-disk directory entries like any other, and the driver never filters them (it's the shell's job to hide them by default and show them under `ls -a`). For each non-directory entry it also reads the file's inode to obtain `i_size`; that nested `ext2_read_inode()` call reads a *different* block (the inode table) than the directory block currently being scanned, so the directory block is copied into a local stack buffer before scanning starts — holding a live cache pointer across that nested read let the directory-block cache slot get evicted and silently swapped out mid-scan, truncating large directory listings.
+
+`ext2_dir_insert(dir_ino, name, ino, file_type)` adds one entry: it first tries to reuse a deleted slot or split an existing entry's trailing slack space in an already-allocated block, and only allocates and appends a fresh block once no existing block has room. `ext2_dir_remove(dir_ino, name)` merges a removed entry's `rec_len` into its predecessor (or, if first in its block, just clears `inode` to mark the slot reusable) — directory blocks are never compacted across entries this way, only within a block's own free space.
 
 Directory entry structure:
 
@@ -187,7 +195,7 @@ typedef struct {
     uint32_t inode;         // 0 = deleted/unused
     uint16_t rec_len;       // byte length of this entry (advances to next)
     uint8_t  name_len;
-    uint8_t  file_type;     // EXT2_FT_REG_FILE or EXT2_FT_DIR
+    uint8_t  file_type;     // EXT2_FT_REG_FILE, EXT2_FT_DIR, or EXT2_FT_SYMLINK
     char     name[];        // not null-terminated; length given by name_len
 } ext2_dirent_t;
 ```
@@ -196,15 +204,21 @@ typedef struct {
 
 ```c
 int  ext2_mount(disk_device_t *disk);
-void ext2_unmount(void);
 bool ext2_is_mounted(void);
 
 int  ext2_stat(const char *path, vfs_stat_t *st);
 int  ext2_read_file(const char *path, uint8_t **out_data, size_t *out_size);
+int  ext2_write_file(const char *path, const uint8_t *data, size_t size, uint32_t flags);
+int  ext2_create(const char *path, bool directory);
+int  ext2_unlink(const char *path, bool directory);
+int  ext2_rename(const char *old_path, const char *new_path);
+int  ext2_link(const char *old_path, const char *new_path);
+int  ext2_symlink(const char *target, const char *path);
+int  ext2_readlink(const char *path, char *buf, size_t bufsize);
 int  ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 ```
 
-`ext2_read_file` allocates a `kcalloc`'d buffer for the entire file. The caller must `kfree` it.
+`ext2_read_file` allocates a `kcalloc`'d buffer for the entire file. The caller must `kfree` it. `ext2_write_file` frees the inode's existing blocks and writes the new content across freshly-allocated blocks (append is handled by the caller pre-combining old + new content, not by the driver).
 
 ### EXT2 Disk Image
 
@@ -235,6 +249,7 @@ Contents:
     alpha.txt
     beta.txt
     gamma.txt
+    uplink              symlink -> ../README.TXT (relative, resolved from testdir's own parent)
 /perm/                  Stage 3A permission-engine regression fixtures
     exec.sh             mode 0755, uid=0, gid=0
     private.txt         mode 0600, uid=0, gid=0 — owner-only
@@ -243,11 +258,17 @@ Contents:
     group_test.txt       mode 0640, uid=0, gid=100 — exercises the group tier specifically
     emptydir/            directory with nothing but '.' and '..'
 /readme.link            symlink -> README.TXT (ext2 "fast symlink", inline target, no data block)
+/abslink                symlink -> /README.TXT (absolute-target fast symlink)
+/loop_a                 symlink -> loop_b (Stage 4 ELOOP regression fixture)
+/loop_b                 symlink -> loop_a (cycle with loop_a; resolution must give up after 40 hops)
+/bin/hello              symlink -> hello.elf (exercises exec-through-a-symlink)
 /bigfile.bin            5120 bytes (5 × 1 KB blocks, all 'B')
 /hugefile.bin           14336 bytes (14 × 1 KB blocks, bytes 0–255 repeating)
 ```
 
 `bigfile.bin` tests block-boundary reads (spans blocks 1–5). `hugefile.bin` tests singly-indirect block reads (exceeds 12 direct blocks; blocks 13–14 are via `i_block[12]`). Every inode gets a real (image build time) timestamp — see `tools/mkext2.py`'s `BUILD_TIME` — rather than the all-zero placeholder used before Stage 2D.
+
+The rest of the writable-filesystem surface (files/directories/hard links created and removed at runtime — `mkdir`, `creat`/`write`, `unlink`, `rmdir`, `rename`, `link`, `symlink` with both fast and block-based targets) is exercised by `user/ext2test.c`'s regression suite rather than baked into the image; see that file for the full scenario list.
 
 ---
 
@@ -458,18 +479,18 @@ A negative resulting offset returns `-EINVAL`. Seeking past the end of the file 
 
 ## Limitations
 
-- EXT2 is read-only; no write or create operations.
-- EXT2 does not support doubly- or triply-indirect blocks.
-- FAT16 filenames restricted to 8.3; no LFN support.
+- EXT2 does not support doubly- or triply-indirect blocks (files are capped at 12 + 256 = 268 blocks, i.e. ~268 KiB with 1 KiB blocks).
+- FAT16 filenames restricted to 8.3; no LFN support; FAT16 has no concept of symlinks or hard links (its `vfs_ops_t` leaves `readlink`/`link`/`symlink` `NULL`).
 - Single FAT16 and single EXT2 instance; no unmount.
 - Root directory has a fixed 512-entry capacity in FAT16.
 - `fat16_rename` does not support true atomic cross-directory moves.
 - Permissions are enforced (Stage 3A — see `docs/api/vfs.md`), but there is no
   ACL/capability model, no setuid/setgid, no sticky bit, and no groups
-  database. `chmod`/`chown` exist only as `-EROFS` syscall stubs; no
-  filesystem can persist a permission or ownership change yet.
+  database. `chmod`/`chown` exist only as `-EROFS` syscall stubs on both
+  filesystems; neither can persist a permission or ownership change yet.
 - No login system: every process is uid 0 (root) in practice. Credentials
   exist and are enforced, but nothing can set them to anything else outside
   the `ext2test` regression suite's test-only `SYS_DEBUG_SETCRED` hook.
-- Symlinks are recognized (`VFS_SYMLINK`, `S_ISLNK`) but never followed;
-  `readlink()`/`symlink()` are not implemented.
+- No `O_RDWR`: a file opened for reading can't also be written, and vice
+  versa; read-modify-write requires a full read followed by a separate
+  truncating write.

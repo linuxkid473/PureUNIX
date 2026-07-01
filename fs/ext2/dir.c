@@ -137,9 +137,18 @@ static int readdir_block(uint32_t blk_no, void *raw_ctx)
 
     if (blk_no == 0) return 0;
 
-    /* Non-owning pointer into block cache — do NOT kfree. */
-    const uint8_t *buf = ext2_read_block(blk_no);
-    if (!buf) return -1;
+    /* Copy the block out immediately: unlike a lookup that only compares
+     * names, this loop calls ext2_read_inode() per entry (to fill in
+     * dirent.size), which itself calls ext2_read_block() on the inode
+     * table — a different block competing for the same cache slots. Held
+     * across that call, a raw cache pointer here could get silently
+     * evicted and start reading someone else's block mid-scan (see the
+     * ownership rule in block.h; every other block-modifying loop in this
+     * file already copies out for the same reason). */
+    const uint8_t *ro = ext2_read_block(blk_no);
+    if (!ro) return -1;
+    uint8_t buf[EXT2_DIR_MAX_BLOCK];
+    memcpy(buf, ro, fs->block_size);
 
     uint32_t off = 0;
     while (off + sizeof(ext2_dirent_t) <= fs->block_size) {

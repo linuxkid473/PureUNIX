@@ -190,8 +190,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (!want_write) {
             /* Read-only open (unchanged since Stage 3A). */
             vfs_stat_t st;
-            if (vfs_stat(path, &st) != 0) {
-                return (uint32_t)-ENOENT;
+            int srs = vfs_stat(path, &st);
+            if (srs != 0) {
+                return (uint32_t)srs;
             }
             if (st.type != VFS_FILE) {
                 return (uint32_t)-EISDIR;
@@ -202,8 +203,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
             uint8_t *data = NULL;
             size_t   size = 0;
-            if (vfs_read_file(path, &data, &size) != 0) {
-                return (uint32_t)-ENOENT;
+            int rrc = vfs_read_file(path, &data, &size);
+            if (rrc != 0) {
+                return (uint32_t)rrc;
             }
 
             t->fds[fd].used   = true;
@@ -219,8 +221,14 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         /* Writable open (Stage 4): the whole file is buffered in memory and
          * flushed to the filesystem in one shot on close(). */
         vfs_stat_t st;
-        bool exists = (vfs_stat(path, &st) == 0);
-        if (!exists) {
+        int sws = vfs_stat(path, &st);
+        if (sws != 0) {
+            /* Anything other than "doesn't exist" (e.g. -ELOOP, -EACCES
+             * from a traversal check) is a real resolution failure and
+             * must be reported as such, not papered over as ENOENT. */
+            if (sws != -ENOENT) {
+                return (uint32_t)sws;
+            }
             if (!want_creat) {
                 return (uint32_t)-ENOENT;
             }
@@ -228,8 +236,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             if (cr != 0 && cr != -EEXIST) {
                 return (uint32_t)cr;
             }
-            if (vfs_stat(path, &st) != 0) {
-                return (uint32_t)-ENOENT;
+            sws = vfs_stat(path, &st);
+            if (sws != 0) {
+                return (uint32_t)sws;
             }
         }
         if (st.type != VFS_FILE) {
@@ -486,8 +495,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-ENOENT;
         }
         readdir_collect_ctx_t ctx = { .out = out, .max = max, .count = 0 };
-        if (vfs_readdir(path, readdir_collect_cb, &ctx) < 0) {
-            return (uint32_t)-ENOENT;
+        int drc = vfs_readdir(path, readdir_collect_cb, &ctx);
+        if (drc < 0) {
+            return (uint32_t)drc;
         }
         return (uint32_t)ctx.count;
     }

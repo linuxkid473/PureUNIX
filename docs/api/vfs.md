@@ -291,7 +291,7 @@ int vfs_chmod(const char *path, mode_t mode);
 int vfs_chown(const char *path, uid_t uid, gid_t gid);
 ```
 
-Resolve the path and confirm it exists (`-ENOENT` if not), then call the mount's `ops->chmod`/`ops->chown`. Both are `NULL` on every driver today (EXT2 is read-only; FAT16 has no permission storage), so every existing path currently gets `-EROFS`. No actual chmod/chown behaviour exists yet — this is scaffolding so a future writable filesystem can plug in without any VFS-level API change.
+Resolve the path and confirm it exists (`-ENOENT` if not), then call the mount's `ops->chmod`/`ops->chown`. Both are `NULL` on every driver today — Stage 4 made EXT2 writable for file/directory/link content, but neither it nor FAT16 stores mutable ownership/permission bits on disk — so every existing path currently gets `-EROFS`. No actual chmod/chown behaviour exists yet — this is scaffolding so a future on-disk permission format can plug in without any VFS-level API change.
 
 ### What is *not* here yet
 
