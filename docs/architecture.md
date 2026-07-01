@@ -2,7 +2,7 @@
 
 ## Overview
 
-PureUnix is a monolithic, single-address-space kernel for the i686 (IA-32) architecture. There is no hardware-enforced user/kernel separation in the current implementation: ELF user programs are loaded into the same virtual address space as the kernel and executed at ring 0.
+PureUNIX is a monolithic, single-address-space kernel for the i686 (IA-32) architecture. There is no hardware-enforced user/kernel separation in the current implementation: ELF user programs are loaded into the same virtual address space as the kernel and executed at ring 0.
 
 The kernel is a single flat ELF binary linked at the 1 MiB physical address mark. It initializes protected-mode services sequentially from `kernel_main`, then enters the interactive shell loop. There is no background thread or idle process: the kernel spins on `hlt` in a loop placed after `shell_run`, which never returns in normal operation.
 
@@ -37,9 +37,10 @@ kernel_main(magic, mbi_addr)
     ├── syscall_init()           No-op (INT 0x80 gate already set in idt_init)
     ├── pit_init(100)            Program PIT channel 0 to 100 Hz; enable IRQ0
     ├── keyboard_init()          Flush PS/2 buffer; register IRQ1 handler; enable IRQ1
-    ├── ata_init()               Probe ATA primary master; register IRQ14 handler
+    ├── ata_init()               Probe ATA primary master + slave; register IRQ14 handler
     ├── vfs_init()               Initialize VFS error string
-    ├── fat16_mount(disk)        Parse BPB from sector 0 of ATA disk (if present)
+    ├── fat16_mount(disk)        Parse BPB from ATA primary master (index=0); FAT16
+    ├── ext2_mount(disk2)        Parse superblock from ATA primary slave (index=1); EXT2
     ├── arch_enable_interrupts() STI
     └── shell_run()              Enter interactive shell (does not return)
 ```
@@ -62,9 +63,10 @@ kernel_main(magic, mbi_addr)
 | VGA | `drivers/vga.c` | 80×25 text mode, ANSI SGR, hardware cursor |
 | Serial | `drivers/serial.c` | COM1 output, ANSI cursor control |
 | Keyboard | `drivers/keyboard.c` | PS/2 scan code set 1 → key codes, ring buffer |
-| ATA | `drivers/ata.c` | PIO read/write, primary master, LBA28 |
+| ATA | `drivers/ata.c` | PIO read/write, primary master + slave, LBA28 |
 | FAT16 | `fs/fat16.c` | BPB parse, path lookup, cluster I/O, all file operations |
-| VFS | `fs/vfs.c` | Dispatch wrapper over FAT16; path normalization |
+| EXT2 | `fs/ext2/` | Read-only; superblock, BGDT, inode table, dir traversal, block cache |
+| VFS | `fs/vfs.c` | Dual-dispatch (EXT2-first reads, union readdir, FAT16-only writes); path normalization |
 | libc | `libc/` | `printf`, string functions, `ctype`, `stdlib` |
 | Shell | `shell/` | Line editor, parser, pipeline execution, 27 builtins |
 | Editor | `editor/editor.c` | vim-like modal editor, 512 lines, single-level undo |
@@ -83,7 +85,8 @@ Physical / Virtual Address (identity mapped 1:1)
     [.text]                  Kernel code (4 KiB aligned)
     [.rodata]                Read-only data, exception names
     [.data]                  Initialized globals
-    [.bss]                   Zero globals; boot_stack_bottom–boot_stack_top (32 KiB)
+    [.bss]                   Zero globals; boot_stack_bottom–boot_stack_top (32 KiB);
+                             EXT2 block cache (4 × 4 KiB slots = 16 KiB)
 (__kernel_end)               End of kernel image (linker symbol)
 
 ALIGN(__kernel_end, 4096)    Kernel heap start
@@ -118,7 +121,8 @@ The order in `kernel_main` is not arbitrary:
 4. **vmm_init before heap_init**: the heap region must be mapped before any pointer in it is dereferenced.
 5. **heap_init before tasking_init**: task stacks are allocated via `kmalloc`.
 6. **pit_init/keyboard_init before arch_enable_interrupts**: handlers must be registered before the CPU can receive them.
-7. **ata_init + fat16_mount before shell_run**: shell builtins like `ls` and `cat` assume the filesystem is ready.
+7. **ata_init before fat16_mount/ext2_mount**: disk devices must be probed before filesystem drivers reference them.
+8. **fat16_mount/ext2_mount before shell_run**: shell builtins like `ls` and `cat` assume the filesystem is ready.
 
 ---
 
@@ -138,8 +142,10 @@ kernel_main
 ├── pit_init         needs: io.h, arch.h
 ├── keyboard_init    needs: io.h, arch.h
 ├── ata_init         needs: io.h, arch.h, disk.h
-├── vfs_init         needs: fat16.h, string.h
+├── vfs_init         needs: fat16.h, ext2.h, string.h
 ├── fat16_mount      needs: disk.h, memory.h, string.h, stdio.h
+├── ext2_mount       needs: disk.h, memory.h, string.h, stdio.h
+│       └── fs/ext2/ needs: block.c (cache), super.c, inode.c, dir.c, file.c
 └── shell_run
     ├── shell_readline   needs: keyboard.h, vga.h, stdio.h, vfs.h
     ├── shell_parse      needs: string.h

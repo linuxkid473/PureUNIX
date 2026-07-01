@@ -4,13 +4,13 @@
 
 - C99 with GCC extensions (`-std=gnu99`).
 - 4-space indentation; no tabs in C files.
-- Function names: `module_verb_noun` (e.g., `fat16_read_file`, `pit_sleep`).
+- Function names: `module_verb_noun` (e.g., `fat16_read_file`, `pit_sleep`, `ext2_read_block`).
 - Struct types: `snake_case_t`.
 - Enum constants: `ALL_CAPS`.
 - `#define` constants: `ALL_CAPS`, prefixed with module name.
 - Header guards: `__PUREUNIX_MODULE_H__`.
 - Kernel-only declarations guarded with `#ifdef __PUREUNIX_KERNEL__`.
-- No dynamic dispatch; function pointers only where unavoidable (VFS, disk_device_t).
+- No dynamic dispatch; function pointers only where unavoidable (VFS callbacks, `disk_device_t`).
 
 ---
 
@@ -19,7 +19,7 @@
 1. Create `drivers/<name>.c` and `include/pureunix/<name>.h`.
 2. Write an init function (`<name>_init()`).
 3. If the driver needs an IRQ:
-   - Register with `idt_set_irq_handler(irq_num, handler_fn)` (or call `idt_register_irq` if that wrapper exists — check `arch/i386/idt.c`).
+   - Register with `idt_set_irq_handler(irq_num, handler_fn)`.
    - Enable the IRQ line with `irq_enable(irq_num)` from `arch/i386/pic.c`.
 4. Call `<name>_init()` from `kernel/main.c` in the appropriate sequence (after `arch_init()` for hardware access, after `heap_init()` if the driver needs `kmalloc`).
 5. Add the new `.c` file to one of the directories already included in the Makefile's `find` glob (`drivers/` is already covered).
@@ -70,15 +70,25 @@ The INT 0x80 gate is already installed with DPL=3; no IDT changes are required f
 2. Write a `main(void)` function returning `int`.
 3. Add the program name to `USER_PROGRAMS` in `Makefile`:
    ```makefile
-   USER_PROGRAMS := hello calc viewer editor sh <name>
+   USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test <name>
    ```
 4. `make` will compile, link, and include it in the FAT16 image under `/BIN/<NAME>.ELF`.
 
 **Constraints**:
 - No standard library. Only `libpure` functions are available.
 - Programs run in kernel address space with no memory protection.
-- File I/O is `O_RDONLY` only. `pu_open`, `pu_close`, `pu_lseek`, and `pu_stat` work; writing to an open fd via syscall is not yet implemented.
+- File I/O: `pu_open` (EXT2 or FAT16), `pu_read`, `pu_lseek`, `pu_close`, `pu_stat` all work. Writing to an open fd via syscall is not implemented.
 - Stack is the kernel boot stack; deep recursion may corrupt kernel data.
+
+---
+
+## EXT2 Block Cache Rules
+
+The EXT2 block cache returns non-owning pointers. These rules must be followed:
+
+1. **Never call `kfree` on a pointer returned by `ext2_read_block`.** The cache owns the buffer.
+2. **Copy data before calling `ext2_read_block` again.** Any `ext2_read_block` call can evict the slot holding your pointer. In `ext2_iter_blocks`, the singly-indirect block pointer table is copied into a `uint32_t local_ptrs[256]` array for exactly this reason.
+3. **`ext2_block_cache_flush()`** is called at mount and unmount. Do not call it during normal driver operation.
 
 ---
 
@@ -87,26 +97,28 @@ The INT 0x80 gate is already installed with DPL=3; no IDT changes are required f
 The `kernel_main` function in `kernel/main.c` initializes subsystems in this order:
 
 ```
-serial_init()       # COM1; needed for early debug output
-vga_init()          # text mode; screen cleared
-arch_init()         # GDT + IDT installed; interrupts still disabled
-pmm_init()          # parses Multiboot memory map; bitmap populated
-vmm_init()          # paging enabled
-heap_init()         # kmalloc available after this point
-tasking_init()      # initial "kernel" task created
-syscall_init()      # INT 0x80 gate installed
-pit_init(100)       # IRQ0 handler registered; 100 Hz tick counter
-keyboard_init()     # IRQ1 handler registered
-ata_init()          # ATA probed; IRQ14 registered
-vfs_init()          # VFS state initialized (no disk yet)
-fat16_mount()       # filesystem mounted on ATA primary master
+serial_init()             # COM1; needed for early debug output
+vga_init()                # text mode; screen cleared
+arch_init()               # GDT + IDT installed; interrupts still disabled
+pmm_init()                # parses Multiboot memory map; bitmap populated
+vmm_init()                # paging enabled
+heap_init()               # kmalloc available after this point
+tasking_init()            # initial "kernel" task created
+syscall_init()            # no-op; INT 0x80 gate already set in idt_init
+pit_init(100)             # IRQ0 handler registered; 100 Hz tick counter
+keyboard_init()           # IRQ1 handler registered
+ata_init()                # ATA primary master + slave probed; IRQ14 registered
+vfs_init()                # VFS state initialized (no disk yet)
+fat16_mount(primary_master)   # FAT16 filesystem; program store
+ext2_mount(primary_slave)     # EXT2 filesystem; data store (may be absent)
 arch_enable_interrupts()  # STI; hardware interrupts now active
-shell_run()         # interactive shell loop; never returns
+shell_run()               # interactive shell loop; never returns
 ```
 
 Subsystems may not be called out of order. In particular:
 - `kmalloc` before `heap_init()` will dereference null.
 - `irq_enable` before `arch_init()` will modify an uninitialized IDT.
+- `fat16_mount` / `ext2_mount` before `ata_init()` will access an uninitialized disk device.
 - `shell_run` before `arch_enable_interrupts()` will hang on the first keyboard read.
 
 ---
@@ -117,9 +129,11 @@ Subsystems may not be called out of order. In particular:
 |---|---|
 | `0x00000000–0x000FFFFF` | BIOS/VGA/reserved; PMM never allocates here |
 | `0x00100000–__kernel_end` | Kernel image; PMM marks as used |
-| `__kernel_end – __kernel_end+4MB` | Kernel heap (fixed 8 MiB) |
+| `__kernel_end – __kernel_end+8MB` | Kernel heap (fixed 8 MiB) |
 | `0x00400000–0x006FFFFF` | ELF user program load range |
 | `0x00B8000` | VGA framebuffer (within identity-mapped 128 MiB) |
+
+The EXT2 block cache (16 KiB) lives in kernel `.bss` and does not use the heap.
 
 ---
 
@@ -152,12 +166,13 @@ qemu-system-i386 \
     -m 128M \
     -kernel build/pureunix.elf \
     -drive file=build/pureunix.img,format=raw,if=ide,index=0 \
+    -drive file=build/ext2.img,format=raw,if=ide,index=1 \
     -serial stdio \
     -no-reboot -no-shutdown \
     -s -S
 ```
 
-`-s`: listens on `localhost:1234` for GDB.  
+`-s`: listens on `localhost:1234` for GDB.
 `-S`: pauses CPU at startup until GDB connects.
 
 Connect with:
@@ -185,39 +200,48 @@ Task stacks are 16 KiB with no guard page. Deep recursion or large stack frames 
 
 ### Cooperative Scheduling Only
 
-The PIT IRQ0 handler only increments `ticks`. A task that does not call `task_yield()` holds the CPU indefinitely. Any blocking loop without a yield will hang the system.
+The PIT IRQ0 handler only increments `ticks`. A task that does not call `task_yield()` holds the CPU indefinitely.
 
 ### SYS_EXIT Does Not Kill the Task
 
-Calling `syscall3(SYS_EXIT, code, 0, 0)` returns `code` from `syscall_dispatch` but does not terminate or zombie the current task. The task continues executing. Programs relying on `exit()` semantics must explicitly avoid this.
+Calling `syscall3(SYS_EXIT, code, 0, 0)` returns `code` from `syscall_dispatch` but does not terminate or zombie the current task. Programs relying on `exit()` semantics must avoid this.
 
-### 8MB Heap, No Growth
+### 8 MiB Heap, No Growth
 
-The heap is fixed at 8 MiB starting at `__kernel_end`. Large `kmalloc` calls will fail (return null) if the heap is exhausted. There is no `sbrk` or heap extension.
+The heap is fixed at 8 MiB starting at `__kernel_end`. Large `kmalloc` calls will fail (return null) if the heap is exhausted.
+
+### EXT2 Block Cache Eviction
+
+The 4-slot LRU block cache means only 4 distinct blocks can be live simultaneously. Code that holds a non-owning pointer from `ext2_read_block` and then calls `ext2_read_block` for a 5th distinct block will get the pointer silently invalidated. Always copy needed data into a local buffer or stack array before the next call.
 
 ### FAT16 8.3 Only
 
-Filenames longer than 8 characters or extensions longer than 3 characters are truncated or rejected by `name_to_83`. Files created by other OS tools with LFN entries will be ignored (their LFN slots are skipped; only the 8.3 short entry is used if present).
+Filenames longer than 8 characters or extensions longer than 3 characters are truncated or rejected. LFN entries from other OS tools are skipped.
 
 ### Single-Level Undo in Editor
 
-The editor (`editor/editor.c`) keeps only one undo level. After a second edit, the previous undo state is permanently lost.
+The editor keeps only one undo level. After a second edit, the previous undo state is permanently lost.
 
 ---
 
 ## Testing
 
-There is no automated test suite. Manual testing procedure:
+Manual testing procedure:
 
 1. `make` — verify zero errors and zero warnings.
 2. `make run` — observe boot sequence on serial output and VGA.
 3. At the shell prompt:
    - `help` — verify builtin list appears.
-   - `ls /` — verify FAT16 root is readable.
-   - `cat /README.TXT` — verify file read works.
-   - `echo hello > /test.txt && cat /test.txt` — verify write and pipeline.
+   - `ls /` — verify entries from both EXT2 (README.TXT, etc/, home/, testdir/, bigfile.bin, hugefile.bin) and FAT16 (BIN/, DOCS/) appear.
+   - `cat /README.TXT` — verify EXT2 file read works.
+   - `ls /bin` — verify FAT16 /BIN/ is readable.
+   - `echo hello > /test.txt && cat /test.txt` — verify FAT16 write and pipeline.
+   - `stat /bigfile.bin` — verify size 5120 from EXT2.
+   - `stat /hugefile.bin` — verify size 14336 from EXT2.
    - `/bin/hello.elf` — verify ELF execution.
-   - `/bin/opentest.elf` — verify file syscalls; all lines should end in `OK`, `fd=3`, or expected negative error codes.
+   - `/bin/opentest.elf` — verify file open/stat/lseek/close syscalls.
+   - `/bin/readtest.elf` — verify SYS_READ on VFS-backed file descriptors.
+   - `/bin/ext2test.elf` — 14-case EXT2 integration test; all should pass.
    - `ps` — verify task list.
    - `vim /test.txt` — verify editor opens and `:q` exits.
    - `reboot` — verify reboot via keyboard controller.
