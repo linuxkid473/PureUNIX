@@ -34,22 +34,63 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     case SYS_READ: {
         int fd = (int)regs->ebx;
         char *buf = (char *)regs->ecx;
-        size_t len = regs->edx;
-        if (fd != 0) {
+        size_t len = (size_t)regs->edx;
+
+        if (fd == 0) {
+            /* stdin: keyboard — preserve original behaviour */
+            if (!buf) {
+                return (uint32_t)-EINVAL;
+            }
+            size_t i = 0;
+            while (i < len) {
+                int key = keyboard_getkey();
+                if (key == KEY_ENTER) {
+                    buf[i++] = '\n';
+                    break;
+                }
+                if (key > 0 && key < 128) {
+                    buf[i++] = (char)key;
+                }
+            }
+            return (uint32_t)i;
+        }
+
+        /* fds 1 and 2 are write-only; anything outside [3, MAX_OPEN_FILES) is invalid */
+        if (fd < 3 || fd >= MAX_OPEN_FILES) {
             return (uint32_t)-EBADF;
         }
-        size_t i = 0;
-        while (i < len) {
-            int key = keyboard_getkey();
-            if (key == KEY_ENTER) {
-                buf[i++] = '\n';
-                break;
-            }
-            if (key > 0 && key < 128) {
-                buf[i++] = (char)key;
-            }
+
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EBADF;
         }
-        return i;
+
+        fd_entry_t *f = &t->fds[fd];
+        if (!f->used || !f->data) {
+            return (uint32_t)-EBADF;
+        }
+
+        if (!buf) {
+            return (uint32_t)-EINVAL;
+        }
+
+        /* Zero-length read: valid per POSIX; nothing to copy */
+        if (len == 0) {
+            return 0;
+        }
+
+        /* At or past EOF */
+        if (f->offset >= f->size) {
+            return 0;
+        }
+
+        size_t available = f->size - f->offset;
+        size_t to_copy   = (len < available) ? len : available;
+
+        memcpy(buf, f->data + f->offset, to_copy);
+        f->offset += to_copy;
+
+        return (uint32_t)to_copy;
     }
     case SYS_GETPID:
         return task_current() ? task_current()->id : 0;
@@ -98,6 +139,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
 
         t->fds[fd].used   = true;
+        t->fds[fd].flags  = flags;
         t->fds[fd].data   = data;
         t->fds[fd].size   = size;
         t->fds[fd].offset = 0;

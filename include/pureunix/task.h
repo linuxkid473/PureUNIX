@@ -10,10 +10,11 @@
    data is the entire file loaded at open() time via vfs_read_file(). */
 typedef struct fd_entry {
     bool     used;
-    char     path[PUREUNIX_MAX_PATH];
-    uint8_t *data;    /* kmalloc'd file contents; freed on close */
-    size_t   size;
-    size_t   offset;  /* current read position */
+    int      flags;              /* open() flags: O_RDONLY / O_WRONLY / O_RDWR */
+    char     path[PUREUNIX_MAX_PATH]; /* VFS path — used for re-stat and debugging */
+    uint8_t *data;               /* kmalloc'd file contents; freed on close */
+    size_t   size;               /* total file size in bytes */
+    size_t   offset;             /* current seek position */
 } fd_entry_t;
 
 typedef enum task_state {
