@@ -1,6 +1,7 @@
 #include <pureunix/arch.h>
 #include <pureunix/config.h>
 #include <pureunix/disk.h>
+#include <pureunix/ext2.h>
 #include <pureunix/fat16.h>
 #include <pureunix/kernel.h>
 #include <pureunix/keyboard.h>
@@ -31,11 +32,22 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     ata_init();
     vfs_init();
 
+    /* FAT16 on primary master (program store) */
     disk_device_t *disk = ata_primary_master();
     if (disk->present && fat16_mount(disk) == 0) {
-        printf("Root filesystem mounted on %s\n", disk->name);
+        printf("FAT16 mounted on %s\n", disk->name);
     } else {
-        printf("No FAT16 disk mounted; filesystem commands will report errors.\n");
+        printf("No FAT16 disk found; filesystem commands may fail.\n");
+    }
+
+    /* EXT2 on primary slave (data filesystem — takes priority in VFS reads) */
+    disk_device_t *disk2 = ata_primary_slave();
+    if (disk2->present) {
+        if (ext2_mount(disk2) == 0) {
+            printf("EXT2 mounted on %s\n", disk2->name);
+        } else {
+            printf("EXT2 mount failed on %s\n", disk2->name);
+        }
     }
 
     arch_enable_interrupts();

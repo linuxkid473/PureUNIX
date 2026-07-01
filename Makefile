@@ -9,7 +9,8 @@ PYTHON ?= python3
 BUILD := build
 KERNEL := $(BUILD)/pureunix.elf
 ISO := $(BUILD)/pureunix.iso
-DISK := $(BUILD)/pureunix.img
+DISK  := $(BUILD)/pureunix.img
+DISK2 := $(BUILD)/ext2.img
 
 COMMON_CFLAGS := -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Wno-unused-parameter \
 	-fno-stack-protector -fno-pic -fno-pie -m32 -march=i686 -Iinclude
@@ -24,12 +25,12 @@ KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 	$(patsubst %.S,$(BUILD)/%.o,$(KERNEL_AS_SRCS))
 DEPS := $(KERNEL_OBJS:.o=.d)
 
-USER_PROGRAMS := hello calc viewer editor sh opentest readtest
+USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
 .PHONY: all run iso clean disk docs
 
-all: $(KERNEL) $(DISK)
+all: $(KERNEL) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -64,10 +65,15 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
 
-disk: $(DISK)
+$(DISK2): tools/mkext2.py
+	$(PYTHON) tools/mkext2.py $@
 
-run: $(KERNEL) $(DISK)
-	$(QEMU) -m 128M -kernel $(KERNEL) -drive file=$(DISK),format=raw,if=ide,index=0 \
+disk: $(DISK) $(DISK2)
+
+run: $(KERNEL) $(DISK) $(DISK2)
+	$(QEMU) -m 128M -kernel $(KERNEL) \
+		-drive file=$(DISK),format=raw,if=ide,index=0 \
+		-drive file=$(DISK2),format=raw,if=ide,index=1 \
 		-serial stdio -no-reboot -no-shutdown
 
 iso: $(KERNEL) $(DISK)

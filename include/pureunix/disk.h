@@ -13,6 +13,7 @@ typedef struct disk_device {
 
 void ata_init(void);
 disk_device_t *ata_primary_master(void);
+disk_device_t *ata_primary_slave(void);
 int ata_read_sector(uint32_t lba, uint8_t *buffer);
 int ata_write_sector(uint32_t lba, const uint8_t *buffer);
 
