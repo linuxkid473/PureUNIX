@@ -38,21 +38,39 @@ int ext2_stat(const char *path, vfs_stat_t *st)
     ext2_inode_t inode;
     if (ext2_read_inode(ino, &inode) != 0) return -1;
 
+    /* Every on-disk inode type is decoded: the coarse VFS type only
+     * distinguishes directory/symlink/"everything else" (regular files,
+     * device nodes, FIFOs, sockets all read back as VFS_FILE at this
+     * level), but the real type is always available via S_ISxxx(st_mode)
+     * below. Size always comes straight from the inode — directories are
+     * not special-cased to zero. */
     uint16_t type_bits = inode.i_mode & EXT2_S_IFMT;
     if (type_bits == EXT2_S_IFDIR) {
         st->type = VFS_DIR;
-        st->size = 0;
-    } else if (type_bits == EXT2_S_IFREG) {
-        st->type = VFS_FILE;
-        st->size = inode.i_size;
+    } else if (type_bits == EXT2_S_IFLNK) {
+        st->type = VFS_SYMLINK;
     } else {
-        /* Symlinks, device nodes, etc. — not supported. */
-        return -1;
+        st->type = VFS_FILE;
     }
+    st->size = inode.i_size;
 
     /* Expose UNIX permission bits (lower 12 bits of i_mode) as the mode
        field; the VFS treats it as opaque. */
     st->mode = (uint16_t)(inode.i_mode & 0x0FFF);
+
+    /* Full Unix metadata, taken directly from the on-disk inode — EXT2's
+     * i_mode already uses the standard S_IF-type-plus-rwx encoding, so it
+     * can be copied into st_mode with no translation. No fields synthesized. */
+    st->st_mode = inode.i_mode;
+    st->st_uid = inode.i_uid;
+    st->st_gid = inode.i_gid;
+    st->st_nlink = inode.i_links_count;
+    st->st_ino = ino;
+    st->st_atime = inode.i_atime;
+    st->st_mtime = inode.i_mtime;
+    st->st_ctime = inode.i_ctime;
+    st->st_blocks = inode.i_blocks; /* i_blocks already counts 512-byte sectors */
+    st->st_blksize = ext2_get_fs()->block_size;
     return 0;
 }
 
@@ -66,6 +84,14 @@ int ext2_read_file(const char *path, uint8_t **out_data, size_t *out_size)
 
     uint32_t ino;
     if (ext2_path_to_inode(path, &ino) != 0) return -1;
+
+    /* Only regular files have i_block entries that are real data-block
+     * pointers. Symlinks (fast symlinks store the target inline in
+     * i_block), device nodes, FIFOs, and sockets are refused here rather
+     * than iterated as if their inode held block pointers. */
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) != 0) return -1;
+    if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) return -1;
 
     return ext2_read_file_ino(ino, out_data, out_size);
 }
@@ -82,4 +108,27 @@ int ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx)
     if (ext2_path_to_inode(path, &ino) != 0) return -1;
 
     return ext2_readdir_ino(ino, cb, ctx);
+}
+
+/* -------------------------------------------------------------------------
+ * VFS mount-table registration — EXT2 is read-only, so the write/create/
+ * unlink/rename slots are left NULL; the VFS treats a NULL op as
+ * "unsupported" rather than crashing on a missing function pointer.
+ * ---------------------------------------------------------------------- */
+
+static const vfs_ops_t ext2_vfs_ops_table = {
+    .stat = ext2_stat,
+    .read_file = ext2_read_file,
+    .write_file = NULL,
+    .create = NULL,
+    .unlink = NULL,
+    .rename = NULL,
+    .readdir = ext2_readdir,
+    .chmod = NULL,
+    .chown = NULL,
+};
+
+const vfs_ops_t *ext2_vfs_ops(void)
+{
+    return &ext2_vfs_ops_table;
 }

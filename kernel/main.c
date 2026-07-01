@@ -35,6 +35,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     /* FAT16 on primary master (ata0) — compatibility/testing only, mounted at /fat */
     disk_device_t *disk = ata_primary_master();
     if (disk->present && fat16_mount(disk) == 0) {
+        vfs_mount("/fat", VFS_FS_FAT16, fat16_vfs_ops(), NULL);
         printf("FAT16 mounted on /fat\n");
     } else {
         printf("No FAT16 disk found; /fat will be unavailable.\n");
@@ -44,6 +45,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     disk_device_t *disk2 = ata_primary_slave();
     if (disk2->present) {
         if (ext2_mount(disk2) == 0) {
+            vfs_mount("/", VFS_FS_EXT2, ext2_vfs_ops(), NULL);
             printf("EXT2 mounted on /\n");
         } else {
             printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);

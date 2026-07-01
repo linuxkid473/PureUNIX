@@ -9,6 +9,13 @@ typedef int32_t ssize_t;
 typedef uint32_t phys_addr_t;
 typedef uint32_t virt_addr_t;
 
+/* POSIX-ish metadata types, used by struct stat / vfs_stat_t. */
+typedef uint32_t mode_t;
+typedef uint32_t uid_t;
+typedef uint32_t gid_t;
+typedef uint32_t nlink_t;
+typedef uint32_t ino_t;
+
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define ALIGN_UP(value, align) (((value) + ((align) - 1)) & ~((align) - 1))
 #define ALIGN_DOWN(value, align) ((value) & ~((align) - 1))

@@ -16,4 +16,7 @@ int fat16_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 uint32_t fat16_free_bytes(void);
 uint32_t fat16_total_bytes(void);
 
+/* Table of the above, for registration via vfs_mount(). */
+const vfs_ops_t *fat16_vfs_ops(void);
+
 #endif

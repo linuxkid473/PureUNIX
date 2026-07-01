@@ -16,7 +16,13 @@ Layout (1 KB blocks, single block group):
    ...
   Block 133: first data block
 """
-import struct, sys, os
+import struct, sys, os, time
+
+# Real build-time timestamp (seconds since epoch), used for every inode's
+# atime/mtime/ctime — a static image has no other authentic value to give
+# these fields, but this is the actual time the image was built, not a
+# fabricated placeholder like the all-zero timestamps used previously.
+BUILD_TIME = int(time.time())
 
 # ---- filesystem parameters -----------------------------------------------
 BLOCK_SIZE        = 1024
@@ -40,14 +46,17 @@ FIRST_FREE_BLOCK  = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS  # 133
 # EXT2 inode mode bits
 S_IFDIR = 0x4000
 S_IFREG = 0x8000
+S_IFLNK = 0xA000
 S_IRWXU = 0o755    # owner rwx
 DEFAULT_DIR_MODE  = S_IFDIR | 0o755
 DEFAULT_FILE_MODE = S_IFREG | 0o644
+DEFAULT_LINK_MODE = S_IFLNK | 0o777   # symlink permissions are conventionally all-access
 
 # Directory entry file_type values
 FT_UNKNOWN = 0
 FT_REG     = 1
 FT_DIR     = 2
+FT_SYMLINK = 7
 
 # Reserved inode numbers
 ROOT_INO = 2
@@ -70,6 +79,9 @@ class Ext2Builder:
         self._dirs = {}
         # Store (mode, size, blocks_list, nlinks, uid, gid) per inode
         self._inodes = {}
+        # inode_no -> parent inode_no, used to fill in a directory's own ".."
+        # entry with the real parent instead of always pointing at root.
+        self._parent = {ROOT_INO: ROOT_INO}
 
         # Reserve root (inode 2) as a directory with no entries yet
         self._dirs[ROOT_INO] = []
@@ -116,13 +128,36 @@ class Ext2Builder:
             'mode': DEFAULT_DIR_MODE, 'size': 0, 'blocks': [],
             'nlinks': 2, 'uid': 0, 'gid': 0
         }
+        self._parent[ino] = parent_ino
         # Add entry in parent
         self._dirs[parent_ino].append((name, ino, FT_DIR))
         self._inodes[parent_ino]['nlinks'] += 1   # parent gets an extra link for '..'
         return ino
 
-    def add_file(self, parent_ino, name: str, data: bytes) -> int:
-        """Create a regular file inside parent_ino; return the new inode number."""
+    def add_symlink(self, parent_ino, name: str, target: str) -> int:
+        """Create a symlink inside parent_ino; return the new inode number.
+
+        Uses ext2's "fast symlink" convention: for targets short enough to
+        fit in the 60 bytes of i_block (no indirection needed), the target
+        path is stored inline in the inode itself and no data block is
+        allocated at all."""
+        target_bytes = target.encode('ascii')
+        assert len(target_bytes) <= 60, "symlink target too long for inline fast-symlink storage"
+        ino = self._alloc_inode()
+        self._inodes[ino] = {
+            'mode': DEFAULT_LINK_MODE, 'size': len(target_bytes), 'blocks': [],
+            'nlinks': 1, 'uid': 0, 'gid': 0, 'inline_target': target_bytes,
+        }
+        self._dirs[parent_ino].append((name, ino, FT_SYMLINK))
+        return ino
+
+    def add_file(self, parent_ino, name: str, data: bytes,
+                 mode=None, uid: int = 0, gid: int = 0) -> int:
+        """Create a regular file inside parent_ino; return the new inode number.
+
+        mode defaults to DEFAULT_FILE_MODE (0644); pass an explicit
+        S_IFREG|0oNNN to give a file different permissions (and optionally a
+        non-root uid/gid), e.g. for permission-engine regression fixtures."""
         ino   = self._alloc_inode()
         # Allocate data blocks
         blk_list = []
@@ -136,8 +171,9 @@ class Ext2Builder:
             pos       += len(chunk)
             remaining -= len(chunk)
         self._inodes[ino] = {
-            'mode': DEFAULT_FILE_MODE, 'size': len(data), 'blocks': blk_list,
-            'nlinks': 1, 'uid': 0, 'gid': 0
+            'mode': mode if mode is not None else DEFAULT_FILE_MODE,
+            'size': len(data), 'blocks': blk_list,
+            'nlinks': 1, 'uid': uid, 'gid': gid
         }
         self._dirs[parent_ino].append((name, ino, FT_REG))
         return ino
@@ -177,8 +213,8 @@ class Ext2Builder:
             # Build the canonical entry list: "." and ".." come first
             # For simplicity every directory fits in one block
             dot_entries = [
-                ('.',  ino,   FT_DIR),
-                ('..', ROOT_INO if ino != ROOT_INO else ROOT_INO, FT_DIR),
+                ('.',  ino, FT_DIR),
+                ('..', self._parent.get(ino, ROOT_INO), FT_DIR),
             ] + entries
             blk = self._alloc_block()
             block_data = self._build_dir_block(dot_entries)
@@ -196,34 +232,43 @@ class Ext2Builder:
         gid     = info['gid']
         nlinks  = info['nlinks']
         blks    = info['blocks']
+        inline_target = info.get('inline_target')
 
-        # Build i_block[15]: direct[0..11], indirect[12..14]
-        i_block = [0] * 15
-        direct  = blks[:12]
-        indirect_data = blks[12:]
+        i_block        = [0] * 15
+        i_blocks_field  = 0
 
-        for idx, b in enumerate(direct):
-            i_block[idx] = b
+        if inline_target is not None:
+            # Fast symlink: the target path lives directly in the 60 bytes
+            # of i_block: no data block is allocated, and i_blocks stays 0.
+            padded = inline_target.ljust(60, b'\x00')
+            i_block = list(struct.unpack('<15I', padded))
+        else:
+            # Build i_block[15]: direct[0..11], indirect[12..14]
+            direct        = blks[:12]
+            indirect_data = blks[12:]
 
-        # If more than 12 blocks, allocate a singly-indirect block
-        if indirect_data:
-            ind_blk_no = self._alloc_block()
-            ind_buf    = bytearray(BLOCK_SIZE)
-            for idx, b in enumerate(indirect_data):
-                struct.pack_into('<I', ind_buf, idx * 4, b)
-            self._write_block(ind_blk_no, bytes(ind_buf))
-            i_block[12] = ind_blk_no
+            for idx, b in enumerate(direct):
+                i_block[idx] = b
 
-        # i_blocks: 512-byte units of all allocated blocks (data + indirect)
-        total_disk_blocks = len(blks) + (1 if indirect_data else 0)
-        i_blocks_field    = total_disk_blocks * SECTORS_PER_BLOCK
+            # If more than 12 blocks, allocate a singly-indirect block
+            if indirect_data:
+                ind_blk_no = self._alloc_block()
+                ind_buf    = bytearray(BLOCK_SIZE)
+                for idx, b in enumerate(indirect_data):
+                    struct.pack_into('<I', ind_buf, idx * 4, b)
+                self._write_block(ind_blk_no, bytes(ind_buf))
+                i_block[12] = ind_blk_no
+
+            # i_blocks: 512-byte units of all allocated blocks (data + indirect)
+            total_disk_blocks = len(blks) + (1 if indirect_data else 0)
+            i_blocks_field    = total_disk_blocks * SECTORS_PER_BLOCK
 
         fmt = '<HHIIIIIHHIII' + 'I' * 15 + 'IIII12s'
         raw = struct.pack(fmt,
             mode, uid, size,
-            0,    # i_atime
-            0,    # i_ctime
-            0,    # i_mtime
+            BUILD_TIME,  # i_atime
+            BUILD_TIME,  # i_ctime
+            BUILD_TIME,  # i_mtime
             0,    # i_dtime
             gid, nlinks,
             i_blocks_field,
@@ -417,13 +462,16 @@ def add_docs(fs, docs_dir):
     fs.add_file(docs_ino, 'index.txt', b''.join(index_lines))
 
 
+EXEC_MODE = S_IFREG | 0o755   # rwxr-xr-x — programs need X_OK to run (Stage 3A)
+
+
 def add_bin(fs, programs):
     """Add the ELF program store to /bin on the EXT2 image."""
     bin_ino = fs.mkdir(ROOT_INO, 'bin')
     for program in programs:
         name = os.path.basename(program).lower()
         with open(program, 'rb') as f:
-            fs.add_file(bin_ino, name, f.read())
+            fs.add_file(bin_ino, name, f.read(), mode=EXEC_MODE)
 
 
 def main(argv):
@@ -465,6 +513,11 @@ def main(argv):
     fs.add_file(etc_ino, 'hostname',
         b'pureunix\n')
 
+    # Stage 2D: a real symlink inode, to exercise S_ISLNK()/ls -l "l"
+    # recognition end to end. Not followed or readable — see
+    # fs/ext2/mount.c's ext2_read_file, which refuses non-regular inodes.
+    fs.add_symlink(ROOT_INO, 'readme.link', 'README.TXT')
+
     # ------------------------------------------------------------------ /bin
     if programs:
         add_bin(fs, programs)
@@ -500,6 +553,37 @@ def main(argv):
     huge_data = bytes(range(256)) * (huge_size // 256)
     assert len(huge_data) == huge_size
     fs.add_file(ROOT_INO, 'hugefile.bin', huge_data)
+
+    # ------------------------------------------------------------------ Stage 3A permission fixtures
+    # One asset per mode called out by the Stage 3A regression suite, plus a
+    # group-vs-other case (group_test.txt) so the permission engine's three
+    # tiers (owner/group/other) are all exercised, not just owner-vs-other.
+    perm_ino = fs.mkdir(ROOT_INO, 'perm')
+
+    fs.add_file(perm_ino, 'exec.sh',
+        b'#!/bin/sh\necho this file exists only to carry an executable bit\n',
+        mode=S_IFREG | 0o755, uid=0, gid=0)
+
+    fs.add_file(perm_ino, 'private.txt',
+        b'owner-only: root can read this via the uid-0 bypass; a non-root\n'
+        b'uid with no matching owner/group must be denied (other bits are 0).\n',
+        mode=S_IFREG | 0o600, uid=0, gid=0)
+
+    fs.add_file(perm_ino, 'readonly.txt',
+        b'world-readable, nobody-writable except root (root write always\n'
+        b'succeeds regardless of mode bits).\n',
+        mode=S_IFREG | 0o444, uid=0, gid=0)
+
+    fs.add_file(perm_ino, 'noaccess.bin',
+        b'\x00' * 16,
+        mode=S_IFREG | 0o000, uid=0, gid=0)
+
+    fs.add_file(perm_ino, 'group_test.txt',
+        b'owned by uid=0, gid=100: group members can read but not write;\n'
+        b'anyone else falls through to the (all-zero) other bits.\n',
+        mode=S_IFREG | 0o640, uid=0, gid=100)
+
+    fs.mkdir(perm_ino, 'emptydir')  # directory with nothing but '.' and '..'
 
     # ------------------------------------------------------------------ build
     fs.build(out)

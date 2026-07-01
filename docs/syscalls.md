@@ -46,6 +46,11 @@ static int syscall3(int n, int a, int b, int c)
 | 7 | `SYS_CLOSE` | fd | — | — | 0 or negative error |
 | 8 | `SYS_LSEEK` | fd | offset (signed) | whence | new offset or negative error |
 | 9 | `SYS_STAT` | path pointer | `struct stat *` | — | 0 or negative error |
+| 10 | `SYS_ACCESS` | path pointer | mode (`F_OK`/`R_OK`/`W_OK`/`X_OK`) | — | 0, `-EACCES`, or `-ENOENT` |
+| 11 | `SYS_CHMOD` | path pointer | mode | — | `-EROFS` (infrastructure only, see below) |
+| 12 | `SYS_CHOWN` | path pointer | uid | gid | `-EROFS` (infrastructure only, see below) |
+| 13 | `SYS_READDIR` | path pointer | `struct dirent *` buffer | max entries | entry count or negative error |
+| 14 | `SYS_DEBUG_SETCRED` | uid | gid | — | 0 (test hook — see below) |
 
 ---
 
@@ -186,12 +191,88 @@ Retrieves metadata for a file or directory by path.
 ```c
 struct stat {
     unsigned int   st_size;   /* file size in bytes; 0 for directories */
-    unsigned int   st_type;   /* 1 = file, 2 = directory */
-    unsigned short st_attr;   /* FAT attribute byte; 0 for EXT2 entries */
+    unsigned int   st_type;   /* 1 = file, 2 = directory, 3 = symlink */
+    unsigned short st_attr;   /* FAT attribute byte (legacy) */
+
+    mode_t   st_mode;    /* file-type bits | rwx permission bits */
+    uid_t    st_uid;
+    gid_t    st_gid;
+    unsigned int st_nlink;
+    unsigned int st_ino;
+    unsigned int st_atime;
+    unsigned int st_mtime;
+    unsigned int st_ctime;
+    unsigned int st_blocks;   /* 512-byte blocks allocated */
+    unsigned int st_blksize;  /* preferred I/O block size */
 };
 ```
 
-`vfs_stat` tries EXT2 first, then FAT16. The `st_attr` field is 0 for entries resolved through EXT2 (EXT2 mode bits are not surfaced in this field).
+`st_mode`/`st_uid`/`st_gid`/`st_nlink`/`st_ino`/timestamps/`st_blocks`/`st_blksize` come directly from the EXT2 inode; FAT16 synthesizes them (uid=gid=0, mode derived from file/dir type, nlink=1 — see `docs/filesystem.md`). `st_atime`/`st_mtime`/`st_ctime` are 0 only if the underlying filesystem genuinely has no timestamp for that entry.
+
+`vfs_stat` also enforces `X_OK` on every ancestor directory in `path` before returning metadata — see `SYS_ACCESS` and `docs/api/vfs.md`'s Permissions section for the full model.
+
+---
+
+## SYS_ACCESS (10)
+
+Checks whether the calling task's credentials would permit the requested access to `path`, mirroring POSIX `access(2)`.
+
+**Arguments**:
+- `EBX`: pointer to null-terminated absolute path string
+- `ECX`: mode — `F_OK` (0), or an OR of `R_OK` (4) / `W_OK` (2) / `X_OK` (1)
+
+**Returns**: `0` if access would be permitted, or a negative error code:
+
+| Code | Value | Meaning |
+|---|---|---|
+| `-EINVAL` | -22 | null path pointer |
+| `-ENOENT` | -2 | path does not exist (or an ancestor directory denies `X_OK`, folded into the same `vfs_stat` failure) |
+| `-EACCES` | -13 | path exists but the requested access is denied |
+
+**Implementation**: `vfs_stat(path, &st)` followed by `vfs_access(&st, current_uid(), current_gid(), mode)` — the same central permission engine every other permission check in the kernel uses.
+
+---
+
+## SYS_CHMOD (11) / SYS_CHOWN (12)
+
+Syscall infrastructure only — no filesystem stores mutable permission/ownership bits yet.
+
+**SYS_CHMOD** — `EBX`: path pointer, `ECX`: mode. **SYS_CHOWN** — `EBX`: path pointer, `ECX`: uid, `EDX`: gid.
+
+**Returns**: `-ENOENT` if the path doesn't exist, otherwise `-EROFS` (both EXT2 and FAT16 leave `ops->chmod`/`ops->chown` `NULL`). The syscalls exist now so a future writable filesystem can support them without any ABI change.
+
+---
+
+## SYS_READDIR (13)
+
+Enumerates a directory's entries into a flat, caller-supplied buffer — no cursor/offset semantics; the whole directory (up to the buffer's capacity) is returned in one call.
+
+**Arguments**:
+- `EBX`: pointer to null-terminated absolute path string
+- `ECX`: pointer to an array of `struct dirent`
+- `EDX`: capacity of that array (max entries to write)
+
+**Returns**: the number of entries written (`>= 0`), or a negative error code (`-EINVAL`, `-ENOENT`).
+
+**`struct dirent` layout** (`include/pureunix/dirent.h` / `user/libpure.h`):
+
+```c
+struct dirent {
+    char         name[64];   /* PUREUNIX_MAX_NAME */
+    unsigned int type;       /* 1 = file, 2 = directory, 3 = symlink */
+    unsigned int size;
+};
+```
+
+`.` and `..` are included like any other entry — the VFS/driver layer never filters them; a shell's `ls -a` vs plain `ls` is purely a display-side choice made by whoever calls `SYS_READDIR`/`vfs_readdir`.
+
+---
+
+## SYS_DEBUG_SETCRED (14)
+
+**Test-only.** Overwrites the calling task's `uid`/`gid` outright, with **no privilege check whatsoever** — there is no login system yet to check against, so this is not a real `setuid()`. It exists solely so `user/ext2test.c` can exercise owner/group/other permission logic while running as non-root. Nothing outside the regression suite should call it, and it must not be treated as a real syscall going forward.
+
+**Arguments**: `EBX`: new uid, `ECX`: new gid. **Returns**: always `0`.
 
 ---
 
@@ -208,10 +289,14 @@ Defined in `include/pureunix/errno.h` (kernel) and `user/libpure.h` (user progra
 | Constant | Value | Meaning |
 |---|---|---|
 | `ENOENT` | 2 | no such file or directory |
+| `EIO` | 5 | I/O error |
 | `EBADF` | 9 | bad file descriptor |
+| `EACCES` | 13 | permission denied |
 | `EISDIR` | 21 | is a directory |
 | `EINVAL` | 22 | invalid argument |
 | `EMFILE` | 24 | too many open files |
+| `EROFS` | 30 | read-only filesystem |
+| `ENOSYS` | 38 | function not implemented |
 
 Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
@@ -219,7 +304,9 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 ## Unimplemented Syscalls
 
-`fstat`, `mmap`, `munmap`, `brk`, `fork`, `exec`, `wait`, `waitpid`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `mkdir`, `unlink`, `rename`, `readdir`.
+`fstat`, `mmap`, `munmap`, `brk`, `fork`, `exec`, `wait`, `waitpid`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `mkdir`, `unlink`, `rename`, `readlink`, `symlink`, `setuid`, `setgid`, `getuid`, `getgid`.
+
+`SYS_CHMOD`/`SYS_CHOWN` exist as syscall numbers but currently always return `-EROFS` — see above.
 
 ---
 
@@ -234,6 +321,12 @@ int    pu_open(const char *path, int flags);                    // SYS_OPEN
 int    pu_close(int fd);                                        // SYS_CLOSE
 int    pu_lseek(int fd, int offset, int whence);                // SYS_LSEEK
 int    pu_stat(const char *path, struct stat *st);              // SYS_STAT
+int    pu_access(const char *path, int mode);                   // SYS_ACCESS
+int    pu_chmod(const char *path, mode_t mode);                 // SYS_CHMOD
+int    pu_chown(const char *path, uid_t uid, gid_t gid);         // SYS_CHOWN
+int    pu_readdir(const char *path, struct dirent *entries,
+                   int max_entries);                            // SYS_READDIR
+int    pu_debug_setcred(uid_t uid, gid_t gid);                  // SYS_DEBUG_SETCRED — test-only, see above
 void   pu_puts(const char *s);                                  // SYS_WRITE to fd 1
 void   pu_puti(int value);                                      // integer to decimal on fd 1
 size_t pu_strlen(const char *s);                                // no syscall

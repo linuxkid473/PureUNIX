@@ -35,6 +35,12 @@ typedef struct task {
     struct task *next;
     /* per-task file descriptor table; fds 0/1/2 are reserved (stdin/out/err) */
     fd_entry_t fds[MAX_OPEN_FILES];
+    /* process credentials, used by the VFS permission engine (vfs_access).
+     * No login system exists yet: the kernel task and everything it spawns
+     * starts at uid=gid=0 (root) and a child inherits its creator's
+     * credentials at task_create() time. */
+    uid_t uid;
+    gid_t gid;
 } task_t;
 
 void tasking_init(void);
@@ -44,5 +50,11 @@ void task_exit(void);
 task_t *task_current(void);
 void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx);
 int task_kill(uint32_t id);
+
+/* Credentials of the currently scheduled task. Never reads a global —
+ * always goes through task_current(), so callers (chiefly the VFS
+ * permission engine) see whichever task is actually running. */
+uid_t current_uid(void);
+gid_t current_gid(void);
 
 #endif

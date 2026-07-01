@@ -29,8 +29,22 @@ typedef struct task {
     void        (*entry)(void *); // entry function
     void         *arg;          // passed to entry on first run
     struct task  *next;         // next node in circular list
+    fd_entry_t    fds[MAX_OPEN_FILES]; // per-task file descriptor table
+    uid_t         uid;          // process credentials (Stage 3A)
+    gid_t         gid;
 } task_t;
 ```
+
+### Credentials (Stage 3A)
+
+`uid`/`gid` are the process credentials consumed by the VFS permission engine (`vfs_access`, see `docs/api/vfs.md`). `tasking_init()` sets the initial kernel task to `uid=0, gid=0` (root); `task_create()` copies the *creating* task's credentials into the new task — the only credential-inheritance rule that exists before a real login/setuid model arrives. There is no login system, no additional users, and no passwd database yet, so in practice every task is root.
+
+```c
+uid_t current_uid(void);   // task_current()->uid, or 0 if there is no current task
+gid_t current_gid(void);   // task_current()->gid, or 0 if there is no current task
+```
+
+Never read from a global — both always go through `task_current()`, so they reflect whichever task is actually scheduled.
 
 ---
 

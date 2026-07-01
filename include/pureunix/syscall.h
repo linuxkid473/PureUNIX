@@ -11,6 +11,17 @@ enum {
     SYS_CLOSE  = 7,
     SYS_LSEEK  = 8,
     SYS_STAT   = 9,
+    SYS_ACCESS = 10,
+    SYS_CHMOD  = 11,
+    SYS_CHOWN  = 12,
+    SYS_READDIR = 13,
+    /* Stage 3A test-only hook: sets the *calling task's* uid/gid outright,
+     * with no privilege check whatsoever. This is not a real setuid() —
+     * there is no login system or privilege model yet to enforce against.
+     * It exists solely so user/ext2test.c can exercise owner/group/other
+     * permission logic while running as non-root; nothing outside the
+     * regression suite should ever call it. See ext2test.c section [22]. */
+    SYS_DEBUG_SETCRED = 14,
 };
 
 #endif

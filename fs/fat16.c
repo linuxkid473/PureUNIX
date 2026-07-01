@@ -1,6 +1,7 @@
 #include <pureunix/ctype.h>
 #include <pureunix/fat16.h>
 #include <pureunix/memory.h>
+#include <pureunix/stat.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 
@@ -564,15 +565,76 @@ bool fat16_is_mounted(void)
     return fs.mounted;
 }
 
+static bool is_leap_year(int year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+static int days_in_month(int year, int month)
+{
+    static const uint8_t dim[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month == 2 && is_leap_year(year)) {
+        return 29;
+    }
+    return dim[month - 1];
+}
+
+/* Decode a FAT16 directory-entry date/time pair into Unix epoch seconds
+ * (UTC, no timezone handling — FAT stores local time with no offset).
+ * date/time == 0 (as in the synthetic root-directory entry) yields 0. */
+static uint32_t fat_datetime_to_unix(uint16_t date, uint16_t time)
+{
+    if (date == 0) {
+        return 0;
+    }
+    int year = 1980 + (date >> 9);
+    int month = (date >> 5) & 0x0F;
+    int day = date & 0x1F;
+    int hour = (time >> 11) & 0x1F;
+    int minute = (time >> 5) & 0x3F;
+    int second = (time & 0x1F) * 2;
+    if (month < 1) month = 1;
+    if (day < 1) day = 1;
+
+    uint32_t days = 0;
+    for (int y = 1970; y < year; ++y) {
+        days += is_leap_year(y) ? 366 : 365;
+    }
+    for (int m = 1; m < month; ++m) {
+        days += (uint32_t)days_in_month(year, m);
+    }
+    days += (uint32_t)(day - 1);
+
+    return days * 86400u + (uint32_t)hour * 3600u + (uint32_t)minute * 60u + (uint32_t)second;
+}
+
 int fat16_stat(const char *path, vfs_stat_t *st)
 {
     found_entry_t found;
     if (path_lookup(path, &found) != 0) {
         return -1;
     }
-    st->type = (found.entry.attr & FAT_ATTR_DIRECTORY) ? VFS_DIR : VFS_FILE;
+    bool is_dir = (found.entry.attr & FAT_ATTR_DIRECTORY) != 0;
+    st->type = is_dir ? VFS_DIR : VFS_FILE;
     st->size = found.entry.size;
     st->mode = found.entry.attr;
+
+    /* FAT16 has no Unix permissions/ownership, so these fields are
+     * synthesized rather than read from disk: uid/gid are always 0, mode
+     * is file-type bits plus a fixed rwxr-xr-x/rw-r--r-- pattern, and
+     * nlink is always 1 (FAT has no hardlink concept). Timestamps are the
+     * one part of this that IS real, decoded from the on-disk FAT
+     * date/time fields; last_access_date has no time component in FAT16. */
+    st->st_mode = (mode_t)((is_dir ? S_IFDIR : S_IFREG) | (is_dir ? 0755 : 0644));
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_nlink = 1;
+    st->st_ino = (ino_t)((found.dir_cluster << 16) | (found.index & 0xFFFF));
+    st->st_atime = fat_datetime_to_unix(found.entry.last_access_date, 0);
+    st->st_mtime = fat_datetime_to_unix(found.entry.write_date, found.entry.write_time);
+    st->st_ctime = fat_datetime_to_unix(found.entry.create_date, found.entry.create_time);
+    st->st_blksize = cluster_size();
+    st->st_blocks = (found.entry.size + 511) / 512;
     return 0;
 }
 
@@ -820,4 +882,28 @@ uint32_t fat16_total_bytes(void)
         return 0;
     }
     return (fs.max_cluster - 2) * cluster_size();
+}
+
+/* -------------------------------------------------------------------------
+ * VFS mount-table registration
+ * ---------------------------------------------------------------------- */
+
+static const vfs_ops_t fat16_vfs_ops_table = {
+    .stat = fat16_stat,
+    .read_file = fat16_read_file,
+    .write_file = fat16_write_file,
+    .create = fat16_create,
+    .unlink = fat16_unlink,
+    .rename = fat16_rename,
+    .readdir = fat16_readdir,
+    /* FAT16 has no on-disk permission/ownership storage — its stat() only
+     * synthesizes uid=gid=0 and a fixed mode, so there is nothing for
+     * chmod/chown to persist yet. */
+    .chmod = NULL,
+    .chown = NULL,
+};
+
+const vfs_ops_t *fat16_vfs_ops(void)
+{
+    return &fat16_vfs_ops_table;
 }

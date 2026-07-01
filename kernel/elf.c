@@ -2,6 +2,7 @@
 #include <pureunix/memory.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/task.h>
 #include <pureunix/vfs.h>
 
 #define EI_NIDENT 16
@@ -50,6 +51,22 @@ bool elf_is_valid(const uint8_t *image, size_t size)
 
 int elf_exec(const char *path)
 {
+    /* Executing requires X_OK on the file itself — distinct from, and
+     * checked in addition to, the R_OK that vfs_read_file() below enforces
+     * to actually load the bytes off disk (this kernel has no separate
+     * "read the file without going through the normal read gate" path, so
+     * running a program still needs both bits set, as every ELF in /bin
+     * in the test image does: rwxr-xr-x). */
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) {
+        printf("%s: not found\n", path);
+        return -1;
+    }
+    if (!vfs_access(&st, current_uid(), current_gid(), X_OK)) {
+        printf("%s: permission denied\n", path);
+        return -1;
+    }
+
     uint8_t *image = NULL;
     size_t size = 0;
     if (vfs_read_file(path, &image, &size) != 0) {

@@ -45,6 +45,26 @@ static void print_bytes(const char *buf, int n)
     }
 }
 
+/* Compare two C strings; return 1 if equal. */
+static int streq(const char *a, const char *b)
+{
+    size_t i = 0;
+    for (;;) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+        i++;
+    }
+}
+
+/* Find name among the first count entries; return its index or -1. */
+static int find_name(struct dirent *entries, int count, const char *name)
+{
+    for (int i = 0; i < count; i++) {
+        if (streq(entries[i].name, name)) return i;
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(void)
@@ -389,6 +409,310 @@ int main(void)
         if (fa >= 3) pu_close(fa);
         if (fb >= 3) pu_close(fb);
     }
+
+    /* ----------------------------------------------------------------- 15 */
+    pu_puts("\n[15] directory traversal: root listing\n");
+
+    {
+        struct dirent entries[48];
+        int count = pu_readdir("/", entries, 48);
+        if (count < 0) {
+            fail("pu_readdir('/') returned error: ", count);
+        } else {
+            pu_puts("  entries="); pu_puti(count); pu_puts("\n");
+            const char *expect[] = { "README.TXT", "etc", "bin", "docs", "home",
+                                      "testdir", "perm", "readme.link",
+                                      "bigfile.bin", "hugefile.bin" };
+            int all_found = 1;
+            for (size_t i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+                if (find_name(entries, count, expect[i]) < 0) {
+                    pu_puts("  missing: "); pu_puts(expect[i]); pu_puts("\n");
+                    all_found = 0;
+                }
+            }
+            if (all_found)
+                pass("root listing contains every expected top-level entry");
+            else
+                fail("root listing missing expected entries, count=", count);
+        }
+    }
+
+    /* ----------------------------------------------------------------- 16 */
+    pu_puts("\n[16] directory traversal: nested directory listing (/testdir)\n");
+
+    {
+        struct dirent entries[16];
+        int count = pu_readdir("/testdir", entries, 16);
+        if (count < 0) {
+            fail("pu_readdir('/testdir') returned error: ", count);
+        } else if (find_name(entries, count, "alpha.txt") >= 0 &&
+                   find_name(entries, count, "beta.txt")  >= 0 &&
+                   find_name(entries, count, "gamma.txt") >= 0) {
+            pass("nested listing /testdir contains alpha/beta/gamma.txt");
+        } else {
+            fail("nested listing missing expected files, count=", count);
+        }
+    }
+
+    /* ----------------------------------------------------------------- 17 */
+    pu_puts("\n[17] directory traversal: '.' and '..' entries\n");
+
+    {
+        /* The VFS never filters these out — see fs/ext2/dir.c's
+           readdir_block — so they show up in every pu_readdir() result
+           exactly as they would feed a shell's `ls -a`/`ls -la`. Nothing
+           is fabricated here or in the kernel; this just confirms the
+           driver-level entries Stage 2D added are still exposed. */
+        struct dirent entries[48];
+        int count = pu_readdir("/", entries, 48);
+        if (count >= 0 && find_name(entries, count, ".") >= 0)
+            pass("root listing includes '.' entry");
+        else
+            fail("root listing missing '.' entry, count=", count);
+
+        if (count >= 0 && find_name(entries, count, "..") >= 0)
+            pass("root listing includes '..' entry");
+        else
+            fail("root listing missing '..' entry, count=", count);
+
+        struct dirent empty_entries[8];
+        int empty_count = pu_readdir("/perm/emptydir", empty_entries, 8);
+        if (empty_count == 2 &&
+            find_name(empty_entries, empty_count, ".")  >= 0 &&
+            find_name(empty_entries, empty_count, "..") >= 0) {
+            pass("emptydir contains exactly '.' and '..', nothing fabricated");
+        } else {
+            fail("emptydir entry count wrong, got ", empty_count);
+        }
+    }
+
+    /* ----------------------------------------------------------------- 18 */
+    pu_puts("\n[18] directory sizes come from the real inode (not hardcoded 0)\n");
+
+    r = pu_stat("/etc", &st);
+    if (r == 0 && st.st_size > 0) {
+        pu_puts("  /etc size="); pu_puti((int)st.st_size); pu_puts("\n");
+        pass("directory size is nonzero (real i_size, not synthesized)");
+    } else {
+        fail("expected directory size > 0, got ", (int)st.st_size);
+    }
+
+    /* ----------------------------------------------------------------- 19 */
+    pu_puts("\n[19] metadata: inode numbers\n");
+
+    r = pu_stat("/", &st);
+    if (r == 0 && st.st_ino == 2)
+        pass("root directory is inode 2 (EXT2_ROOT_INODE)");
+    else
+        fail("expected root inode 2, got ", (int)st.st_ino);
+
+    {
+        struct stat a, b;
+        pu_stat("/README.TXT", &a);
+        pu_stat("/etc/passwd", &b);
+        if (a.st_ino != b.st_ino)
+            pass("distinct files have distinct inode numbers");
+        else
+            fail("README.TXT and passwd share inode ", (int)a.st_ino);
+
+        struct stat a2;
+        pu_stat("/README.TXT", &a2);
+        if (a.st_ino == a2.st_ino)
+            pass("stat'ing the same file twice yields the same inode number");
+        else
+            fail("inode number unstable across stat calls: ", (int)a2.st_ino);
+    }
+
+    /* ----------------------------------------------------------------- 20 */
+    pu_puts("\n[20] metadata: permissions, uid, gid\n");
+
+    r = pu_stat("/README.TXT", &st);
+    if (r == 0 && (st.st_mode & 0777) == 0644 && st.st_uid == 0 && st.st_gid == 0)
+        pass("/README.TXT is mode 0644, uid=0, gid=0");
+    else
+        fail("unexpected README.TXT metadata, mode&0777=", (int)(st.st_mode & 0777));
+
+    r = pu_stat("/perm/private.txt", &st);
+    if (r == 0 && (st.st_mode & 0777) == 0600)
+        pass("/perm/private.txt is mode 0600");
+    else
+        fail("expected mode 0600, got ", (int)(st.st_mode & 0777));
+
+    r = pu_stat("/perm/readonly.txt", &st);
+    if (r == 0 && (st.st_mode & 0777) == 0444)
+        pass("/perm/readonly.txt is mode 0444");
+    else
+        fail("expected mode 0444, got ", (int)(st.st_mode & 0777));
+
+    r = pu_stat("/perm/noaccess.bin", &st);
+    if (r == 0 && (st.st_mode & 0777) == 0000)
+        pass("/perm/noaccess.bin is mode 0000");
+    else
+        fail("expected mode 0000, got ", (int)(st.st_mode & 0777));
+
+    r = pu_stat("/perm/group_test.txt", &st);
+    if (r == 0 && (st.st_mode & 0777) == 0640 && st.st_gid == 100)
+        pass("/perm/group_test.txt is mode 0640, gid=100");
+    else
+        fail("unexpected group_test.txt metadata, gid=", (int)st.st_gid);
+
+    /* ----------------------------------------------------------------- 21 */
+    pu_puts("\n[21] metadata: timestamps and link count\n");
+
+    r = pu_stat("/README.TXT", &st);
+    if (r == 0 && st.st_atime > 0 && st.st_mtime > 0 && st.st_ctime > 0)
+        pass("README.TXT has real (nonzero) atime/mtime/ctime");
+    else
+        fail("expected nonzero timestamps, mtime=", (int)st.st_mtime);
+
+    if (r == 0 && st.st_nlink == 1)
+        pass("regular file has link count 1");
+    else
+        fail("expected nlink=1 for a regular file, got ", (int)st.st_nlink);
+
+    r = pu_stat("/etc", &st);
+    if (r == 0 && st.st_nlink >= 2)
+        pass("directory has link count >= 2 ('.' plus parent's entry)");
+    else
+        fail("expected directory nlink>=2, got ", (int)st.st_nlink);
+
+    /* ----------------------------------------------------------------- 22 */
+    pu_puts("\n[22] symlinks: detected, not followed, not readable as a file\n");
+
+    r = pu_stat("/readme.link", &st);
+    if (r == 0 && st.st_type == 3)
+        pass("stat('/readme.link') reports type=SYMLINK(3)");
+    else
+        fail("expected st_type=3, got ", (int)st.st_type);
+
+    if (r == 0 && S_ISLNK(st.st_mode))
+        pass("S_ISLNK(st_mode) is true for readme.link");
+    else
+        fail("expected S_ISLNK, st_mode=", (int)st.st_mode);
+
+    if (r == 0 && (st.st_mode & 0777) == 0777)
+        pass("readme.link inode mode is the conventional 0777 for symlinks");
+    else
+        fail("expected symlink perm bits 0777, got ", (int)(st.st_mode & 0777));
+
+    fd = pu_open("/readme.link", O_RDONLY);
+    if (fd < 0)
+        pass("open('/readme.link') fails — readlink() is not implemented, "
+             "and a symlink must not be readable as a regular file");
+    else {
+        fail("expected open(symlink) to fail, got fd=", fd);
+        pu_close(fd);
+    }
+
+    /* ----------------------------------------------------------------- 23 */
+    pu_puts("\n[23] access(): F_OK/R_OK/W_OK/X_OK as root\n");
+
+    if (pu_access("/README.TXT", F_OK) == 0)
+        pass("access(README.TXT, F_OK) succeeds — file exists");
+    else
+        fail("expected F_OK success, got ", pu_access("/README.TXT", F_OK));
+
+    r = pu_access("/no/such/file.txt", F_OK);
+    if (r == ENOENT)
+        pass("access(nonexistent, F_OK) returns ENOENT");
+    else
+        fail("expected ENOENT, got ", r);
+
+    if (pu_access("/perm/noaccess.bin", R_OK) == 0)
+        pass("root: R_OK on mode-0000 file succeeds (root read bypass)");
+    else
+        fail("expected root R_OK bypass to succeed, got ", pu_access("/perm/noaccess.bin", R_OK));
+
+    if (pu_access("/perm/readonly.txt", W_OK) == 0)
+        pass("root: W_OK on mode-0444 file succeeds (root write bypass)");
+    else
+        fail("expected root W_OK bypass to succeed, got ", pu_access("/perm/readonly.txt", W_OK));
+
+    if (pu_access("/perm/exec.sh", X_OK) == 0)
+        pass("root: X_OK on mode-0755 file succeeds");
+    else
+        fail("expected X_OK success on exec.sh, got ", pu_access("/perm/exec.sh", X_OK));
+
+    r = pu_access("/perm/noaccess.bin", X_OK);
+    if (r == EACCES)
+        pass("root: X_OK on mode-0000 file is denied — root still needs "
+             "*some* execute bit set (traditional Unix root exception)");
+    else
+        fail("expected EACCES even for root with no x bits, got ", r);
+
+    /* ----------------------------------------------------------------- 24 */
+    pu_puts("\n[24] permission engine: owner/group/other, as non-root\n");
+    pu_puts("  (using SYS_DEBUG_SETCRED, a regression-suite-only test hook —\n");
+    pu_puts("   see include/pureunix/syscall.h. Credentials are restored to\n");
+    pu_puts("   uid=0/gid=0 before this program returns.)\n");
+
+    /* uid=1000 matches neither group_test.txt's owner (0) nor its group
+       (100) — everything should fall through to "other". */
+    pu_debug_setcred(1000, 999);
+
+    r = pu_access("/perm/private.txt", R_OK);
+    if (r == EACCES)
+        pass("non-root, no match: R_OK on mode-0600 owner-only file denied");
+    else
+        fail("expected EACCES on private.txt, got ", r);
+
+    r = pu_access("/perm/readonly.txt", R_OK);
+    if (r == 0)
+        pass("non-root: R_OK on mode-0444 world-readable file succeeds");
+    else
+        fail("expected R_OK success on readonly.txt, got ", r);
+
+    r = pu_access("/perm/readonly.txt", W_OK);
+    if (r == EACCES)
+        pass("non-root: W_OK on mode-0444 file is denied (no bypass for non-root)");
+    else
+        fail("expected EACCES for W_OK on readonly.txt, got ", r);
+
+    r = pu_access("/perm/group_test.txt", R_OK);
+    if (r == EACCES)
+        pass("non-root, gid mismatch: R_OK on mode-0640 group file falls "
+             "through to other bits (0) and is denied");
+    else
+        fail("expected EACCES on group_test.txt (gid mismatch), got ", r);
+
+    /* Now match the file's group (gid=100) but still not its owner. */
+    pu_debug_setcred(1000, 100);
+
+    r = pu_access("/perm/group_test.txt", R_OK);
+    if (r == 0)
+        pass("non-root, gid match: R_OK on mode-0640 group file succeeds (group r bit)");
+    else
+        fail("expected R_OK success via group bits, got ", r);
+
+    r = pu_access("/perm/group_test.txt", W_OK);
+    if (r == EACCES)
+        pass("non-root, gid match: W_OK on mode-0640 group file denied (group has no w bit)");
+    else
+        fail("expected EACCES — group bits are r-- only, got ", r);
+
+    r = pu_access("/perm/exec.sh", X_OK);
+    if (r == 0)
+        pass("non-root: X_OK on mode-0755 file still succeeds (other x bit)");
+    else
+        fail("expected X_OK success via other bits, got ", r);
+
+    r = pu_access("/perm/noaccess.bin", R_OK);
+    int r2 = pu_access("/perm/noaccess.bin", W_OK);
+    int r3 = pu_access("/perm/noaccess.bin", X_OK);
+    if (r == EACCES && r2 == EACCES && r3 == EACCES)
+        pass("non-root: mode-0000 file denies R/W/X with no root bypass");
+    else
+        fail("expected all three denied for noaccess.bin, r+r2+r3=", r + r2 + r3);
+
+    /* Restoring root is not optional: elf_exec() runs this program's code
+       in the shell's own task (there is no fork/exec — see kernel/elf.c),
+       so leaving credentials changed here would leave the *shell itself*
+       running as uid=1000/gid=100 for the rest of the session. */
+    pu_debug_setcred(0, 0);
+    if (pu_access("/perm/noaccess.bin", R_OK) == 0)
+        pass("credentials restored to uid=0/gid=0 before returning (root bypass confirmed)");
+    else
+        fail("FATAL: failed to restore root credentials, R_OK=", pu_access("/perm/noaccess.bin", R_OK));
 
     pu_puts("\n=== ext2test complete ===\n");
     return 0;

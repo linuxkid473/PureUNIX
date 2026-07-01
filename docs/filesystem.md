@@ -4,16 +4,14 @@
 
 The filesystem layer has three components:
 
-- **EXT2 driver** (`fs/ext2/`) — read-only driver for the ATA primary slave disk. Handles superblock parsing, block group descriptor table, inode reads, directory traversal, direct and singly-indirect block iteration, and a 4-slot LRU block cache.
-- **FAT16 driver** (`fs/fat16.c`) — read/write driver for the ATA primary master disk. Handles cluster allocation/freeing, file and directory CRUD, and all write operations.
-- **VFS** (`fs/vfs.c`) — dual-dispatch layer over both drivers. Read operations (stat, read, readdir) try EXT2 first and merge FAT16 results. Write operations route exclusively to FAT16.
+- **EXT2 driver** (`fs/ext2/`) — read-only driver for the ATA primary slave disk. Handles superblock parsing, block group descriptor table, inode reads, directory traversal, direct and singly-indirect block iteration, and a 4-slot LRU block cache. Primary root filesystem, mounted at `/`.
+- **FAT16 driver** (`fs/fat16.c`) — read/write driver for the ATA primary master disk. Handles cluster allocation/freeing, file and directory CRUD, and all write operations. Mounted at `/fat` for compatibility/testing only.
+- **VFS** (`fs/vfs.c`) — a mount-table router, *not* a dual-dispatch/union layer: every path resolves via longest-prefix match to exactly one mount, and that mount's driver alone serves the call (see `docs/api/vfs.md` for the full mount-table API). Stage 3A adds Unix permission enforcement at this same layer.
 
-The two filesystems partition the namespace by disk:
-
-| Disk | Role | Filesystem |
-|---|---|---|
-| ATA primary master (`index=0`) | Program store | FAT16 (read/write) |
-| ATA primary slave (`index=1`) | Data filesystem | EXT2 (read-only) |
+| Disk | Role | Filesystem | Mountpoint |
+|---|---|---|---|
+| ATA primary master (`index=0`) | Compatibility/testing store | FAT16 (read/write) | `/fat` |
+| ATA primary slave (`index=1`) | Primary root filesystem | EXT2 (read-only) | `/` |
 
 ---
 
@@ -21,17 +19,22 @@ The two filesystems partition the namespace by disk:
 
 **Source**: `fs/vfs.c`
 **Header**: `include/pureunix/vfs.h`
+**Full API reference**: `docs/api/vfs.md`
 
-### Dispatch Policy
+### Dispatch
 
-| Operation | EXT2 | FAT16 |
-|---|---|---|
-| `vfs_stat` | tried first; returns if found | tried if EXT2 fails |
-| `vfs_read_file` | tried first; returns if found | tried if EXT2 fails |
-| `vfs_readdir` | called if path is a directory in EXT2 | always called if path is a directory in FAT16; results are merged |
-| `vfs_write_file`, `vfs_create`, `vfs_mkdir`, `vfs_unlink`, `vfs_rmdir`, `vfs_rename` | not used (EXT2 is read-only) | exclusive |
+Every `vfs_*` call resolves `path` to a single mount (longest-prefix match against the mount table registered via `vfs_mount()` in `kernel_main`) and calls straight into that mount's `vfs_ops_t`. `/etc`, `/bin`, `/docs`, etc. all live under the EXT2 mount at `/`; `/fat/...` resolves to the FAT16 mount, with the `/fat` prefix stripped before the driver sees the path. There is no merging — `ls /` shows only EXT2's root, `ls /fat` shows only FAT16's root.
 
-`vfs_readdir` calls both drivers when both have the directory. This makes `ls /` show entries from both the EXT2 data partition (README.TXT, etc/) and the FAT16 program store (/bin). Entries from the two sources are interleaved in callback order: all EXT2 entries first, then all FAT16 entries.
+### Permissions (Stage 3A)
+
+Every `vfs_*` call also runs the calling task's credentials (`current_uid()`/`current_gid()`) through the central permission engine, `vfs_access()`, before touching the driver:
+
+- Ancestor directories in `path` need `X_OK` (search permission) — enforced for every call, read or write.
+- `vfs_read_file`/`vfs_readdir` additionally require `R_OK` on the target.
+- The write-side calls (`vfs_write_file`, `vfs_create`, `vfs_mkdir`, `vfs_unlink`, `vfs_rmdir`, `vfs_rename`) require `W_OK` on whichever directory/file the operation modifies — enforced unconditionally, even though EXT2 is read-only (its ops table just has those slots `NULL`), so a future writable filesystem is covered automatically.
+- uid 0 (root) always gets read/write; execute additionally requires at least one execute bit set somewhere on the file.
+
+Neither driver knows anything about permissions — `vfs_access()` operates purely on the `vfs_stat_t` metadata drivers already hand back. See `docs/api/vfs.md`'s "Permissions" section for the full model, and `include/pureunix/task.h` for process credentials.
 
 ### API
 
@@ -74,23 +77,7 @@ All path arguments must be absolute (begin with `/`). Return value is `0` on suc
 
 ### Types
 
-```c
-typedef enum { VFS_FILE = 1, VFS_DIR = 2 } vfs_node_type_t;
-
-typedef struct vfs_stat {
-    vfs_node_type_t type;
-    uint32_t        size;   // file size in bytes; 0 for directories
-    uint16_t        mode;   // FAT attribute byte (0 for EXT2 entries)
-} vfs_stat_t;
-
-typedef struct vfs_dirent {
-    char            name[PUREUNIX_MAX_NAME];  // 64 bytes
-    vfs_node_type_t type;
-    uint32_t        size;
-} vfs_dirent_t;
-
-typedef int (*vfs_readdir_cb_t)(const vfs_dirent_t *entry, void *ctx);
-```
+See `docs/api/vfs.md` for the full, current `vfs_stat_t` (Unix metadata: mode, uid, gid, nlink, inode number, timestamps, block count/size — direct from the inode on EXT2, synthesized on FAT16) and `vfs_dirent_t` definitions, and `vfs_node_type_t`'s three values (`VFS_FILE`, `VFS_DIR`, `VFS_SYMLINK`).
 
 `vfs_readdir` calls `cb` for each visible entry from any mounted filesystem. Return non-zero from `cb` to stop iteration.
 
@@ -233,10 +220,14 @@ int  ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 Contents:
 
 ```
-/README.TXT             207 bytes — informational text
+/README.TXT             informational text
 /etc/
     passwd              user account list
     hostname            hostname string
+/bin/                   ELF program store, mode 0755 (rwxr-xr-x) — see Permissions below
+    *.elf
+/docs/                  documentation tree, mirrored from docs/*.md
+    api/
 /home/
     user/
         notes.txt       sample user notes
@@ -244,11 +235,19 @@ Contents:
     alpha.txt
     beta.txt
     gamma.txt
+/perm/                  Stage 3A permission-engine regression fixtures
+    exec.sh             mode 0755, uid=0, gid=0
+    private.txt         mode 0600, uid=0, gid=0 — owner-only
+    readonly.txt        mode 0444, uid=0, gid=0 — world-readable, root-writable only
+    noaccess.bin         mode 0000, uid=0, gid=0 — nobody but root (and root needs no x bit exemption for r/w)
+    group_test.txt       mode 0640, uid=0, gid=100 — exercises the group tier specifically
+    emptydir/            directory with nothing but '.' and '..'
+/readme.link            symlink -> README.TXT (ext2 "fast symlink", inline target, no data block)
 /bigfile.bin            5120 bytes (5 × 1 KB blocks, all 'B')
 /hugefile.bin           14336 bytes (14 × 1 KB blocks, bytes 0–255 repeating)
 ```
 
-`bigfile.bin` tests block-boundary reads (spans blocks 1–5). `hugefile.bin` tests singly-indirect block reads (exceeds 12 direct blocks; blocks 13–14 are via `i_block[12]`).
+`bigfile.bin` tests block-boundary reads (spans blocks 1–5). `hugefile.bin` tests singly-indirect block reads (exceeds 12 direct blocks; blocks 13–14 are via `i_block[12]`). Every inode gets a real (image build time) timestamp — see `tools/mkext2.py`'s `BUILD_TIME` — rather than the all-zero placeholder used before Stage 2D.
 
 ---
 
@@ -443,15 +442,7 @@ Slots 0, 1, 2 are permanently reserved for stdin/stdout/stderr. `SYS_OPEN` alloc
 
 **`struct stat` / `SYS_STAT`**:
 
-`SYS_STAT` calls `vfs_stat()` (EXT2-first, FAT16-fallback) and populates:
-
-```c
-struct stat {
-    unsigned int   st_size;   /* file size in bytes; 0 for directories */
-    unsigned int   st_type;   /* 1 = VFS_FILE, 2 = VFS_DIR */
-    unsigned short st_attr;   /* FAT attribute byte (0 for EXT2 entries) */
-};
-```
+`SYS_STAT` resolves `path` through the VFS mount table and populates a `struct stat` with size/type plus full Unix metadata (mode, uid, gid, nlink, inode number, timestamps, block count/size) and enforces `X_OK` on every ancestor directory along the way. See `docs/syscalls.md`'s `SYS_STAT` section for the current layout, and `docs/api/vfs.md` for the permission model.
 
 **Seek semantics**:
 
@@ -471,7 +462,14 @@ A negative resulting offset returns `-EINVAL`. Seeking past the end of the file 
 - EXT2 does not support doubly- or triply-indirect blocks.
 - FAT16 filenames restricted to 8.3; no LFN support.
 - Single FAT16 and single EXT2 instance; no unmount.
-- No file permissions beyond FAT attribute bytes (EXT2 mode bits are not surfaced to userland).
-- No timestamps surfaced to userland.
 - Root directory has a fixed 512-entry capacity in FAT16.
 - `fat16_rename` does not support true atomic cross-directory moves.
+- Permissions are enforced (Stage 3A — see `docs/api/vfs.md`), but there is no
+  ACL/capability model, no setuid/setgid, no sticky bit, and no groups
+  database. `chmod`/`chown` exist only as `-EROFS` syscall stubs; no
+  filesystem can persist a permission or ownership change yet.
+- No login system: every process is uid 0 (root) in practice. Credentials
+  exist and are enforced, but nothing can set them to anything else outside
+  the `ext2test` regression suite's test-only `SYS_DEBUG_SETCRED` hook.
+- Symlinks are recognized (`VFS_SYMLINK`, `S_ISLNK`) but never followed;
+  `readlink()`/`symlink()` are not implemented.

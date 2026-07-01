@@ -7,6 +7,7 @@
 #include <pureunix/io.h>
 #include <pureunix/kernel.h>
 #include <pureunix/memory.h>
+#include <pureunix/stat.h>
 #include <pureunix/stdio.h>
 #include <pureunix/stdlib.h>
 #include <pureunix/string.h>
@@ -71,6 +72,7 @@ void shell_env_list(shell_output_t *out)
 
 static int cmd_help(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_ls(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
+static int cmd_stat(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_cd(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_pwd(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_mkdir(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
@@ -99,6 +101,7 @@ static int cmd_editor(shell_context_t *ctx, shell_command_t *cmd, const char *in
 
 static const builtin_t builtins[] = {
     { "ls", "list directory contents", cmd_ls },
+    { "stat", "show inode/file metadata", cmd_stat },
     { "cd", "change directory", cmd_cd },
     { "pwd", "print working directory", cmd_pwd },
     { "mkdir", "create a directory", cmd_mkdir },
@@ -164,27 +167,238 @@ static int cmd_help(shell_context_t *ctx, shell_command_t *cmd, const char *inpu
     return 0;
 }
 
-static int ls_cb(const vfs_dirent_t *entry, void *ctx)
+/* Render a POSIX mode into a 10-char "-rwxrwxrwx" style string (out must be
+ * at least 11 bytes). Every inode type EXT2 can store is decoded; anything
+ * that matches none of the known S_IF* bit patterns prints as '?'. */
+static void mode_to_string(mode_t mode, char out[11])
 {
-    shell_output_t *out = ctx;
-    shell_out_printf(out, "%c %s %u\n", entry->type == VFS_DIR ? 'd' : '-', entry->name, entry->size);
+    out[0] = S_ISDIR(mode)  ? 'd' :
+             S_ISLNK(mode)  ? 'l' :
+             S_ISCHR(mode)  ? 'c' :
+             S_ISBLK(mode)  ? 'b' :
+             S_ISFIFO(mode) ? 'p' :
+             S_ISSOCK(mode) ? 's' :
+             S_ISREG(mode)  ? '-' : '?';
+    out[1] = (mode & S_IRUSR) ? 'r' : '-';
+    out[2] = (mode & S_IWUSR) ? 'w' : '-';
+    out[3] = (mode & S_IXUSR) ? 'x' : '-';
+    out[4] = (mode & S_IRGRP) ? 'r' : '-';
+    out[5] = (mode & S_IWGRP) ? 'w' : '-';
+    out[6] = (mode & S_IXGRP) ? 'x' : '-';
+    out[7] = (mode & S_IROTH) ? 'r' : '-';
+    out[8] = (mode & S_IWOTH) ? 'w' : '-';
+    out[9] = (mode & S_IXOTH) ? 'x' : '-';
+    out[10] = '\0';
+}
+
+static char short_type_char(vfs_node_type_t type)
+{
+    switch (type) {
+    case VFS_DIR:     return 'd';
+    case VFS_SYMLINK: return 'l';
+    default:          return '-';
+    }
+}
+
+static bool is_dot_name(const char *name)
+{
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
+typedef struct ls_ctx {
+    shell_output_t *out;
+    bool long_fmt;
+    bool show_all;
+    char dir[PUREUNIX_MAX_PATH];
+} ls_ctx_t;
+
+static int ls_cb(const vfs_dirent_t *entry, void *ctx_)
+{
+    ls_ctx_t *ctx = ctx_;
+    if (is_dot_name(entry->name) && !ctx->show_all) {
+        return 0;
+    }
+
+    if (!ctx->long_fmt) {
+        shell_out_printf(ctx->out, "%c %s %u\n", short_type_char(entry->type), entry->name, entry->size);
+        return 0;
+    }
+
+    /* "." and ".." are real directory entries here (the EXT2 driver no
+     * longer hides them), so they get stat'd like anything else;
+     * vfs_normalize resolves them to the actual directory/parent path. */
+    char path[PUREUNIX_MAX_PATH];
+    vfs_normalize(path, ctx->dir, entry->name);
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) {
+        shell_out_printf(ctx->out, "?????????? ? ? ? %u %s\n", entry->size, entry->name);
+        return 0;
+    }
+    char modestr[11];
+    mode_to_string(st.st_mode, modestr);
+    shell_out_printf(ctx->out, "%s %u %u %u %u %s\n", modestr, st.st_nlink, st.st_uid, st.st_gid, st.size, entry->name);
     return 0;
 }
 
 static int cmd_ls(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
 {
+    bool long_fmt = false;
+    bool show_all = false;
+    const char *path_arg = NULL;
+
+    for (int i = 1; i < cmd->argc; ++i) {
+        const char *arg = cmd->argv[i];
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (const char *p = arg + 1; *p; ++p) {
+                switch (*p) {
+                case 'l': long_fmt = true; break;
+                case 'a': show_all = true; break;
+                default:
+                    shell_out_printf(out, "ls: invalid option -- '%c'\n", *p);
+                    return -1;
+                }
+            }
+        } else if (!path_arg) {
+            path_arg = arg;
+        } else {
+            shell_out_printf(out, "ls: too many arguments\n");
+            return -1;
+        }
+    }
+
     char path[PUREUNIX_MAX_PATH];
-    abs_path(ctx, cmd->argc > 1 ? cmd->argv[1] : ".", path);
+    abs_path(ctx, path_arg ? path_arg : ".", path);
     vfs_stat_t st;
     if (vfs_stat(path, &st) != 0) {
         shell_out_printf(out, "ls: cannot access %s\n", path);
         return -1;
     }
-    if (st.type == VFS_FILE) {
-        shell_out_printf(out, "- %s %u\n", path, st.size);
+    if (st.type != VFS_DIR) {
+        if (long_fmt) {
+            char modestr[11];
+            mode_to_string(st.st_mode, modestr);
+            shell_out_printf(out, "%s %u %u %u %u %s\n", modestr, st.st_nlink, st.st_uid, st.st_gid, st.size, path);
+        } else {
+            shell_out_printf(out, "%c %s %u\n", short_type_char(st.type), path, st.size);
+        }
         return 0;
     }
-    return vfs_readdir(path, ls_cb, out);
+
+    ls_ctx_t lctx = { .out = out, .long_fmt = long_fmt, .show_all = show_all };
+    strncpy(lctx.dir, path, sizeof(lctx.dir) - 1);
+    return vfs_readdir(path, ls_cb, &lctx);
+}
+
+static const char *type_name(mode_t mode)
+{
+    if (S_ISDIR(mode))  return "directory";
+    if (S_ISLNK(mode))  return "symbolic link";
+    if (S_ISCHR(mode))  return "character device";
+    if (S_ISBLK(mode))  return "block device";
+    if (S_ISFIFO(mode)) return "FIFO";
+    if (S_ISSOCK(mode)) return "socket";
+    if (S_ISREG(mode))  return "regular file";
+    return "unknown";
+}
+
+/* Days-since-epoch -> proleptic-Gregorian y/m/d (Howard Hinnant's
+ * civil_from_days, restricted to uint32_t since every timestamp here postdates
+ * 1970 and predates year ~2106). */
+static void unix_to_civil(uint32_t epoch, uint32_t *year, uint32_t *mon, uint32_t *day,
+                          uint32_t *hour, uint32_t *min, uint32_t *sec)
+{
+    uint32_t days = epoch / 86400u;
+    uint32_t rem  = epoch % 86400u;
+    *hour = rem / 3600u;
+    rem %= 3600u;
+    *min  = rem / 60u;
+    *sec  = rem % 60u;
+
+    uint32_t z   = days + 719468u;
+    uint32_t era = z / 146097u;
+    uint32_t doe = z - era * 146097u;
+    uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    uint32_t mp  = (5u * doy + 2u) / 153u;
+    *day  = doy - (153u * mp + 2u) / 5u + 1u;
+    *mon  = mp + (mp < 10u ? 3u : (uint32_t)-9);
+    *year = era * 400u + yoe + (*mon <= 2u ? 1u : 0u);
+}
+
+static void put2(char *buf, size_t *pos, uint32_t v)
+{
+    buf[(*pos)++] = (char)('0' + (v / 10u) % 10u);
+    buf[(*pos)++] = (char)('0' + v % 10u);
+}
+
+static void put4(char *buf, size_t *pos, uint32_t v)
+{
+    buf[(*pos)++] = (char)('0' + (v / 1000u) % 10u);
+    buf[(*pos)++] = (char)('0' + (v / 100u) % 10u);
+    buf[(*pos)++] = (char)('0' + (v / 10u) % 10u);
+    buf[(*pos)++] = (char)('0' + v % 10u);
+}
+
+/* Format a Unix epoch timestamp as "YYYY-MM-DD HH:MM:SS" (buf must be at
+ * least 20 bytes). epoch == 0 (no timestamp available) prints as "-". */
+static void format_epoch(uint32_t epoch, char *buf, size_t buf_size)
+{
+    if (buf_size < 20) {
+        if (buf_size) buf[0] = '\0';
+        return;
+    }
+    if (epoch == 0) {
+        strcpy(buf, "-");
+        return;
+    }
+    uint32_t year, mon, day, hour, min, sec;
+    unix_to_civil(epoch, &year, &mon, &day, &hour, &min, &sec);
+
+    size_t pos = 0;
+    put4(buf, &pos, year); buf[pos++] = '-';
+    put2(buf, &pos, mon);  buf[pos++] = '-';
+    put2(buf, &pos, day);  buf[pos++] = ' ';
+    put2(buf, &pos, hour); buf[pos++] = ':';
+    put2(buf, &pos, min);  buf[pos++] = ':';
+    put2(buf, &pos, sec);
+    buf[pos] = '\0';
+}
+
+static int cmd_stat(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
+{
+    if (require_args(cmd, 2, out, "stat <path>") != 0) {
+        return -1;
+    }
+    char path[PUREUNIX_MAX_PATH];
+    abs_path(ctx, cmd->argv[1], path);
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) {
+        shell_out_printf(out, "stat: cannot stat '%s'\n", path);
+        return -1;
+    }
+
+    char modestr[11];
+    mode_to_string(st.st_mode, modestr);
+    uint32_t perm = st.st_mode & 0777;
+
+    char atime[20], mtime[20], ctime_buf[20];
+    format_epoch(st.st_atime, atime, sizeof(atime));
+    format_epoch(st.st_mtime, mtime, sizeof(mtime));
+    format_epoch(st.st_ctime, ctime_buf, sizeof(ctime_buf));
+
+    shell_out_printf(out, "File: %s\n", path);
+    shell_out_printf(out, "Inode: %u\n", st.st_ino);
+    shell_out_printf(out, "Type: %s\n", type_name(st.st_mode));
+    shell_out_printf(out, "Mode: 0%u%u%u (%s)\n", (perm >> 6) & 7, (perm >> 3) & 7, perm & 7, modestr);
+    shell_out_printf(out, "Links: %u\n", st.st_nlink);
+    shell_out_printf(out, "UID: %u\n", st.st_uid);
+    shell_out_printf(out, "GID: %u\n", st.st_gid);
+    shell_out_printf(out, "Size: %u\n", st.size);
+    shell_out_printf(out, "Blocks: %u\n", st.st_blocks);
+    shell_out_printf(out, "Access: %s\n", atime);
+    shell_out_printf(out, "Modify: %s\n", mtime);
+    shell_out_printf(out, "Change: %s\n", ctime_buf);
+    return 0;
 }
 
 static int cmd_cd(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)

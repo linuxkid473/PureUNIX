@@ -1,4 +1,5 @@
 #include <pureunix/arch.h>
+#include <pureunix/dirent.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
 #include <pureunix/keyboard.h>
@@ -9,6 +10,29 @@
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
 #include <pureunix/vfs.h>
+
+/* Collects vfs_readdir() callback entries into the caller's SYS_READDIR
+ * output buffer, capped at the caller-supplied capacity. */
+typedef struct readdir_collect_ctx {
+    struct pureunix_dirent *out;
+    int max;
+    int count;
+} readdir_collect_ctx_t;
+
+static int readdir_collect_cb(const vfs_dirent_t *entry, void *ctx_)
+{
+    readdir_collect_ctx_t *ctx = ctx_;
+    if (ctx->count >= ctx->max) {
+        return 1; /* stop iteration: buffer full */
+    }
+    struct pureunix_dirent *d = &ctx->out[ctx->count];
+    strncpy(d->name, entry->name, PUREUNIX_MAX_NAME - 1);
+    d->name[PUREUNIX_MAX_NAME - 1] = '\0';
+    d->type = (uint32_t)entry->type;
+    d->size = entry->size;
+    ctx->count++;
+    return 0;
+}
 
 void syscall_init(void)
 {
@@ -119,6 +143,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (st.type != VFS_FILE) {
             return (uint32_t)-EISDIR;
         }
+        if (!vfs_access(&st, current_uid(), current_gid(), R_OK)) {
+            return (uint32_t)-EACCES;
+        }
 
         task_t *t = task_current();
         int fd = -1;
@@ -202,6 +229,87 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         st->st_size = vst.size;
         st->st_type = (uint32_t)vst.type;
         st->st_attr = vst.mode;
+        st->st_mode = vst.st_mode;
+        st->st_uid = vst.st_uid;
+        st->st_gid = vst.st_gid;
+        st->st_nlink = vst.st_nlink;
+        st->st_ino = vst.st_ino;
+        st->st_atime = vst.st_atime;
+        st->st_mtime = vst.st_mtime;
+        st->st_ctime = vst.st_ctime;
+        st->st_blocks = vst.st_blocks;
+        st->st_blksize = vst.st_blksize;
+        return 0;
+    }
+    case SYS_ACCESS: {
+        const char *path = (const char *)regs->ebx;
+        int mode = (int)regs->ecx;
+
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        vfs_stat_t st;
+        if (vfs_stat(path, &st) != 0) {
+            return (uint32_t)-ENOENT;
+        }
+        if (!vfs_access(&st, current_uid(), current_gid(), mode)) {
+            return (uint32_t)-EACCES;
+        }
+        return 0;
+    }
+    case SYS_CHMOD: {
+        const char *path = (const char *)regs->ebx;
+        mode_t mode = (mode_t)regs->ecx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_chmod(path, mode);
+    }
+    case SYS_CHOWN: {
+        const char *path = (const char *)regs->ebx;
+        uid_t uid = (uid_t)regs->ecx;
+        gid_t gid = (gid_t)regs->edx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_chown(path, uid, gid);
+    }
+    case SYS_READDIR: {
+        const char *path = (const char *)regs->ebx;
+        struct pureunix_dirent *out = (struct pureunix_dirent *)regs->ecx;
+        int max = (int)regs->edx;
+
+        if (!path || !out || max <= 0) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        readdir_collect_ctx_t ctx = { .out = out, .max = max, .count = 0 };
+        if (vfs_readdir(path, readdir_collect_cb, &ctx) < 0) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)ctx.count;
+    }
+    case SYS_DEBUG_SETCRED: {
+        /* Test-only credential override — see the comment on
+         * SYS_DEBUG_SETCRED in include/pureunix/syscall.h. No privilege
+         * check by design: there is no login system yet to check against. */
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EINVAL;
+        }
+        t->uid = (uid_t)regs->ebx;
+        t->gid = (gid_t)regs->ecx;
         return 0;
     }
     default:

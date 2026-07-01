@@ -16,4 +16,7 @@ int ext2_stat(const char *path, vfs_stat_t *st);
 int ext2_read_file(const char *path, uint8_t **out_data, size_t *out_size);
 int ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
 
+/* Table of the above, for registration via vfs_mount(). */
+const vfs_ops_t *ext2_vfs_ops(void);
+
 #endif

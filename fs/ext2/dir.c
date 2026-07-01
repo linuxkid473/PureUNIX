@@ -122,31 +122,32 @@ static int readdir_block(uint32_t blk_no, void *raw_ctx)
         if (de->inode != 0 && de->name_len > 0) {
             const char *n    = EXT2_DIRENT_NAME(de);
             uint8_t     nlen = de->name_len;
-            if (!((nlen == 1 && n[0] == '.') ||
-                  (nlen == 2 && n[0] == '.' && n[1] == '.'))) {
 
-                vfs_dirent_t dirent;
-                memset(&dirent, 0, sizeof(dirent));
+            /* "." and ".." are real directory entries on disk (every EXT2
+             * directory stores them) and are passed through here just like
+             * any other entry; it's the shell's job to hide them by default
+             * and show them under ls -a. */
+            vfs_dirent_t dirent;
+            memset(&dirent, 0, sizeof(dirent));
 
-                uint8_t copy_len = nlen < (PUREUNIX_MAX_NAME - 1)
-                                   ? nlen : (PUREUNIX_MAX_NAME - 1);
-                memcpy(dirent.name, n, copy_len);
-                dirent.name[copy_len] = '\0';
+            uint8_t copy_len = nlen < (PUREUNIX_MAX_NAME - 1)
+                               ? nlen : (PUREUNIX_MAX_NAME - 1);
+            memcpy(dirent.name, n, copy_len);
+            dirent.name[copy_len] = '\0';
 
-                if (de->file_type == EXT2_FT_DIR) {
-                    dirent.type = VFS_DIR;
-                    dirent.size = 0;
-                } else {
-                    dirent.type = VFS_FILE;
-                    ext2_inode_t file_inode;
-                    dirent.size = (ext2_read_inode(de->inode, &file_inode) == 0)
-                                  ? file_inode.i_size : 0;
-                }
+            if (de->file_type == EXT2_FT_DIR) {
+                dirent.type = VFS_DIR;
+                dirent.size = 0;
+            } else {
+                dirent.type = (de->file_type == EXT2_FT_SYMLINK) ? VFS_SYMLINK : VFS_FILE;
+                ext2_inode_t file_inode;
+                dirent.size = (ext2_read_inode(de->inode, &file_inode) == 0)
+                              ? file_inode.i_size : 0;
+            }
 
-                if (rctx->cb(&dirent, rctx->user_ctx) != 0) {
-                    rctx->stopped = 1;
-                    return 1;  /* stop iteration */
-                }
+            if (rctx->cb(&dirent, rctx->user_ctx) != 0) {
+                rctx->stopped = 1;
+                return 1;  /* stop iteration */
             }
         }
         off += de->rec_len;

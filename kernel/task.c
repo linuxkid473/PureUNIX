@@ -35,6 +35,8 @@ void tasking_init(void)
     main_task.state = TASK_RUNNING;
     main_task.next = &main_task;
     reserve_stdio(&main_task);
+    main_task.uid = 0;
+    main_task.gid = 0;
     current = &main_task;
     task_list_head = &main_task;
 }
@@ -56,6 +58,10 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg)
     task->entry = entry;
     task->arg = arg;
     reserve_stdio(task);
+    /* Credentials propagate from creator to child — the only "process
+     * spawning" rule that exists before a real login/setuid model arrives. */
+    task->uid = current ? current->uid : 0;
+    task->gid = current ? current->gid : 0;
 
     uint32_t *sp = (uint32_t *)(task->stack_base + TASK_STACK_SIZE);
     *--sp = (uint32_t)task_bootstrap;
@@ -112,6 +118,16 @@ void task_exit(void)
 task_t *task_current(void)
 {
     return current;
+}
+
+uid_t current_uid(void)
+{
+    return current ? current->uid : 0;
+}
+
+gid_t current_gid(void)
+{
+    return current ? current->gid : 0;
 }
 
 void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx)

@@ -37,6 +37,31 @@ int pu_stat(const char *path, struct stat *st)
     return syscall3(SYS_STAT, (int)path, (int)st, 0);
 }
 
+int pu_access(const char *path, int mode)
+{
+    return syscall3(SYS_ACCESS, (int)path, mode, 0);
+}
+
+int pu_chmod(const char *path, mode_t mode)
+{
+    return syscall3(SYS_CHMOD, (int)path, (int)mode, 0);
+}
+
+int pu_chown(const char *path, uid_t uid, gid_t gid)
+{
+    return syscall3(SYS_CHOWN, (int)path, (int)uid, (int)gid);
+}
+
+int pu_readdir(const char *path, struct dirent *entries, int max_entries)
+{
+    return syscall3(SYS_READDIR, (int)path, (int)entries, max_entries);
+}
+
+int pu_debug_setcred(uid_t uid, gid_t gid)
+{
+    return syscall3(SYS_DEBUG_SETCRED, (int)uid, (int)gid, 0);
+}
+
 size_t pu_strlen(const char *s)
 {
     size_t len = 0;
