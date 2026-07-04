@@ -83,6 +83,11 @@ void vmm_map_page(virt_addr_t virt, phys_addr_t phys, uint32_t flags)
         page_directory[pd_i] = frame | PAGE_PRESENT | PAGE_WRITE | (flags & PAGE_USER);
     } else {
         table = (uint32_t *)(page_directory[pd_i] & ~0xFFF);
+        /* Widening an already-present PDE (e.g. the identity map) to
+         * PAGE_USER only relaxes the directory-level gate; each page's own
+         * PTE.user bit below still decides whether that specific page is
+         * actually reachable from ring 3. */
+        page_directory[pd_i] |= (flags & PAGE_USER);
     }
     table[pt_i] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");

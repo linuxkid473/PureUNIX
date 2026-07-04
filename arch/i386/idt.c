@@ -3,6 +3,7 @@
 #include <pureunix/panic.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/task.h>
 
 typedef struct idt_entry {
     uint16_t base_low;
@@ -33,6 +34,7 @@ extern void irq4(void); extern void irq5(void); extern void irq6(void); extern v
 extern void irq8(void); extern void irq9(void); extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void); extern void irq15(void);
 extern void isr128(void);
+extern void isr129(void);
 
 static const char *exception_names[] = {
     "divide by zero", "debug", "non-maskable interrupt", "breakpoint",
@@ -84,6 +86,7 @@ void idt_init(void)
     }
 
     idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE);
+    idt_set_gate(0x81, (uint32_t)isr129, 0x08, 0xEE);
     idt_load((uint32_t)&idtp);
 }
 
@@ -91,6 +94,14 @@ void isr_dispatch(interrupt_regs_t *regs)
 {
     if (regs->int_no == 0x80) {
         regs->eax = syscall_dispatch(regs);
+        return;
+    }
+
+    if (regs->int_no == 0x81) {
+        /* Process-termination trap: not part of the public syscall ABI.
+         * task_exit() never returns for the exiting task — it context
+         * switches away to whoever is waiting in task_join(). */
+        task_exit((int)regs->ebx);
         return;
     }
 

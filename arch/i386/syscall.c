@@ -42,6 +42,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 {
     switch (regs->eax) {
     case SYS_EXIT:
+        /* Deliberately a pass-through, not a real exit(): see
+         * docs/syscalls.md and user/systest.c's "SYS_EXIT does not
+         * terminate the caller" test. Actual process termination happens
+         * through a separate, non-syscall mechanism — see int
+         * $0x81 / task_terminate_trap in crt0.S and arch/i386/idt.c. */
         return regs->ebx;
     case SYS_WRITE: {
         int fd = (int)regs->ebx;

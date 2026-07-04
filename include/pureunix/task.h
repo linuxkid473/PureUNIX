@@ -32,6 +32,13 @@ typedef struct task {
     uint8_t *stack_base;
     void (*entry)(void *);
     void *arg;
+    /* set for tasks started via task_create_user(): task_bootstrap() drops
+     * to ring 3 at user_entry/user_stack instead of calling entry(arg). */
+    bool is_user;
+    uint32_t user_entry;
+    uint32_t user_stack;
+    /* set by task_exit(), read back by task_join() */
+    int exit_code;
     struct task *next;
     /* per-task file descriptor table; fds 0/1/2 are reserved (stdin/out/err) */
     fd_entry_t fds[MAX_OPEN_FILES];
@@ -45,8 +52,15 @@ typedef struct task {
 
 void tasking_init(void);
 task_t *task_create(const char *name, void (*entry)(void *), void *arg);
+/* Like task_create(), but the task starts in ring 3 at `entry` running on
+ * `user_stack_top` (both must already be mapped PAGE_USER) instead of
+ * calling a kernel-mode function pointer. */
+task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_top);
 void task_yield(void);
-void task_exit(void);
+void task_exit(int code);
+/* Blocks (cooperatively, via task_yield) until `t` exits, then reaps it
+ * (frees its stack and task_t) and returns its exit code. */
+int task_join(task_t *t);
 task_t *task_current(void);
 void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx);
 int task_kill(uint32_t id);

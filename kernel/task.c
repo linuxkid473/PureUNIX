@@ -13,10 +13,14 @@ static uint32_t next_task_id = 1;
 
 static void task_bootstrap(void)
 {
-    if (current && current->entry) {
-        current->entry(current->arg);
+    if (current) {
+        if (current->is_user) {
+            enter_usermode(current->user_entry, current->user_stack);
+        } else if (current->entry) {
+            current->entry(current->arg);
+        }
     }
-    task_exit();
+    task_exit(0);
 }
 
 static void reserve_stdio(task_t *task)
@@ -41,7 +45,7 @@ void tasking_init(void)
     task_list_head = &main_task;
 }
 
-task_t *task_create(const char *name, void (*entry)(void *), void *arg)
+static task_t *task_alloc(const char *name)
 {
     task_t *task = kcalloc(1, sizeof(task_t));
     if (!task) {
@@ -55,8 +59,6 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg)
     task->id = next_task_id++;
     strncpy(task->name, name ? name : "task", sizeof(task->name) - 1);
     task->state = TASK_READY;
-    task->entry = entry;
-    task->arg = arg;
     reserve_stdio(task);
     /* Credentials propagate from creator to child — the only "process
      * spawning" rule that exists before a real login/setuid model arrives. */
@@ -76,6 +78,29 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg)
     }
     tail->next = task;
     task->next = task_list_head;
+    return task;
+}
+
+task_t *task_create(const char *name, void (*entry)(void *), void *arg)
+{
+    task_t *task = task_alloc(name);
+    if (!task) {
+        return NULL;
+    }
+    task->entry = entry;
+    task->arg = arg;
+    return task;
+}
+
+task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_top)
+{
+    task_t *task = task_alloc(name);
+    if (!task) {
+        return NULL;
+    }
+    task->is_user = true;
+    task->user_entry = entry;
+    task->user_stack = user_stack_top;
     return task;
 }
 
@@ -103,16 +128,43 @@ void task_yield(void)
     }
     next->state = TASK_RUNNING;
     current = next;
+    /* main_task runs on the boot stack (no stack_base) and never executes
+     * in ring 3, so it has nothing to install here. */
+    if (next->stack_base) {
+        tss_set_kernel_stack((uint32_t)(next->stack_base + TASK_STACK_SIZE));
+    }
     context_switch(&prev->stack_ptr, next->stack_ptr);
 }
 
-void task_exit(void)
+void task_exit(int code)
 {
+    current->exit_code = code;
     current->state = TASK_ZOMBIE;
     task_yield();
     for (;;) {
         arch_halt();
     }
+}
+
+int task_join(task_t *t)
+{
+    if (!t) {
+        return -1;
+    }
+    while (t->state != TASK_ZOMBIE) {
+        task_yield();
+    }
+    int code = t->exit_code;
+
+    task_t *prev = task_list_head;
+    while (prev->next != t) {
+        prev = prev->next;
+    }
+    prev->next = t->next;
+
+    kfree(t->stack_base);
+    kfree(t);
+    return code;
 }
 
 task_t *task_current(void)

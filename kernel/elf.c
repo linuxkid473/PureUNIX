@@ -4,11 +4,21 @@
 #include <pureunix/string.h>
 #include <pureunix/task.h>
 #include <pureunix/vfs.h>
+#include <pureunix/vmm.h>
 
 #define EI_NIDENT 16
 #define ET_EXEC 2
 #define EM_386 3
 #define PT_LOAD 1
+
+/* Fixed ring3 sandbox window: code+data+bss go in the low part, a 64 KiB
+ * stack (growing down from the top) takes the rest. Kept inside the same
+ * [0x400000, 0x700000) range this loader has always used, so no new
+ * physical memory needs to be carved out for it. */
+#define USER_WINDOW_BASE  0x400000U
+#define USER_WINDOW_END   0x700000U
+#define USER_STACK_SIZE   0x10000U
+#define ELF_CODE_LIMIT   (USER_WINDOW_END - USER_STACK_SIZE)
 
 typedef struct elf32_ehdr {
     uint8_t e_ident[EI_NIDENT];
@@ -85,7 +95,8 @@ int elf_exec(const char *path)
         if (ph->p_type != PT_LOAD) {
             continue;
         }
-        if (ph->p_offset + ph->p_filesz > size || ph->p_vaddr < 0x400000 || ph->p_vaddr + ph->p_memsz > 0x700000) {
+        if (ph->p_offset + ph->p_filesz > size || ph->p_vaddr < USER_WINDOW_BASE ||
+            ph->p_vaddr + ph->p_memsz > ELF_CODE_LIMIT) {
             printf("%s: invalid segment\n", path);
             kfree(image);
             return -1;
@@ -96,8 +107,20 @@ int elf_exec(const char *path)
         }
     }
 
-    int (*entry)(void) = (int (*)(void))eh->e_entry;
-    int rc = entry();
+    uint32_t entry = eh->e_entry;
     kfree(image);
-    return rc;
+
+    /* Widen the sandbox window to user-accessible. The PDE covering this
+     * range already exists (part of the boot-time identity map); only its
+     * PAGE_USER bit and each page's own PAGE_USER bit are missing. */
+    for (uint32_t addr = USER_WINDOW_BASE; addr < USER_WINDOW_END; addr += PUREUNIX_PAGE_SIZE) {
+        vmm_map_page(addr, addr, PAGE_USER | PAGE_WRITE);
+    }
+
+    task_t *child = task_create_user("user", entry, USER_WINDOW_END);
+    if (!child) {
+        printf("%s: failed to create process\n", path);
+        return -1;
+    }
+    return task_join(child);
 }

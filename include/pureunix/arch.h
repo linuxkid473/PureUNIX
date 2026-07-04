@@ -18,6 +18,15 @@ void idt_init(void);
 void interrupt_register_handler(uint8_t vector, interrupt_handler_t handler);
 void isr_dispatch(interrupt_regs_t *regs);
 
+/* Points the hardware task state segment's ring-0 stack at esp0, so the
+ * next ring3 -> ring0 trap (syscall or exception) lands on the given
+ * kernel stack instead of whatever the previous running task left there. */
+void tss_set_kernel_stack(uint32_t esp0);
+
+/* Drops to CPL3 and starts executing at `entry` on `user_stack` (which
+ * must already be present + PAGE_USER mapped). Never returns. */
+void enter_usermode(uint32_t entry, uint32_t user_stack) __attribute__((noreturn));
+
 void pic_init(void);
 void pic_send_eoi(uint8_t irq);
 void irq_enable(uint8_t irq);

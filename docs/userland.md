@@ -2,7 +2,7 @@
 
 ## Overview
 
-PureUNIX supports executing ELF32 binaries loaded from the FAT16 filesystem. User programs run in the same address space as the kernel with no memory protection or privilege separation. The userland infrastructure consists of:
+PureUNIX supports executing ELF32 binaries loaded from the FAT16 filesystem. User programs run in ring 3 (CPL 3), on their own stack, in the same page directory as the kernel: the fixed `[0x400000, 0x700000)` load window is the only region marked `PAGE_USER`, so user code cannot touch the rest of kernel memory without faulting. The userland infrastructure consists of:
 
 | Component | Source | Purpose |
 |---|---|---|
@@ -37,22 +37,22 @@ Returns `-1` on any validation failure. ELF section headers are ignored.
 
 For each `PT_LOAD` segment in the program header table:
 
-1. Validates `p_vaddr` in the range `[0x400000, 0x700000)`. Segments outside this range are rejected.
+1. Validates `p_vaddr` in the range `[0x400000, 0x6F0000)` — the top 64 KiB of the `[0x400000, 0x700000)` window is reserved for the user stack. Segments outside this range are rejected.
 2. Copies `p_filesz` bytes from `data + p_offset` to the virtual address via `memcpy`.
 3. If `p_memsz > p_filesz` (BSS), the remaining bytes are zeroed with `memset`.
 
 ### Execution
 
-After all segments are loaded, `elf_exec` calls the entry point:
+After all segments are loaded, `elf_exec` marks the whole `[0x400000, 0x700000)` window `PAGE_USER` (see `kernel/vmm.c`), spawns a task via `task_create_user(name, e_entry, 0x700000)`, and blocks in `task_join()` until it exits:
 
 ```c
-int (*entry_fn)(void) = (int (*)(void))ehdr->e_entry;
-int result = entry_fn();
+task_t *child = task_create_user("user", entry, USER_WINDOW_END);
+return task_join(child);
 ```
 
-The call happens in kernel context, on the kernel stack, with kernel privilege. The return value is returned by `elf_exec` to its caller (`exec_external` in the shell).
+The task's first switch-in runs `enter_usermode()` (`arch/i386/usermode.S`), which `iret`s to CPL 3 at `e_entry` with `ESP` at the top of the 64 KiB user stack. A per-task kernel stack (`arch/i386/gdt.c`'s TSS, updated on every `task_yield()`) is what lets a later trap from ring 3 land back in the kernel safely. The return value is returned by `elf_exec` to its caller (`exec_external` in the shell).
 
-**No process isolation**: the user program has unrestricted access to kernel memory and hardware.
+**Still no isolation between user *programs***: every ELF run shares the same fixed window and the same page directory as the kernel (no per-process address space yet), so only the kernel-vs-user boundary is enforced — not process-vs-process.
 
 ---
 
@@ -65,12 +65,15 @@ The call happens in kernel context, on the kernel stack, with kernel privilege. 
 .global _start
 _start:
     call main
-    ret
+    movl %eax, %ebx
+    int $0x81
+.Lhang:
+    jmp .Lhang
 ```
 
-`_start` is the ELF entry point. It calls `main` and returns. The return from `_start` goes back to the kernel's `entry_fn()` call in `elf_exec`. There is no `exit` syscall invocation from `crt0`.
+`_start` is the ELF entry point. It calls `main`, then traps to `int $0x81` with the return value in `EBX`. This is **not** the public `SYS_*` syscall gate (`int $0x80`) — it is a separate, kernel-internal vector (`isr129`, wired up in `arch/i386/idt.c`) whose handler calls `task_exit(ebx)`. `task_exit()` never returns to the dying task; it context-switches to whichever task is blocked on it in `task_join()` (normally `elf_exec`'s caller). `.Lhang` is an unreachable safety net.
 
-**Note**: `SYS_EXIT` (syscall 1) does not terminate the task. If a program wants to signal an exit code, it must call it explicitly before returning from `main`. The kernel resumes after `elf_exec` regardless.
+**Note**: `SYS_EXIT` (syscall 1, reachable via `int $0x80`) is a different thing entirely and still does not terminate the task — it is a documented pass-through that just echoes `EBX` back (see `docs/syscalls.md` and the "SYS_EXIT does not terminate the caller" checks in `user/systest.c`). Actual process termination only happens through the `int $0x81` trap above, which user code never issues directly — only `crt0` does, after `main` returns.
 
 ---
 
@@ -235,8 +238,8 @@ The resulting ELF files are placed in `build/user/` and then written into the FA
 
 ## Limitations
 
-- No memory isolation between user programs and kernel.
-- No user stack separate from the kernel boot stack.
+- User programs run in ring 3 with their own 64 KiB stack, but there is still no per-process address space: every program loads into the same fixed `[0x400000, 0x700000)` window, so two programs' memory is never isolated from each other, only from the kernel.
+- Only one program can run at a time (see below), so the single fixed window is never actually contended.
 - No dynamic linking; all code must be statically linked.
 - No `printf`, `malloc`, `free`, or any standard library in libpure.
 - Only one program can run at a time; no fork or exec.

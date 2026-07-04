@@ -13,3 +13,10 @@ gdt_flush:
     ljmp $0x08, $.flush
 .flush:
     ret
+
+.global tss_flush
+.type tss_flush, @function
+tss_flush:
+    mov $0x28, %ax
+    ltr %ax
+    ret

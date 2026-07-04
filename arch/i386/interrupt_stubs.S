@@ -87,6 +87,17 @@ isr128:
     pushl $128
     jmp isr_common_stub
 
+/* Kernel-internal process-termination trap (int $0x81) — distinct from
+ * the public int $0x80 syscall gate. Used only by user/crt0.S after
+ * main() returns; never exposed as a SYS_* number. */
+.global isr129
+.type isr129, @function
+isr129:
+    cli
+    pushl $0
+    pushl $129
+    jmp isr_common_stub
+
 .extern isr_dispatch
 .global isr_common_stub
 .type isr_common_stub, @function
