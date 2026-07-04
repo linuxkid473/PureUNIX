@@ -12,6 +12,7 @@
 #include <pureunix/stdlib.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
+#include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 
@@ -98,6 +99,8 @@ static int cmd_shutdown(shell_context_t *ctx, shell_command_t *cmd, const char *
 static int cmd_env(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_export(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 static int cmd_editor(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
+static int cmd_adduser(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
+static int cmd_passwd(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
 
 static const builtin_t builtins[] = {
     { "ls", "list directory contents", cmd_ls },
@@ -129,6 +132,8 @@ static const builtin_t builtins[] = {
     { "export", "set environment variable", cmd_export },
     { "vim", "open the vim text editor", cmd_editor },
     { "vi",  "open the vim text editor", cmd_editor },
+    { "adduser", "create a new user account (root only)", cmd_adduser },
+    { "passwd", "change a user's password", cmd_passwd },
 };
 
 const builtin_t *shell_builtins(size_t *count)
@@ -706,4 +711,35 @@ static int cmd_editor(shell_context_t *ctx, shell_command_t *cmd, const char *in
     char path[PUREUNIX_MAX_PATH];
     abs_path(ctx, cmd->argv[1], path);
     return editor_open(path);
+}
+
+/* Both of these prompt for the new password interactively (via
+ * pureunix/users.h, writing directly to the terminal), so they bypass the
+ * buffered shell_output_t out the same way cmd_editor's full-screen editor
+ * does — only the final one-line result goes through `out`. */
+static int cmd_adduser(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
+{
+    if (require_args(cmd, 2, out, "adduser USERNAME") != 0) return -1;
+    if (current_uid() != 0) {
+        shell_out_puts(out, "adduser: permission denied (must be root)\n");
+        return -1;
+    }
+    if (users_adduser(cmd->argv[1]) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_passwd(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
+{
+    const char *target = cmd->argc > 1 ? cmd->argv[1] : shell_getenv("USER");
+    if (cmd->argc > 1 && strcmp(target, shell_getenv("USER")) != 0 && current_uid() != 0) {
+        shell_out_puts(out, "passwd: permission denied\n");
+        return -1;
+    }
+    if (users_passwd(target) != 0) {
+        return -1;
+    }
+    shell_out_puts(out, "Password updated.\n");
+    return 0;
 }

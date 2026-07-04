@@ -13,7 +13,8 @@ A from-scratch operating system kernel for the i686 (IA-32) architecture, writte
 - **Drivers**: VGA text mode (80×25) with ANSI SGR colors, VBE linear framebuffer + boot splash, PS/2 keyboard, 16550 serial (COM1), ATA PIO disk (primary master and slave)
 - **Filesystems**: EXT2 read/write driver (primary root filesystem, ATA slave) with symlinks, hard links, and Unix permissions; FAT16 read/write driver (compatibility/testing store, ATA master)
 - **VFS**: mount-table router with longest-prefix path resolution, symlink-following path resolution, and Unix permission enforcement (`uid`/`gid`/mode) on every call
-- **Shell**: interactive line editor with history (64 entries), tab completion, pipes (`|`), I/O redirection (`<`, `>`, `>>`), and 29 builtins
+- **Accounts**: `/etc/passwd` + `/etc/shadow` accounts; a first-boot wizard sets the root password and prints a setup guide, and every subsequent boot requires a `login:`/`Password:` prompt before the shell starts; `adduser`/`passwd` builtins manage accounts afterward (see `docs/users.md`)
+- **Shell**: interactive line editor with history (64 entries), tab completion, pipes (`|`), I/O redirection (`<`, `>`, `>>`), and 31 builtins
 - **Editor**: modal vim-like editor (`vim`/`vi`) with NORMAL, INSERT, COMMAND, and search modes
 - **Scheduler**: cooperative round-robin task scheduler; `elf_exec` spawns a ring-3 task per program and blocks until it exits
 - **Syscalls**: 21 syscalls via `int $0x80` — process (`exit`, `getpid`, `yield`), I/O (`read`, `write`), files (`open`, `close`, `lseek`, `stat`, `lstat`, `access`, `readdir`), and filesystem mutation (`chmod`, `chown`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, `readlink`)
@@ -44,7 +45,8 @@ A from-scratch operating system kernel for the i686 (IA-32) architecture, writte
 | Ring 3 ELF32 execution | Complete | `elf_exec` loads into a fixed window (`0x400000`–`0x700000`), spawns a ring-3 task via a hardware TSS + `iret`, and blocks in `task_join()` until it exits |
 | Cooperative scheduler | Complete | Round-robin; no preemption; `task_join()` lets a caller wait on a spawned task |
 | Syscall interface | Complete (21 syscalls + 1 test-only) | See Features above; `SYS_DEBUG_SETCRED` is test-only, no privilege check |
-| Shell builtins (29) | Complete | ls, cd, cat, echo, cp, mv, rm, mkdir, rmdir, touch, stat, mount, free, ps, kill, reboot, shutdown, env, export, etc. |
+| Accounts & login | Complete | `/etc/passwd` + `/etc/shadow`; first-boot root-password wizard; login prompt every boot; `adduser`/`passwd` builtins (see `docs/users.md`) |
+| Shell builtins (31) | Complete | ls, cd, cat, echo, cp, mv, rm, mkdir, rmdir, touch, stat, mount, free, ps, kill, reboot, shutdown, env, export, adduser, passwd, etc. |
 | Shell pipeline/redirect | Complete | Up to 4 pipe stages, `<`, `>`, `>>` |
 | vim-like editor | Complete | Modal edit, undo, search, `:w`/`:q`/`:wq` |
 | Userland programs | Partial | `hello`, `calc`, and the full syscall/filesystem regression suites (`opentest`, `readtest`, `ext2test`, `systest`) are functional; `viewer`/`sh`/`editor` are stubs (the real shell and editor run as kernel builtins) |
@@ -122,6 +124,8 @@ qemu-system-i386 -m 128M -cdrom build/pureunix.iso -boot d \
 
 Every path resolves to exactly one mount via longest-prefix match — `/` and `/fat` are two separate trees, not a merged view. Serial output (all `printf` output) appears on `stdio`. The VGA/framebuffer display appears in the QEMU window.
 
+The very first boot on a disk image runs a setup wizard that asks you to set a root password and prints a short setup guide; every boot after that (this one included) shows a `login:`/`Password:` prompt before the shell starts. See `docs/users.md`.
+
 ---
 
 ## First Commands
@@ -133,6 +137,9 @@ cat /README.TXT             # reads from EXT2
 ls /bin                     # EXT2's /bin — where installed ELF programs live
 ls /fat                     # FAT16's root (separate mount, compatibility/testing)
 cat /etc/passwd             # reads from EXT2
+whoami                       # shows the account you logged in as
+adduser alice                # root only — creates /etc/passwd + /home/alice entries
+passwd                       # change your own password
 touch note.txt
 echo hello > note.txt
 cat note.txt

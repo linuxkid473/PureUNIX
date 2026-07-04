@@ -71,4 +71,9 @@ int task_kill(uint32_t id);
 uid_t current_uid(void);
 gid_t current_gid(void);
 
+/* Sets the *current* task's credentials outright, no privilege check —
+ * called only by the kernel-mode login flow (kernel/users.c) once a
+ * username/password pair has been verified against /etc/shadow. */
+void task_set_creds(uid_t uid, gid_t gid);
+
 #endif

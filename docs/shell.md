@@ -12,11 +12,16 @@ The PureUnix shell runs entirely inside the kernel. It is implemented across fou
 | `shell/builtins.c` | All built-in command implementations, environment variable table |
 | `shell/shell_internal.h` | Internal types and function declarations shared across shell files |
 
-The public API (`include/pureunix/shell.h`) exposes only two functions:
+The public API (`include/pureunix/shell.h`):
 
 ```c
 void shell_run(void);
 int  shell_execute_line(const char *line);
+
+/* Shared with kernel/users.c's login flow — see docs/users.md */
+const char *shell_getenv(const char *key);
+int  shell_setenv(const char *key, const char *value);
+void shell_set_home_cwd(const char *home);
 ```
 
 ---
@@ -168,7 +173,7 @@ Completion triggers when Tab is pressed at the end of the line. The current toke
 
 ## Built-in Commands
 
-All 27 builtins share the signature:
+All 29 builtins share the signature:
 ```c
 typedef int (*builtin_fn_t)(shell_context_t *ctx, shell_command_t *cmd,
                             const char *input, shell_output_t *out);
@@ -205,6 +210,8 @@ All output is written via `shell_out_printf`/`shell_out_puts`, which routes to t
 | `env` | Print all environment variables |
 | `export KEY=VALUE` | Set or create environment variable |
 | `vim FILE` / `vi FILE` | Open file in the vim-like editor |
+| `adduser NAME` | Create a new account (root only); see docs/users.md |
+| `passwd [NAME]` | Change a password (root can change any user's, others only their own) |
 
 ### `date` Implementation
 
@@ -242,4 +249,4 @@ A static array of 32 `env_var_t` entries (key up to 31 chars, value up to 95 cha
 `shell_getenv(key)` returns the value string or `""` if not found.  
 `shell_setenv(key, value)` updates an existing entry or creates a new one (up to 32 total).
 
-`export` is the only way for the user to set variables. There is no inheritance between shells.
+`export` lets the user set variables directly; `kernel/users.c`'s login flow overwrites `USER`/`HOME`/`SHELL` with the values from `/etc/passwd` once a login succeeds (see docs/users.md). There is no inheritance between shells.

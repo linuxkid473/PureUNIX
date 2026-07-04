@@ -25,7 +25,8 @@ PureUNIX/
 │   ├── task.c          Cooperative round-robin scheduler; task_t list; context switch glue
 │   ├── elf.c           ELF32 loader; validates and loads PT_LOAD segments to 0x400000–0x700000
 │   ├── panic.c         panic() — white-on-red VGA + serial + halt
-│   └── reboot.c        Keyboard controller reset; ACPI/QEMU power off ports
+│   ├── reboot.c        Keyboard controller reset; ACPI/QEMU power off ports
+│   └── users.c         /etc/passwd + /etc/shadow, first-boot setup wizard, login prompt, adduser/passwd
 │
 ├── drivers/
 │   ├── vga.c           80×25 VGA text mode; ANSI SGR colors; hardware cursor; serial mirror
@@ -60,7 +61,7 @@ PureUNIX/
 │   ├── sh.c            Main loop; pipeline execution; external program dispatch
 │   ├── parser.c        Tokenizer; pipeline/redirection/pipe parsing
 │   ├── line.c          Interactive line editor; history (64×256); tab completion
-│   ├── builtins.c      27 built-in commands; environment variable table (32 vars)
+│   ├── builtins.c      29 built-in commands; environment variable table (32 vars)
 │   └── shell_internal.h Internal types: shell_command_t, shell_pipeline_t, shell_output_t
 │
 ├── editor/
@@ -94,7 +95,8 @@ PureUNIX/
 │       ├── ext2.h      ext2_mount, ext2_unmount, ext2_is_mounted, ext2_stat, ext2_read_file, ext2_readdir
 │       ├── disk.h      disk_device_t, ata_init, ata_primary_master, ata_primary_slave
 │       ├── keyboard.h  KEY_* constants, keyboard_init, keyboard_getkey, keyboard_try_getkey
-│       ├── shell.h     shell_run, shell_execute_line
+│       ├── shell.h     shell_run, shell_execute_line, shell_getenv/setenv, shell_set_home_cwd
+│       ├── users.h     user_record_t, users_first_boot, users_login, users_adduser, users_passwd
 │       ├── vga.h       vga_color enum, vga_init, vga_putc, vga_clear, cursor functions
 │       ├── serial.h    serial_init, serial_putc, serial_clear, serial_move_cursor
 │       ├── editor.h    editor_open
@@ -121,6 +123,7 @@ PureUNIX/
 │   ├── syscalls.md     INT 0x80 ABI, 9 syscalls, libpure wrappers
 │   ├── drivers.md      VGA, Serial, PS/2 Keyboard, ATA PIO (master + slave)
 │   ├── shell.md        Parser, pipeline execution, line editor, builtins, environment
+│   ├── users.md        Accounts, first-boot setup wizard, login prompt, adduser/passwd
 │   ├── userland.md     ELF loader, crt0, libpure, user programs
 │   ├── developer-guide.md  Adding drivers/syscalls/builtins/programs, debugging, pitfalls
 │   ├── project-layout.md   This file
@@ -170,6 +173,7 @@ boot/multiboot2.S
             │               ├─ dir.c     (needs inode.c, block.c)
             │               ├─ file.c    (needs inode.c, block.c, heap)
             │               └─ mount.c   (needs super.c, dir.c, file.c)
+            ├─ kernel/users.c (needs vfs, keyboard, task, shell_setenv/shell_set_home_cwd)
             └─ shell/sh.c (needs vfs, keyboard, vga, task, elf)
                     ├─ shell/parser.c
                     ├─ shell/line.c

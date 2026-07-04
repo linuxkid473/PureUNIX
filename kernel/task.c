@@ -182,6 +182,14 @@ gid_t current_gid(void)
     return current ? current->gid : 0;
 }
 
+void task_set_creds(uid_t uid, gid_t gid)
+{
+    if (current) {
+        current->uid = uid;
+        current->gid = gid;
+    }
+}
+
 void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx)
 {
     if (!task_list_head || !cb) {

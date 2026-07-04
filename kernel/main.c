@@ -13,6 +13,7 @@
 #include <pureunix/stdio.h>
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
+#include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 
@@ -63,6 +64,12 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     arch_enable_interrupts();
+
+    if (users_first_boot()) {
+        users_first_boot_setup();
+    }
+    users_login();
+
     shell_run();
 
     for (;;) {

@@ -176,6 +176,18 @@ int shell_execute_line(const char *line)
     return status;
 }
 
+void shell_set_home_cwd(const char *home)
+{
+    if (!home || !*home) {
+        return;
+    }
+    vfs_stat_t st;
+    if (vfs_stat(home, &st) == 0 && st.type == VFS_DIR) {
+        strncpy(shell_ctx.cwd, home, sizeof(shell_ctx.cwd) - 1);
+        shell_ctx.cwd[sizeof(shell_ctx.cwd) - 1] = '\0';
+    }
+}
+
 void shell_run(void)
 {
     char line[256];
