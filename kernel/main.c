@@ -1,8 +1,10 @@
 #include <pureunix/arch.h>
+#include <pureunix/bootsplash.h>
 #include <pureunix/config.h>
 #include <pureunix/disk.h>
 #include <pureunix/ext2.h>
 #include <pureunix/fat16.h>
+#include <pureunix/framebuffer.h>
 #include <pureunix/kernel.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/memory.h>
@@ -17,13 +19,21 @@
 void kernel_main(uint32_t magic, uint32_t mbi_addr)
 {
     serial_init();
+    arch_init();
+    pmm_init(magic, mbi_addr);
+
+    /* Parse the framebuffer tag and map its physical range before any
+     * console output, so vga_init()/bootsplash_show() below can safely
+     * write pixels once paging is enabled. */
+    fb_probe(magic, mbi_addr);
+    const fb_info_t *fb = fb_get_info();
+    vmm_init(fb->present ? fb->addr : 0, fb->present ? fb->pitch * fb->height : 0);
+
     vga_init();
+    bootsplash_show();
     printf("\033[92m%s\033[0m %s for %s\n", PUREUNIX_NAME, PUREUNIX_VERSION, PUREUNIX_ARCH);
     printf("Boot magic=%x mbi=%p\n", magic, (void *)mbi_addr);
 
-    arch_init();
-    pmm_init(magic, mbi_addr);
-    vmm_init();
     heap_init();
     tasking_init();
     syscall_init();

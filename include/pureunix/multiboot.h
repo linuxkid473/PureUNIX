@@ -46,4 +46,30 @@ typedef struct multiboot2_mmap_tag {
     multiboot2_mmap_entry_t entries[];
 } __attribute__((packed)) multiboot2_mmap_tag_t;
 
+#define MULTIBOOT2_TAG_FRAMEBUFFER 8
+#define MULTIBOOT2_FRAMEBUFFER_TYPE_RGB 1
+
+/* Fixed-size header; for framebuffer_type == RGB it is immediately followed
+ * by a multiboot2_framebuffer_rgb_info_t describing the channel layout. */
+typedef struct multiboot2_framebuffer_tag {
+    uint32_t type;
+    uint32_t size;
+    uint64_t framebuffer_addr;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t framebuffer_bpp;
+    uint8_t framebuffer_type;
+    uint16_t reserved;
+} __attribute__((packed)) multiboot2_framebuffer_tag_t;
+
+typedef struct multiboot2_framebuffer_rgb_info {
+    uint8_t red_field_position;
+    uint8_t red_mask_size;
+    uint8_t green_field_position;
+    uint8_t green_mask_size;
+    uint8_t blue_field_position;
+    uint8_t blue_mask_size;
+} __attribute__((packed)) multiboot2_framebuffer_rgb_info_t;
+
 #endif

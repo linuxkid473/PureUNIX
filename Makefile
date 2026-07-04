@@ -5,6 +5,7 @@ LD := $(CROSS)gcc
 AR := $(CROSS)ar
 QEMU ?= qemu-system-i386
 PYTHON ?= python3
+GRUB_MKRESCUE ?= i686-elf-grub-mkrescue
 
 BUILD := build
 KERNEL := $(BUILD)/pureunix.elf
@@ -70,22 +71,27 @@ $(DISK2): $(USER_ELFS) tools/mkext2.py $(DOCS_MD)
 
 disk: $(DISK) $(DISK2)
 
-run: $(KERNEL) $(DISK) $(DISK2)
-	$(QEMU) -m 128M -kernel $(KERNEL) \
+# Boots through real GRUB (not QEMU's built-in -kernel multiboot1 loader,
+# which never sets up a graphics mode) so the multiboot2 framebuffer request
+# in boot/multiboot2.S actually takes effect.
+run: $(ISO) $(DISK) $(DISK2)
+	$(QEMU) -m 128M -cdrom $(ISO) -boot d \
 		-drive file=$(DISK),format=raw,if=ide,index=0 \
 		-drive file=$(DISK2),format=raw,if=ide,index=1 \
 		-serial stdio -no-reboot -no-shutdown
 
-iso: $(KERNEL) $(DISK)
-	@command -v x86_64-elf-grub-mkrescue >/dev/null 2>&1 || { \
-		echo "x86_64-elf-grub-mkrescue is required for make iso. Install GRUB tools and rerun make iso."; \
+$(ISO): $(KERNEL) boot/grub.cfg
+	@command -v $(GRUB_MKRESCUE) >/dev/null 2>&1 || { \
+		echo "$(GRUB_MKRESCUE) is required for make iso/run. Install GRUB tools (e.g. 'brew install i686-elf-grub') and retry."; \
 		exit 1; \
 	}
 	@rm -rf $(BUILD)/iso
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/pureunix.elf
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
-	x86_64-elf-grub-mkrescue -o $(ISO) $(BUILD)/iso
+	$(GRUB_MKRESCUE) -o $(ISO) $(BUILD)/iso
+
+iso: $(ISO)
 
 clean:
 	rm -rf $(BUILD)

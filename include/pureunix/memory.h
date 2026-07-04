@@ -10,7 +10,7 @@ void pmm_free_frame(phys_addr_t frame);
 uint32_t pmm_total_memory_kb(void);
 uint32_t pmm_free_memory_kb(void);
 
-void vmm_init(void);
+void vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size);
 void vmm_map_page(virt_addr_t virt, phys_addr_t phys, uint32_t flags);
 phys_addr_t vmm_get_mapping(virt_addr_t virt);
 

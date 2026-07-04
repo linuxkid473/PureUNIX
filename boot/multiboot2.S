@@ -20,6 +20,19 @@ mboot2_start:
 .long MBOOT2_ARCH
 .long MBOOT2_LENGTH
 .long MBOOT2_CHECKSUM
+
+# Request a linear graphics framebuffer instead of VGA text mode.
+# Cell grid is 80x25 at 8x17 pixels/glyph (see include/pureunix/font.h).
+.align 8
+fb_tag_start:
+.short 5        # MULTIBOOT_HEADER_TAG_FRAMEBUFFER
+.short 0        # flags
+.long fb_tag_end - fb_tag_start
+.long 640       # width
+.long 425       # height
+.long 32        # depth
+fb_tag_end:
+
 .align 8
 .short 0
 .short 0
