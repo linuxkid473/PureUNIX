@@ -1,10 +1,7 @@
 #include <pureunix/memory.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
-
-#define PAGE_PRESENT 0x001
-#define PAGE_WRITE   0x002
-#define PAGE_USER    0x004
+#include <pureunix/vmm.h>
 
 #define FB_EXTRA_TABLES 4
 
@@ -105,4 +102,107 @@ phys_addr_t vmm_get_mapping(virt_addr_t virt)
         return 0;
     }
     return (table[pt_i] & ~0xFFF) | (virt & 0xFFF);
+}
+
+uint32_t vmm_create_user_directory(void)
+{
+    phys_addr_t pd_frame = pmm_alloc_frame();
+    if (!pd_frame) {
+        return 0;
+    }
+    /* Share every kernel PDE (identity-mapped low RAM, kernel image, heap,
+     * framebuffer) by reference — only pd[USER_WINDOW_BASE>>22] differs per
+     * process, and it starts absent here, populated lazily by
+     * vmm_map_page_in(). */
+    memcpy((void *)pd_frame, page_directory, sizeof(page_directory));
+    return pd_frame;
+}
+
+void vmm_free_user_directory(uint32_t pd_phys)
+{
+    if (!pd_phys) {
+        return;
+    }
+    uint32_t *pd = (uint32_t *)pd_phys;
+    uint32_t pd_i = USER_WINDOW_BASE >> 22;
+    if (pd[pd_i] & PAGE_PRESENT) {
+        uint32_t *table = (uint32_t *)(pd[pd_i] & ~0xFFF);
+        for (uint32_t i = 0; i < 1024; ++i) {
+            if (table[i] & PAGE_PRESENT) {
+                pmm_free_frame(table[i] & ~0xFFF);
+            }
+        }
+        pmm_free_frame((phys_addr_t)table);
+    }
+    pmm_free_frame(pd_phys);
+}
+
+void vmm_map_page_in(uint32_t pd_phys, virt_addr_t virt, phys_addr_t phys, uint32_t flags)
+{
+    uint32_t *pd = (uint32_t *)pd_phys;
+    uint32_t pd_i = virt >> 22;
+    uint32_t pt_i = (virt >> 12) & 0x3FF;
+    uint32_t *table;
+    if (!(pd[pd_i] & PAGE_PRESENT)) {
+        phys_addr_t frame = pmm_alloc_frame();
+        table = (uint32_t *)frame;
+        memset(table, 0, PUREUNIX_PAGE_SIZE);
+        pd[pd_i] = frame | PAGE_PRESENT | PAGE_WRITE | (flags & PAGE_USER);
+    } else {
+        table = (uint32_t *)(pd[pd_i] & ~0xFFF);
+        pd[pd_i] |= (flags & PAGE_USER);
+    }
+    table[pt_i] = (phys & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
+
+    /* Only flush if pd_phys is the directory currently loaded in CR3 — a
+     * directory being built for a not-yet-scheduled process shouldn't pay
+     * for (or rely on) a TLB flush of the currently active address space. */
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    if (cr3 == pd_phys) {
+        __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+    }
+}
+
+bool vmm_fork_address_space(uint32_t dst_pd_phys, uint32_t src_pd_phys)
+{
+    uint32_t pd_i = USER_WINDOW_BASE >> 22;
+    uint32_t *src_pd = (uint32_t *)src_pd_phys;
+    if (!(src_pd[pd_i] & PAGE_PRESENT)) {
+        return true;
+    }
+    uint32_t *src_table = (uint32_t *)(src_pd[pd_i] & ~0xFFF);
+    for (uint32_t i = 0; i < 1024; ++i) {
+        if (!(src_table[i] & PAGE_PRESENT)) {
+            continue;
+        }
+        phys_addr_t src_frame = src_table[i] & ~0xFFF;
+        phys_addr_t dst_frame = pmm_alloc_frame();
+        if (!dst_frame) {
+            return false;
+        }
+        /* Both frames are always identity-accessible here regardless of
+         * which directory is currently loaded in CR3, since every physical
+         * frame pmm_alloc_frame() hands out is < 128 MiB and thus covered
+         * by the shared kernel PDEs present in every directory. */
+        memcpy((void *)dst_frame, (void *)src_frame, PUREUNIX_PAGE_SIZE);
+        virt_addr_t virt = (pd_i << 22) | (i << 12);
+        vmm_map_page_in(dst_pd_phys, virt, dst_frame, (src_table[i] & 0xFFF) | PAGE_PRESENT);
+    }
+    return true;
+}
+
+void vmm_switch_directory(uint32_t pd_phys)
+{
+    load_page_directory((uint32_t *)pd_phys);
+}
+
+void vmm_switch_directory_kernel(void)
+{
+    load_page_directory(page_directory);
+}
+
+uint32_t vmm_kernel_directory_phys(void)
+{
+    return (uint32_t)page_directory;
 }

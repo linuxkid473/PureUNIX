@@ -17,6 +17,15 @@ typedef struct task {
     uint8_t        *stack_base;   // base of the allocated stack buffer
     void          (*entry)(void *); // entry function
     void           *arg;          // argument passed to entry
+    bool            is_user;      // started via task_create_user()/task_fork()
+    uint32_t        user_entry;
+    uint32_t        user_stack;
+    uint32_t        pd_phys;      // this task's page directory (CR3 value) —
+                                   // see docs/memory.md's per-process VMM section
+    struct task    *parent;       // creator, used by task_waitpid()
+    bool            is_fork_child;   // resume via enter_usermode_regs(), not enter_usermode()
+    interrupt_regs_t fork_regs;      // snapshot of the parent's int $0x80 trap frame
+    int             exit_code;
     struct task    *next;         // next task in circular linked list
 } task_t;
 ```
@@ -33,7 +42,7 @@ typedef enum task_state {
 ```
 
 `TASK_SLEEPING` is defined in the enum but no code path sets a task to this state.  
-`TASK_ZOMBIE` tasks are never reaped; their `task_t` structure and stack remain allocated indefinitely.
+`TASK_ZOMBIE` tasks are reaped by whichever call actually claims them — `task_join()` (used internally by `elf_exec()`) or `task_waitpid()` (the `SYS_WAIT` syscall) — which frees the stack, the private page directory (if any), and the `task_t` itself. A zombie nobody ever joins/waits for (e.g. one killed via `task_kill()`) is still never reaped — that part of the limitation stands.
 
 ---
 
@@ -50,12 +59,13 @@ void tasking_init(void) {
     strcpy(main_task.name, "kernel");
     main_task.state = TASK_RUNNING;
     main_task.next  = &main_task;      // circular list, one element
+    main_task.pd_phys = vmm_kernel_directory_phys();
     current         = &main_task;
     task_list_head  = &main_task;
 }
 ```
 
-`main_task` is a static variable; it does not need a separately allocated stack because it continues using the boot stack already in place.
+`main_task` is a static variable; it does not need a separately allocated stack because it continues using the boot stack already in place. Its `pd_phys` is the kernel's own page directory — every kernel-mode task (`task_create()`) inherits its creator's `pd_phys`, so only tasks started via `task_create_user()`/`task_fork()` ever run with a different (private) one.
 
 ---
 
@@ -94,14 +104,25 @@ This matches the layout that `context_switch` expects (see below).
 
 ```c
 static void task_bootstrap(void) {
-    if (current && current->entry) {
-        current->entry(current->arg);
+    if (current) {
+        if (current->is_fork_child) {
+            enter_usermode_regs(&current->fork_regs);
+        } else if (current->is_user) {
+            enter_usermode(current->user_entry, current->user_stack);
+        } else if (current->entry) {
+            current->entry(current->arg);
+        }
     }
-    task_exit();
+    task_exit(0);
 }
 ```
 
-When a newly created task runs for the first time, `context_switch` "returns" to `task_bootstrap`, which calls the task's entry function. When the entry function returns, `task_bootstrap` calls `task_exit()`.
+When a newly created task runs for the first time, `context_switch` "returns" to `task_bootstrap`. Three cases:
+- **`is_fork_child`** (produced by `task_fork()`): `enter_usermode_regs()` restores the full register/segment/iret frame captured from the parent's `int $0x80` trap (with `eax` already zeroed by `task_fork()`) and drops to ring 3 exactly where the parent's `fork()` call was made — this is how `fork()` "returns twice".
+- **`is_user`** (produced by `task_create_user()`, e.g. by `elf_exec()`): `enter_usermode()` drops to ring 3 at `user_entry` on `user_stack`, a fresh process with no inherited register state.
+- Otherwise (produced by `task_create()`): calls the kernel-mode `entry(arg)` function pointer directly.
+
+Whichever path is taken, when it returns `task_bootstrap` calls `task_exit(0)`.
 
 ---
 
@@ -144,7 +165,8 @@ void context_switch(uint32_t **old_sp, uint32_t *new_sp);
 3. Sets the previous task from `TASK_RUNNING` to `TASK_READY`.
 4. Sets the next task to `TASK_RUNNING`.
 5. Updates `current`.
-6. Calls `context_switch`.
+6. If `next->pd_phys != prev->pd_phys`, calls `vmm_switch_directory(next->pd_phys)` — this is what makes address spaces actually change when switching to/from a user-mode process; skipped when both tasks share a directory (e.g. switching between two kernel tasks) to avoid a needless CR3 reload/TLB flush.
+7. Calls `context_switch`.
 
 `next_ready_task()` performs a linear scan of the circular list starting from `current->next`, returning the first task in `TASK_READY` or `TASK_RUNNING` state, or `current` if none is found.
 
@@ -168,6 +190,25 @@ Sets the current task to ZOMBIE and yields. If `task_yield` ever returns (it sho
 
 ---
 
+## Forking
+
+`task_fork(parent_regs)` (called by the `SYS_FORK` handler with the caller's own `int $0x80` trap frame) duplicates the calling task, which must already be a ring-3 (`is_user`) task:
+
+1. `task_alloc()` a new `task_t` + kernel stack, same as any other task.
+2. `vmm_create_user_directory()` + `vmm_fork_address_space()` give the child a private, deep copy of the parent's user window (see `docs/memory.md`) — parent and child are independent from this point on.
+3. `is_fork_child = true` and `fork_regs = *parent_regs` with `fork_regs.eax` cleared to 0, so the child "returns" 0 from `fork()` the first time it's scheduled (see Task Bootstrap above); the parent gets the child's id back from the normal syscall return path.
+4. Every fd the parent has open is deep-copied (not shared) — this kernel has no shared-file-description concept, so seeking/closing one process's copy never affects the other's.
+
+Returns the new `task_t *`, or `NULL` on failure (not a ring-3 caller, or allocation/address-space-copy failure).
+
+---
+
+## Waiting
+
+`task_waitpid(pid, status)` (the `SYS_WAIT` handler): `pid == -1` waits for any child of the caller; `pid > 0` waits for that specific child (verified via `parent == current`, not just a matching id). Scans the circular list; if a matching child is already a zombie, reaps it immediately (same cleanup as `task_join()` — stack, private directory, `task_t`) and returns its id with `*status` set to its exit code. If a matching child exists but isn't a zombie yet, calls `task_yield()` and rescans. If the caller has no matching child at all, returns `-1` immediately rather than yielding forever.
+
+---
+
 ## Killing Tasks
 
 `task_kill(id)` walks the circular list and sets the target task's state to `TASK_ZOMBIE`. It refuses to kill `main_task` (the initial kernel task). Returns `0` on success, `-1` if the task is not found.
@@ -188,7 +229,8 @@ Walks the entire circular list and calls `cb` for each task. Used by the `ps` sh
 
 - **No preemption**: the PIT IRQ0 handler only increments a tick counter. It does not call `task_yield`. A task that does not call `task_yield` or block on I/O will monopolize the CPU indefinitely.
 - **TASK_SLEEPING unused**: the state is defined but no mechanism puts a task to sleep or wakes it up.
-- **No zombie reaping**: memory for exited tasks leaks permanently.
-- **`SYS_EXIT` does not terminate**: the syscall returns the EBX value to the caller but does not call `task_exit`. ELF programs that return from `main` will return through `crt0.S` (`ret` in `_start`), which returns from the `elf_exec` call rather than running `task_exit`.
+- **Zombie reaping requires a waiter**: `task_join()`/`task_waitpid()` reap a zombie when something actually claims it; a zombie nobody joins/waits for (e.g. `task_kill()`'s target) is never reaped.
+- **`SYS_EXIT` does not terminate**: the syscall returns the EBX value to the caller but does not call `task_exit`. ELF programs that return from `main` will return through `crt0.S` (`ret` in `_start`), which returns from the `elf_exec` call rather than running `task_exit`. `pu_exit()` (userspace) and the `int $0x81` trap it wraps are the real termination path — see `docs/syscalls.md`.
 - **Stack overflow**: there is no guard page below task stacks. Overflow silently corrupts adjacent heap memory.
 - **No priority**: all tasks have equal priority in the round-robin.
+- **fork() deep-copies fds, not shared file descriptions**: unlike POSIX (where a forked fd shares its file offset with the parent's), each side gets its own independent copy of the buffered file content and offset.

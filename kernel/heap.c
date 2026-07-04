@@ -22,6 +22,15 @@ static size_t align8(size_t value)
     return (value + 7) & ~((size_t)7);
 }
 
+/* Computable before heap_init() runs (pmm_init() calls this to keep
+ * pmm_alloc_frame() from ever handing out a physical frame that overlaps
+ * the live heap — see the pmm_init() call site). */
+void heap_reserved_range(phys_addr_t *base, uint32_t *size)
+{
+    *base = ALIGN_UP((uint32_t)&__kernel_end, PUREUNIX_PAGE_SIZE);
+    *size = HEAP_SIZE;
+}
+
 void heap_init(void)
 {
     heap_start = (uint8_t *)ALIGN_UP((uint32_t)&__kernel_end, PUREUNIX_PAGE_SIZE);

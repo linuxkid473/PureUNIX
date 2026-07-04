@@ -59,6 +59,9 @@ static int syscall3(int n, int a, int b, int c)
 | 20 | `SYS_RENAME` | old path pointer | new path pointer | — | 0 or negative error |
 | 21 | `SYS_LINK` | old path pointer | new path pointer | — | 0 or negative error |
 | 22 | `SYS_SYMLINK` | target pointer | path pointer | — | 0 or negative error |
+| 23 | `SYS_FORK` | — | — | — | child's pid in the parent, `0` in the child, or `-1` |
+| 24 | `SYS_EXEC` | path pointer | — | — | only returns (negative error) on failure |
+| 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | — | reaped child's pid, or `-1` if no such child |
 
 ---
 
@@ -358,6 +361,34 @@ On EXT2, a target of 60 bytes or less is stored inline in the inode (a "fast sym
 
 ---
 
+## SYS_FORK (23)
+
+Duplicates the calling process, which must be a ring-3 task (kernel-mode callers get `-1`). See `docs/scheduler.md`'s "Forking" section for the full mechanism — in short: a new task with its own private, deep-copied address space (`docs/memory.md`) and deep-copied file descriptors, whose first scheduling resumes it in ring 3 exactly where the parent's `fork()` call was made.
+
+**Returns**: the child's pid (`> 0`) in the parent, `0` in the child, or `-1` on failure (not a ring-3 caller, or out of memory).
+
+---
+
+## SYS_EXEC (24)
+
+Replaces the calling process's own address space with the ELF at `path`, in place — the userspace-visible equivalent of POSIX `execve()`. Builds an entirely new page directory and loads the program into it before touching the caller's state, so a failure (bad path, bad ELF, permission denied, out of memory) leaves the caller completely unaffected and returns normally with a negative error code. On success, the caller's old address space is freed, CR3 is switched, and the very same `int $0x80` return path is redirected (by overwriting the trap frame's `eip`/`useresp`) to start the new program instead of resuming the old one — there is no observable "return" from a successful call.
+
+**Arguments**: `EBX`: pointer to the ELF's path. **Returns**: only ever returns on failure (`-1`, or whatever negative errno the ELF loader produced — see `elf_load_into()` in `kernel/elf.c`).
+
+Fork before exec (the classic `fork()` + `exec()` pattern) to run a new program while the caller keeps running — `elf_exec_current()` (this syscall's implementation) always replaces the *calling* task, never spawns a separate one.
+
+---
+
+## SYS_WAIT (25)
+
+Blocks (cooperatively, via `task_yield()`) until a child of the caller becomes a zombie, then reaps it. See `docs/scheduler.md`'s "Waiting" section.
+
+**Arguments**: `EBX`: pid to wait for (`-1` = any child of the caller), `ECX`: pointer to an `int` to receive the exit code, or NULL to discard it.
+
+**Returns**: the reaped child's pid, or `-1` if the caller has no child matching `pid` (neither running nor already a zombie).
+
+---
+
 ## Error Return
 
 Any unrecognized syscall number returns `(uint32_t)-1`.
@@ -394,9 +425,9 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 ## Unimplemented Syscalls
 
-`fstat`, `mmap`, `munmap`, `brk`, `fork`, `exec`, `wait`, `waitpid`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
+`fstat`, `mmap`, `munmap`, `brk`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
 
-(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above.)
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above.)
 
 `SYS_CHMOD`/`SYS_CHOWN` exist as syscall numbers but currently always return `-EROFS` — see above.
 
@@ -419,6 +450,10 @@ int    pu_chown(const char *path, uid_t uid, gid_t gid);         // SYS_CHOWN
 int    pu_readdir(const char *path, struct dirent *entries,
                    int max_entries);                            // SYS_READDIR
 int    pu_debug_setcred(uid_t uid, gid_t gid);                  // SYS_DEBUG_SETCRED — test-only, see above
+int    pu_fork(void);                                           // SYS_FORK
+int    pu_exec(const char *path);                               // SYS_EXEC
+int    pu_wait(int pid, int *status);                           // SYS_WAIT
+void   pu_exit(int code);           // int $0x81 directly — see docs/scheduler.md's SYS_EXIT note
 void   pu_puts(const char *s);                                  // SYS_WRITE to fd 1
 void   pu_puti(int value);                                      // integer to decimal on fd 1
 size_t pu_strlen(const char *s);                                // no syscall

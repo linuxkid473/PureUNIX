@@ -133,6 +133,17 @@ void pmm_init(uint32_t magic, uint32_t mbi_addr)
     reserve_region((uint32_t)&__kernel_start, (uint32_t)(&__kernel_end - &__kernel_start));
     reserve_region((uint32_t)frame_bitmap, sizeof(frame_bitmap));
 
+    /* The kernel heap lives just past the kernel image but is carved out
+     * directly by heap_init() via linker symbols, never through this
+     * allocator — so without this, pmm_alloc_frame() would think those
+     * frames are free and could hand one out while heap-resident data
+     * (e.g. a kmalloc'd buffer, or the ext2 block cache) is still live in
+     * it, corrupting whichever it overlaps. */
+    phys_addr_t heap_base;
+    uint32_t heap_size;
+    heap_reserved_range(&heap_base, &heap_size);
+    reserve_region(heap_base, heap_size);
+
     printf("PMM: %u KiB total, %u KiB free\n", pmm_total_memory_kb(), pmm_free_memory_kb());
 }
 

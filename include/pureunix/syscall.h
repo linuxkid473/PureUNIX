@@ -32,6 +32,12 @@ enum {
     SYS_RENAME   = 20,
     SYS_LINK     = 21,
     SYS_SYMLINK  = 22,
+
+    /* Per-process address spaces: duplicate (SYS_FORK), replace-in-place
+     * (SYS_EXEC), and reap (SYS_WAIT) a process. See docs/syscalls.md. */
+    SYS_FORK     = 23,
+    SYS_EXEC     = 24,
+    SYS_WAIT     = 25,
 };
 
 #endif

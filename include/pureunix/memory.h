@@ -14,6 +14,10 @@ void vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size);
 void vmm_map_page(virt_addr_t virt, phys_addr_t phys, uint32_t flags);
 phys_addr_t vmm_get_mapping(virt_addr_t virt);
 
+/* Physical range heap_init() will carve out, computable before it runs —
+ * used by pmm_init() to keep the frame allocator from ever handing out a
+ * frame that overlaps the live heap. */
+void heap_reserved_range(phys_addr_t *base, uint32_t *size);
 void heap_init(void);
 void *kmalloc(size_t size);
 void *kcalloc(size_t count, size_t size);

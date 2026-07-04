@@ -30,6 +30,7 @@ The bitmap starts fully set (all frames reserved). The PMM then walks the Multib
 - Low memory (0x000000–0x0FFFFF, 1 MiB) — IVT, BDA, BIOS
 - The kernel image (`__kernel_start` to `__kernel_end`)
 - The bitmap itself
+- The kernel heap's 8 MiB range (via `heap_reserved_range()`, computed the same way `heap_init()` derives it — see Kernel Heap below): the heap is carved out directly by linker symbols, never through this allocator, so without this reservation `pmm_alloc_frame()` would consider heap-resident memory free and could hand out a frame that a live `kmalloc()`'d buffer (or the ext2 block cache) is still using
 
 ### Multiboot Support
 
@@ -67,16 +68,16 @@ uint32_t    pmm_free_memory_kb(void);
 
 ### Design
 
-The VMM creates a single page directory covering the entire 4 GiB virtual address space. It identity-maps the first 128 MiB (virtual address == physical address) by pre-populating 32 page tables.
+The VMM maintains one *kernel* page directory (`page_directory`, a static 4 KiB-aligned array) that identity-maps the first 128 MiB (virtual address == physical address) by pre-populating 32 page tables, plus one *private* page directory per user-mode process.
 
 ```
-page_directory[1024]           static, 4 KiB aligned
+page_directory[1024]           static, 4 KiB aligned — the kernel directory
 identity_tables[32][1024]      static, each 4 KiB aligned
 ```
 
-Each `identity_tables[t][i]` entry maps virtual address `(t*1024 + i) * 4096` to the same physical address, with flags `PAGE_PRESENT | PAGE_WRITE`.
+Each `identity_tables[t][i]` entry maps virtual address `(t*1024 + i) * 4096` to the same physical address, with flags `PAGE_PRESENT | PAGE_WRITE`. After populating the tables, `vmm_init` loads `page_directory` into `CR3` and sets `CR0.PG = 1`.
 
-After populating the tables, `vmm_init` loads `page_directory` into `CR3` and sets `CR0.PG = 1`.
+**Per-process address spaces**: `vmm_create_user_directory()` allocates a fresh physical frame and `memcpy`s the entire kernel `page_directory` into it — every PDE below `USER_WINDOW_BASE`'s index (32) is copied *by reference*, so every process's directory points at the exact same kernel page tables (kernel image, heap, framebuffer, etc. are identical and simultaneously valid in every address space). Only PDE 32 — the fixed user code/data/stack window — differs per process, populated lazily by `vmm_map_page_in()`. Because `pmm_alloc_frame()` never hands out a frame inside the heap or kernel image (see PMM above), and the user window's virtual range (0x08000000+) is entirely outside the 128 MiB identity map, any physical frame the allocator returns is always identity-accessible via `(void *)frame` regardless of which directory is currently loaded in CR3 — this is what lets `vmm_fork_address_space()` and the ELF loader fill in a not-yet-active directory's pages by writing straight to the frame's physical address.
 
 ### Flags
 
@@ -86,22 +87,43 @@ After populating the tables, `vmm_init` loads `page_directory` into `CR3` and se
 #define PAGE_USER    0x004
 ```
 
+### Address space layout
+
+```
+0x00000000 – 0x07FFFFFF  kernel space: identity mapped, shared by every process
+                          (pd[0..31] alias the same page tables in every directory)
+0x08000000 – 0x082FFFFF  per-process user window (pd[32], private per process)
+                            0x08000000 – (stack)   code / data / bss
+                            USER_WINDOW_END-64KiB   fixed-size stack, growing down
+0x08300000 – 0xFFFFFFFF  unmapped
+```
+
 ### API
 
 ```c
-void        vmm_init(void);
-void        vmm_map_page(virt_addr_t virt, phys_addr_t phys, uint32_t flags);
-phys_addr_t vmm_get_mapping(virt_addr_t virt);  // returns 0 if not mapped
+void        vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size);
+void        vmm_map_page(virt_addr_t virt, phys_addr_t phys, uint32_t flags);          // kernel directory only
+phys_addr_t vmm_get_mapping(virt_addr_t virt);                                          // kernel directory only
+
+uint32_t    vmm_create_user_directory(void);     // returns a new directory's phys addr, or 0 on OOM
+void        vmm_free_user_directory(uint32_t pd_phys);
+void        vmm_map_page_in(uint32_t pd_phys, virt_addr_t virt, phys_addr_t phys, uint32_t flags);
+bool        vmm_fork_address_space(uint32_t dst_pd_phys, uint32_t src_pd_phys);          // deep-copies the user window
+
+void        vmm_switch_directory(uint32_t pd_phys);   // loads CR3
+void        vmm_switch_directory_kernel(void);
+uint32_t    vmm_kernel_directory_phys(void);
 ```
 
-`vmm_map_page` looks up the page directory entry for `virt >> 22`. If no page table is present, it allocates one via `pmm_alloc_frame`, initializes it to zero, and installs it. It then sets the page table entry and executes `invlpg` to flush the TLB for that address.
+`vmm_map_page`/`vmm_map_page_in` look up the page directory entry for `virt >> 22`. If no page table is present, one is allocated via `pmm_alloc_frame`, zeroed, and installed. The page table entry is then set; `invlpg` only runs when the target directory is the one currently active in CR3 (a directory being built for a not-yet-scheduled process gets no TLB flush).
+
+`task_yield()` (`kernel/task.c`) calls `vmm_switch_directory()` whenever the next task's `pd_phys` differs from the current one, so CR3 always reflects whichever task is running.
 
 ### Limitations
 
-- No `vmm_unmap_page`: pages can be mapped but not unmapped.
-- No page fault handler: accessing an unmapped page causes an unhandled exception (kernel panic).
-- All kernel and user code runs in the same page directory. There is no per-process address space.
-- The 32 static page tables and the page directory are fixed in the kernel `.bss` segment: they consume 32 × 4 KiB + 4 KiB = 132 KiB of kernel memory.
+- No `vmm_unmap_page`: pages can be mapped but not unmapped (a process's entire user window is freed at once, by `vmm_free_user_directory()`, not page by page).
+- No page fault handler: accessing an unmapped page causes an unhandled exception (kernel panic) — `fork()`/`exec()` always eagerly map every page up front, so this is only reachable via a genuine bug (e.g. a wild pointer) in a user program.
+- The 32 static kernel page tables and the kernel page directory are fixed in the kernel `.bss` segment: they consume 32 × 4 KiB + 4 KiB = 132 KiB of kernel memory. Each additional process directory costs one more page-directory frame plus, once it has any mappings, one page-table frame for PDE 32.
 
 ---
 
@@ -176,7 +198,7 @@ Both functions walk the entire list. They are called by the `free` shell builtin
 ## Memory Diagram
 
 ```
-Physical Address Space (identity mapped)
+Physical Address Space (identity mapped in every process's directory)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 0x0000_0000
     │  1 MiB low memory (PMM reserved)
@@ -188,15 +210,19 @@ Physical Address Space (identity mapped)
     │  [ALIGN_UP to 4 KiB]
     │
     │  Kernel heap
-    │  8 MiB linked-list allocator
-    │  (kmalloc/kfree)
+    │  8 MiB linked-list allocator (kmalloc/kfree)
+    │  reserved in the PMM bitmap — pmm_alloc_frame() never hands this out
     │
 0x000B_8000  VGA framebuffer  (within mapped region)
     │
-0x0040_0000  User ELF load start (validated in elf_exec)
-0x0070_0000  User ELF load end
-    │
-0x0800_0000  End of identity-mapped region (128 MiB)
+0x0800_0000  End of the 128 MiB identity map / PMM-managed range
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-0x0800_0000 – 0xFFFF_FFFF  Unmapped (accessing causes page fault / kernel panic)
+
+Virtual Address Space (per-process beyond this point)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+0x0800_0000  User ELF load start (USER_WINDOW_BASE, pd[32], private per process)
+0x0830_0000  User window end (USER_WINDOW_END) — last 64 KiB is the stack
+0x0830_0000 – 0xFFFF_FFFF  Unmapped (accessing causes page fault / kernel panic)
 ```
+
+Note the user window's *virtual* addresses (0x08000000+) are private per process, but the *physical* frames backing them are ordinary frames from the same 128 MiB PMM pool as everything else — there is no dedicated physical range for user pages, unlike the pre-per-process design where user code shared physical memory with the kernel's identity map 1:1.

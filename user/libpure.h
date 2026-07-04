@@ -27,6 +27,9 @@
 #define SYS_RENAME   20
 #define SYS_LINK     21
 #define SYS_SYMLINK  22
+#define SYS_FORK     23
+#define SYS_EXEC     24
+#define SYS_WAIT     25
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -169,6 +172,30 @@ int    pu_link(const char *old_path, const char *new_path);
 int    pu_symlink(const char *target, const char *path);
 /* Equivalent to open(path, O_WRONLY|O_CREAT|O_TRUNC) — POSIX creat(). */
 int    pu_creat(const char *path);
+
+/* -------------------------------------------------------------------- */
+/* Per-process address spaces: fork / exec / wait                        */
+/* -------------------------------------------------------------------- */
+
+/* Duplicates the calling process: returns the child's pid (> 0) in the
+ * parent, 0 in the child, or a negative value on failure. Parent and
+ * child have independent copies of memory from this point on. */
+int    pu_fork(void);
+/* Replaces the calling process's own memory image with the program at
+ * path, in place. Only returns (with a negative error code) on failure —
+ * on success control never comes back here. */
+int    pu_exec(const char *path);
+/* Blocks until the child identified by pid (or, if pid == -1, any child)
+ * exits, then reaps it. Returns the reaped child's pid, or a negative
+ * value if the caller has no such child. If status is non-NULL, the
+ * child's exit code is written there. */
+int    pu_wait(int pid, int *status);
+/* Immediately terminates the calling process with the given exit code —
+ * unlike SYS_EXIT (see pu_syscall_raw's doc comment), this does not
+ * return. Equivalent to what crt0.S does after main() returns, but
+ * callable mid-program (e.g. by a fork()ed child that must not fall
+ * through to the parent's remaining code). */
+void   pu_exit(int code) __attribute__((noreturn));
 void   pu_puts(const char *s);
 void   pu_puti(int value);
 size_t pu_strlen(const char *s);

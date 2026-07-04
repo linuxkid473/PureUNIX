@@ -27,6 +27,11 @@ void tss_set_kernel_stack(uint32_t esp0);
  * must already be present + PAGE_USER mapped). Never returns. */
 void enter_usermode(uint32_t entry, uint32_t user_stack) __attribute__((noreturn));
 
+/* Restores every field of *regs (same layout isr_common_stub pushes on
+ * entry) and irets into ring 3 at regs->eip. Used to resume a fork()ed
+ * child exactly where its parent's int $0x80 was taken. Never returns. */
+void enter_usermode_regs(const interrupt_regs_t *regs) __attribute__((noreturn));
+
 void pic_init(void);
 void pic_send_eoi(uint8_t irq);
 void irq_enable(uint8_t irq);

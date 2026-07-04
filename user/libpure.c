@@ -126,6 +126,28 @@ int pu_creat(const char *path)
     return pu_open(path, O_WRONLY | O_CREAT | O_TRUNC);
 }
 
+int pu_fork(void)
+{
+    return syscall3(SYS_FORK, 0, 0, 0);
+}
+
+int pu_exec(const char *path)
+{
+    return syscall3(SYS_EXEC, (int)path, 0, 0);
+}
+
+int pu_wait(int pid, int *status)
+{
+    return syscall3(SYS_WAIT, pid, (int)status, 0);
+}
+
+void pu_exit(int code)
+{
+    __asm__ volatile("int $0x81" : : "b"(code) : "memory");
+    for (;;) {
+    }
+}
+
 size_t pu_strlen(const char *s)
 {
     size_t len = 0;

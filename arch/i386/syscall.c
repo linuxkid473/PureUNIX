@@ -1,5 +1,6 @@
 #include <pureunix/arch.h>
 #include <pureunix/dirent.h>
+#include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
 #include <pureunix/keyboard.h>
@@ -505,6 +506,30 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)drc;
         }
         return (uint32_t)ctx.count;
+    }
+    case SYS_FORK: {
+        task_t *child = task_fork(regs);
+        return child ? child->id : (uint32_t)-1;
+    }
+    case SYS_EXEC: {
+        const char *path = (const char *)regs->ebx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)elf_exec_current(regs, path);
+    }
+    case SYS_WAIT: {
+        int pid = (int)regs->ebx;
+        int *status = (int *)regs->ecx;
+        int st = 0;
+        int rc = task_waitpid(pid, &st);
+        if (rc >= 0 && status) {
+            *status = st;
+        }
+        return (uint32_t)rc;
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

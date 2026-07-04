@@ -11,13 +11,11 @@
 #define EM_386 3
 #define PT_LOAD 1
 
-/* Fixed ring3 sandbox window: code+data+bss go in the low part, a 64 KiB
- * stack (growing down from the top) takes the rest. Kept inside the same
- * [0x400000, 0x700000) range this loader has always used, so no new
- * physical memory needs to be carved out for it. */
-#define USER_WINDOW_BASE  0x400000U
-#define USER_WINDOW_END   0x700000U
-#define USER_STACK_SIZE   0x10000U
+/* Ring3 sandbox window: code+data+bss go in the low part, a fixed-size
+ * stack (growing down from the top) takes the rest. USER_WINDOW_BASE/END/
+ * USER_STACK_SIZE are defined in vmm.h — every process gets its own
+ * private mapping of this same virtual range (see vmm_create_user_
+ * directory()/vmm_map_page_in()). */
 #define ELF_CODE_LIMIT   (USER_WINDOW_END - USER_STACK_SIZE)
 
 typedef struct elf32_ehdr {
@@ -59,7 +57,15 @@ bool elf_is_valid(const uint8_t *image, size_t size)
            eh->e_ident[4] == 1 && eh->e_type == ET_EXEC && eh->e_machine == EM_386;
 }
 
-int elf_exec(const char *path)
+/* Reads, validates, and loads path's PT_LOAD segments plus a fresh stack
+ * into pd_phys (a page directory not necessarily currently active in CR3;
+ * every write here goes through a freshly allocated frame's identity
+ * mapping, never through pd_phys's own mapping — see vmm_map_page_in()).
+ * On success, writes the entry point to *out_entry and returns 0; on
+ * failure, returns a negative value and leaves pd_phys untouched by the
+ * caller's perspective (any pages already mapped into it are the caller's
+ * responsibility to free via vmm_free_user_directory()). */
+static int elf_load_into(const char *path, uint32_t pd_phys, uint32_t *out_entry)
 {
     /* Executing requires X_OK on the file itself — distinct from, and
      * checked in addition to, the R_OK that vfs_read_file() below enforces
@@ -101,26 +107,110 @@ int elf_exec(const char *path)
             kfree(image);
             return -1;
         }
-        memcpy((void *)ph->p_vaddr, image + ph->p_offset, ph->p_filesz);
-        if (ph->p_memsz > ph->p_filesz) {
-            memset((void *)(ph->p_vaddr + ph->p_filesz), 0, ph->p_memsz - ph->p_filesz);
+
+        uint32_t seg_start = ALIGN_DOWN(ph->p_vaddr, PUREUNIX_PAGE_SIZE);
+        uint32_t seg_end = ALIGN_UP(ph->p_vaddr + ph->p_memsz, PUREUNIX_PAGE_SIZE);
+        for (uint32_t va = seg_start; va < seg_end; va += PUREUNIX_PAGE_SIZE) {
+            phys_addr_t frame = pmm_alloc_frame();
+            if (!frame) {
+                printf("%s: out of memory\n", path);
+                kfree(image);
+                return -1;
+            }
+            memset((void *)frame, 0, PUREUNIX_PAGE_SIZE);
+
+            /* Copy whatever slice of the segment's file-backed bytes
+             * [p_vaddr, p_vaddr+p_filesz) falls within this page; anything
+             * beyond p_filesz (bss) stays zeroed. */
+            uint32_t file_start = ph->p_vaddr;
+            uint32_t file_end = ph->p_vaddr + ph->p_filesz;
+            uint32_t page_end = va + PUREUNIX_PAGE_SIZE;
+            uint32_t copy_start = va > file_start ? va : file_start;
+            uint32_t copy_end = page_end < file_end ? page_end : file_end;
+            if (copy_start < copy_end) {
+                memcpy((uint8_t *)frame + (copy_start - va),
+                       image + ph->p_offset + (copy_start - file_start),
+                       copy_end - copy_start);
+            }
+
+            vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
         }
     }
 
     uint32_t entry = eh->e_entry;
     kfree(image);
 
-    /* Widen the sandbox window to user-accessible. The PDE covering this
-     * range already exists (part of the boot-time identity map); only its
-     * PAGE_USER bit and each page's own PAGE_USER bit are missing. */
-    for (uint32_t addr = USER_WINDOW_BASE; addr < USER_WINDOW_END; addr += PUREUNIX_PAGE_SIZE) {
-        vmm_map_page(addr, addr, PAGE_USER | PAGE_WRITE);
+    for (uint32_t va = USER_WINDOW_END - USER_STACK_SIZE; va < USER_WINDOW_END;
+         va += PUREUNIX_PAGE_SIZE) {
+        phys_addr_t frame = pmm_alloc_frame();
+        if (!frame) {
+            printf("%s: out of memory\n", path);
+            return -1;
+        }
+        memset((void *)frame, 0, PUREUNIX_PAGE_SIZE);
+        vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
     }
 
-    task_t *child = task_create_user("user", entry, USER_WINDOW_END);
+    *out_entry = entry;
+    return 0;
+}
+
+int elf_exec(const char *path)
+{
+    uint32_t pd_phys = vmm_create_user_directory();
+    if (!pd_phys) {
+        printf("%s: out of memory\n", path);
+        return -1;
+    }
+
+    uint32_t entry;
+    int rc = elf_load_into(path, pd_phys, &entry);
+    if (rc != 0) {
+        vmm_free_user_directory(pd_phys);
+        return rc;
+    }
+
+    task_t *child = task_create_user("user", entry, USER_WINDOW_END, pd_phys);
     if (!child) {
+        vmm_free_user_directory(pd_phys);
         printf("%s: failed to create process\n", path);
         return -1;
     }
     return task_join(child);
+}
+
+int elf_exec_current(interrupt_regs_t *regs, const char *path)
+{
+    task_t *t = task_current();
+    if (!t || !t->is_user) {
+        return -1;
+    }
+
+    uint32_t new_pd = vmm_create_user_directory();
+    if (!new_pd) {
+        return -1;
+    }
+
+    uint32_t entry;
+    int rc = elf_load_into(path, new_pd, &entry);
+    if (rc != 0) {
+        vmm_free_user_directory(new_pd);
+        return rc;
+    }
+
+    uint32_t old_pd = t->pd_phys;
+    t->pd_phys = new_pd;
+    t->user_entry = entry;
+    t->user_stack = USER_WINDOW_END;
+    vmm_switch_directory(new_pd);
+    if (old_pd != vmm_kernel_directory_phys()) {
+        vmm_free_user_directory(old_pd);
+    }
+
+    /* The generic int $0x80 return path (isr_common_stub) will iret using
+     * these fields — redirect it into the freshly loaded program instead
+     * of resuming the one just replaced. */
+    regs->eip = entry;
+    regs->useresp = USER_WINDOW_END;
+    return 0;
 }

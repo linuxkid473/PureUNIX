@@ -13,18 +13,14 @@
  *     by PASS, or FAIL with the expected/actual values.
  *   - A final summary reports the totals.
  *
- * Two things this suite cannot exercise from userspace, by construction of
+ * fork()/exec()/wait() (see "Process creation") give every child its own
+ * private address space (a separate page directory — see
+ * vmm_create_user_directory() / vmm_fork_address_space() in kernel/vmm.c),
+ * so a forked child can freely run and mutate its own memory without any
+ * risk of corrupting this test program's own state.
+ *
+ * One thing this suite cannot exercise from userspace, by construction of
  * this kernel, and does not attempt to:
- *   - Actually invoking exec() on another program: elf_exec() is a kernel
- *     function called directly by the shell, never reachable through a
- *     syscall, so a user program has no way to launch another one. What
- *     *can* be tested from here is everything exec() itself checks before
- *     jumping to an entry point (existence via stat, the X_OK permission
- *     bit via access) — see the "ELF execution preconditions" section.
- *     Every run of this program to completion (arriving at the summary) is
- *     itself a live proof that valid-ELF exec and the return path back to
- *     the shell both work, since that is exactly how this program got here
- *     and how it will end.
  *   - Rebooting: reboot is a shell builtin that calls an arch-level
  *     function directly; it has no syscall number, so there is nothing for
  *     a user program to invoke. Even if there were, calling it here would
@@ -149,6 +145,64 @@ static void test_process_basics(void)
 
     /* Any unrecognized syscall number returns (uint32_t)-1. */
     check_eq("unrecognized syscall number returns -1", -1, pu_syscall_raw(9999, 0, 0, 0));
+}
+
+/* ==================================================================== */
+
+/* Mutated only by the forked child in test_fork_exec_wait(); if fork()
+ * actually gives the child its own address space, the parent must never
+ * observe the child's write to this. */
+static int g_fork_probe = 111;
+
+static void test_fork_exec_wait(void)
+{
+    section("Process creation: SYS_FORK, SYS_EXEC, SYS_WAIT");
+
+    int parent_pid = pu_getpid();
+
+    int pid = pu_fork();
+    check_true("fork() returns a value >= 0", pid >= 0);
+
+    if (pid == 0) {
+        /* Child: prove address-space isolation, then terminate — must not
+         * fall through and re-run the rest of this program's tests. */
+        g_fork_probe = 222;
+        pu_exit(7);
+    }
+
+    check_true("fork() returns a child pid distinct from the parent's", pid != parent_pid);
+    check_eq("the parent's own pid is unchanged after fork()", parent_pid, pu_getpid());
+
+    int status = -1;
+    int reaped = pu_wait(pid, &status);
+    check_eq("wait(pid) reaps the forked child", pid, reaped);
+    check_eq("wait(pid) reports the child's exit code", 7, status);
+    check_eq("the parent's memory is unaffected by the child's write (separate address spaces)",
+             111, g_fork_probe);
+
+    check_true("wait() on a nonexistent child returns an error", pu_wait(999999, 0) < 0);
+
+    /* exec(): fork a child, have it replace itself with /bin/hello.elf,
+     * and confirm the parent observes *that* program's exit status (0),
+     * not whatever the child would have used had exec() silently failed
+     * and fallen through to pu_exit(123) below. */
+    int pid2 = pu_fork();
+    check_true("fork() (for exec test) returns a value >= 0", pid2 >= 0);
+
+    if (pid2 == 0) {
+        pu_exec("/bin/hello.elf");
+        /* exec() only returns on failure. */
+        pu_exit(123);
+    }
+
+    int status2 = -1;
+    int reaped2 = pu_wait(pid2, &status2);
+    check_eq("wait() reaps the exec()'d child", pid2, reaped2);
+    check_eq("the exec()'d child exits with hello.elf's own status, not the fallback", 0, status2);
+
+    int rc = pu_exec("/bin/no_such_program.elf");
+    check_true("exec() on a missing path fails and returns to the caller", rc < 0);
+    check_true("execution continues normally after a failed exec()", 1);
 }
 
 /* ==================================================================== */
@@ -1037,7 +1091,7 @@ static void test_fat16(void)
 
 static void test_elf_exec_preconditions(void)
 {
-    section("ELF execution preconditions (see file header for what's out of scope)");
+    section("ELF execution preconditions (real fork()/exec()/wait() are covered above)");
 
     struct stat st;
     int r = pu_stat("/bin/hello.elf", &st);
@@ -1062,6 +1116,7 @@ int main(void)
     pu_puts("=== PureUNIX System Test ===\n");
 
     test_process_basics();
+    test_fork_exec_wait();
     test_write_read_basics();
     test_open_close();
     test_lseek();

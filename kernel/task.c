@@ -3,6 +3,7 @@
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
+#include <pureunix/vmm.h>
 
 #define TASK_STACK_SIZE 16384
 
@@ -14,7 +15,9 @@ static uint32_t next_task_id = 1;
 static void task_bootstrap(void)
 {
     if (current) {
-        if (current->is_user) {
+        if (current->is_fork_child) {
+            enter_usermode_regs(&current->fork_regs);
+        } else if (current->is_user) {
             enter_usermode(current->user_entry, current->user_stack);
         } else if (current->entry) {
             current->entry(current->arg);
@@ -38,6 +41,7 @@ void tasking_init(void)
     strcpy(main_task.name, "kernel");
     main_task.state = TASK_RUNNING;
     main_task.next = &main_task;
+    main_task.pd_phys = vmm_kernel_directory_phys();
     reserve_stdio(&main_task);
     main_task.uid = 0;
     main_task.gid = 0;
@@ -64,6 +68,8 @@ static task_t *task_alloc(const char *name)
      * spawning" rule that exists before a real login/setuid model arrives. */
     task->uid = current ? current->uid : 0;
     task->gid = current ? current->gid : 0;
+    task->parent = current;
+    task->pd_phys = current ? current->pd_phys : vmm_kernel_directory_phys();
 
     uint32_t *sp = (uint32_t *)(task->stack_base + TASK_STACK_SIZE);
     *--sp = (uint32_t)task_bootstrap;
@@ -92,7 +98,7 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg)
     return task;
 }
 
-task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_top)
+task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_top, uint32_t pd_phys)
 {
     task_t *task = task_alloc(name);
     if (!task) {
@@ -101,7 +107,69 @@ task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_t
     task->is_user = true;
     task->user_entry = entry;
     task->user_stack = user_stack_top;
+    task->pd_phys = pd_phys;
     return task;
+}
+
+static void unlink_task(task_t *t)
+{
+    task_t *prev = task_list_head;
+    while (prev->next != t) {
+        prev = prev->next;
+    }
+    prev->next = t->next;
+}
+
+task_t *task_fork(const interrupt_regs_t *parent_regs)
+{
+    if (!current || !current->is_user) {
+        return NULL;
+    }
+
+    task_t *child = task_alloc(current->name);
+    if (!child) {
+        return NULL;
+    }
+
+    uint32_t child_pd = vmm_create_user_directory();
+    if (!child_pd || !vmm_fork_address_space(child_pd, current->pd_phys)) {
+        if (child_pd) {
+            vmm_free_user_directory(child_pd);
+        }
+        unlink_task(child);
+        kfree(child->stack_base);
+        kfree(child);
+        return NULL;
+    }
+
+    child->is_user = true;
+    child->pd_phys = child_pd;
+    child->user_entry = current->user_entry;
+    child->user_stack = current->user_stack;
+    child->is_fork_child = true;
+    child->fork_regs = *parent_regs;
+    child->fork_regs.eax = 0; /* fork() returns 0 in the child */
+
+    /* Deep-copy open file descriptors: a shallow copy would leave parent
+     * and child sharing (and eventually double-freeing) the same kmalloc'd
+     * buffer. */
+    for (int i = 3; i < MAX_OPEN_FILES; ++i) {
+        fd_entry_t *src = &current->fds[i];
+        if (!src->used) {
+            continue;
+        }
+        fd_entry_t *dst = &child->fds[i];
+        *dst = *src;
+        dst->data = NULL;
+        if (src->size) {
+            dst->data = kmalloc(src->size);
+            if (dst->data) {
+                memcpy(dst->data, src->data, src->size);
+            }
+        }
+    }
+
+    return child;
 }
 
 static task_t *next_ready_task(void)
@@ -133,6 +201,9 @@ void task_yield(void)
     if (next->stack_base) {
         tss_set_kernel_stack((uint32_t)(next->stack_base + TASK_STACK_SIZE));
     }
+    if (next->pd_phys != prev->pd_phys) {
+        vmm_switch_directory(next->pd_phys);
+    }
     context_switch(&prev->stack_ptr, next->stack_ptr);
 }
 
@@ -156,15 +227,48 @@ int task_join(task_t *t)
     }
     int code = t->exit_code;
 
-    task_t *prev = task_list_head;
-    while (prev->next != t) {
-        prev = prev->next;
+    unlink_task(t);
+    if (t->pd_phys != vmm_kernel_directory_phys()) {
+        vmm_free_user_directory(t->pd_phys);
     }
-    prev->next = t->next;
-
     kfree(t->stack_base);
     kfree(t);
     return code;
+}
+
+int task_waitpid(int pid, int *status)
+{
+    for (;;) {
+        bool have_child = false;
+        task_t *t = task_list_head;
+        do {
+            if (t->parent == current && (pid == -1 || (int)t->id == pid)) {
+                have_child = true;
+                if (t->state == TASK_ZOMBIE) {
+                    int code = t->exit_code;
+                    uint32_t reaped_id = t->id;
+
+                    unlink_task(t);
+                    if (t->pd_phys != vmm_kernel_directory_phys()) {
+                        vmm_free_user_directory(t->pd_phys);
+                    }
+                    kfree(t->stack_base);
+                    kfree(t);
+
+                    if (status) {
+                        *status = code;
+                    }
+                    return (int)reaped_id;
+                }
+            }
+            t = t->next;
+        } while (t != task_list_head);
+
+        if (!have_child) {
+            return -1;
+        }
+        task_yield();
+    }
 }
 
 task_t *task_current(void)
