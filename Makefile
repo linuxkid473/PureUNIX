@@ -20,6 +20,14 @@ USER_CFLAGS := $(COMMON_CFLAGS) -fno-builtin
 LDFLAGS := -T boot/linker.ld -ffreestanding -O2 -nostdlib -Wl,--build-id=none
 USER_LDFLAGS := -T user/linker.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
+# Vendored newlib (see third_party/newlib/README.md and tools/build-newlib.sh)
+# — a real C library for user programs, on top of the raw syscall wrappers
+# in user/libpure.c/user/newlib_syscalls.c. Only programs in NEWLIB_PROGRAMS
+# link against it; everything else keeps using bare libpure.
+NEWLIB_DIR := third_party/newlib/i686-elf
+NEWLIB_CFLAGS := -isystem $(NEWLIB_DIR)/include
+NEWLIB_LDFLAGS := $(USER_LDFLAGS) -L$(NEWLIB_DIR)/lib
+
 KERNEL_C_SRCS := $(shell find kernel arch drivers fs libc shell editor -name '*.c' | sort)
 KERNEL_AS_SRCS := $(shell find boot arch -name '*.S' | sort)
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
@@ -29,9 +37,12 @@ DEPS := $(KERNEL_OBJS:.o=.d)
 USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test systest termiostest
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
+NEWLIB_PROGRAMS := libctest
+NEWLIB_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(NEWLIB_PROGRAMS)))
+
 .PHONY: all run iso clean disk docs
 
-all: $(KERNEL) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -52,6 +63,32 @@ $(BUILD)/user/libpure.o: user/libpure.c user/libpure.h
 $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/crt0.o $(BUILD)/user/libpure.o user/linker.ld
 	$(LD) $(USER_LDFLAGS) $(BUILD)/user/crt0.o $(BUILD)/user/libpure.o $< -lgcc -o $@
 
+# Newlib-linked programs (see NEWLIB_PROGRAMS above): newlib_crt0.o calls
+# exit(main()) instead of trapping straight to int $0x81, and
+# newlib_syscalls.o supplies the POSIX syscall names newlib itself doesn't
+# provide for this target — see user/newlib_syscalls.c's header comment.
+# Static pattern rules (restricted to NEWLIB_PROG_OBJS/NEWLIB_ELFS) rather
+# than plain %-rules, so they don't clash with the libpure %.o/%.elf rules
+# above for every other user program.
+$(BUILD)/user/newlib_crt0.o: user/newlib_crt0.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/newlib_syscalls.o: user/newlib_syscalls.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+NEWLIB_PROG_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(NEWLIB_PROGRAMS)))
+
+$(NEWLIB_PROG_OBJS): $(BUILD)/user/%.o: user/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+$(NEWLIB_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $< \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -MMD -MP -c $< -o $@
@@ -63,11 +100,11 @@ $(BUILD)/%.o: %.S
 DOCS_DIR := docs
 DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 
-$(DISK): $(USER_ELFS) tools/mkfat16.py $(DOCS_MD)
-	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
+$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
+	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
-$(DISK2): $(USER_ELFS) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS)
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
 disk: $(DISK) $(DISK2)
 

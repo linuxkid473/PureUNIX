@@ -11,7 +11,8 @@ PureUNIX supports executing ELF32 binaries loaded from the FAT16 filesystem. Use
 | libpure | `user/libpure.c` | Syscall wrappers and utility functions |
 | User linker script | `user/linker.ld` | Base address 0x400000 |
 | Demo programs | `user/hello.c`, `user/calc.c`, `user/viewer.c`, `user/sh.c`, `user/editor.c` | Stubs and functional examples |
-| Test programs | `user/opentest.c`, `user/readtest.c`, `user/ext2test.c` | Syscall and filesystem tests |
+| Test programs | `user/opentest.c`, `user/readtest.c`, `user/ext2test.c`, `user/systest.c`, `user/termiostest.c` | Syscall and filesystem tests |
+| Vendored libc | `third_party/newlib`, `user/newlib_syscalls.c`, `user/newlib_crt0.c` | Real C library (printf, malloc, libm, stdio, ...) for programs that opt in — see "A real C library (newlib)" below |
 
 ---
 
@@ -167,6 +168,20 @@ SECTIONS {
 ```
 
 All user programs are linked at base address `0x400000`. The ELF loader enforces that segments fall within `[0x400000, 0x700000)`, giving at most 3 MiB of usable virtual address space per program.
+
+---
+
+## A real C library (newlib)
+
+**Source**: `third_party/newlib` (vendored build — see `third_party/newlib/README.md` and `tools/build-newlib.sh`), `user/newlib_syscalls.c`, `user/newlib_crt0.c`
+
+Programs that need more than libpure's small utility set (`printf`, `malloc`, `qsort`, `fopen`/`fread`/`fwrite`, `<math.h>`, `setjmp`/`longjmp`, ...) can link against a real C library instead: [newlib](https://sourceware.org/newlib/), cross-compiled for the bare `i686-elf` target and vendored into the repo so the build stays network-free.
+
+newlib has no built-in support for a `i686-*-elf` OS, so it never provides POSIX-named syscall wrappers (`open`, `read`, `write`, ...) on its own — it only calls them. The vendored build was configured with `-DMISSING_SYSCALL_NAMES`, which makes newlib's internal reentrant layer call those plain POSIX names directly; `user/newlib_syscalls.c` implements exactly those names (`open`, `close`, `read`, `write`, `lseek`, `fstat`, `stat`, `isatty`, `link`, `unlink`, `mkdir`, `getpid`, `fork`, `execve`, `wait`/`waitpid`, `kill`, `_exit`, `sbrk`, plus `environ`) as thin translations to the raw `int $0x80` ABI (deliberately not through `libpure.h`, to avoid its `struct stat`/`mode_t`/etc. colliding with newlib's own). `sbrk()` bumps a pointer through a static 1 MiB array reserved in the program's own `.bss`, since PureUNIX has no `brk`/`mmap` syscall.
+
+`user/newlib_crt0.c` is the entry stub for newlib-linked programs (`exit(main())` rather than crt0.S's raw `int $0x81`), so `exit()` flushes stdio buffers and runs `atexit()` handlers before the process actually ends.
+
+A program opts into this by being listed in the Makefile's `NEWLIB_PROGRAMS` (currently just `libctest`) rather than `USER_PROGRAMS`; it links `newlib_crt0.o` + `newlib_syscalls.o` + `-lc -lm` instead of `crt0.o` + `libpure.o`. See `user/libctest.c` for the regression suite exercising this libc (`printf`/`scanf`, `string.h`, `stdlib.h`'s heap and `qsort`, `ctype.h`, `libm`, `setjmp`/`longjmp`, and file I/O through `fopen`/`fread`/`fwrite` all the way down to the EXT2-backed VFS).
 
 ---
 
