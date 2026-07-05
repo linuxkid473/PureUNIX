@@ -30,6 +30,9 @@ void vga_write_len(const char *str, size_t len);
 void vga_set_color(uint8_t fg, uint8_t bg);
 uint8_t vga_color(void);
 void vga_get_cursor(size_t *row, size_t *col);
+/* The console's fixed text-grid dimensions (80x25) — see SYS_IOCTL's
+ * TIOCGWINSZ in arch/i386/syscall.c. */
+void vga_get_size(size_t *rows, size_t *cols);
 void vga_goto(size_t row, size_t col);
 void vga_erase_eol(void);
 void vga_set_cursor(size_t row, size_t col);

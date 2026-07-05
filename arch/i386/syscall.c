@@ -3,6 +3,7 @@
 #include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
+#include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
 #include <pureunix/stat.h>
 #include <pureunix/stdio.h>
@@ -12,6 +13,7 @@
 #include <pureunix/termios.h>
 #include <pureunix/tty.h>
 #include <pureunix/vfs.h>
+#include <pureunix/vga.h>
 
 /* Collects vfs_readdir() callback entries into the caller's SYS_READDIR
  * output buffer, capped at the caller-supplied capacity. */
@@ -559,6 +561,29 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EINVAL;
         }
         return (uint32_t)tty_set_termios(in);
+    }
+    case SYS_IOCTL: {
+        int fd = (int)regs->ebx;
+        int request = (int)regs->ecx;
+        void *argp = (void *)regs->edx;
+        int chk = tty_fd_check(fd);
+        if (chk != 0) {
+            return (uint32_t)chk;
+        }
+        if (request != TIOCGWINSZ) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!argp) {
+            return (uint32_t)-EINVAL;
+        }
+        struct winsize *ws = (struct winsize *)argp;
+        size_t rows, cols;
+        vga_get_size(&rows, &cols);
+        ws->ws_row = (unsigned short)rows;
+        ws->ws_col = (unsigned short)cols;
+        ws->ws_xpixel = 0;
+        ws->ws_ypixel = 0;
+        return 0;
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

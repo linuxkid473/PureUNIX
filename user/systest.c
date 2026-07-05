@@ -221,6 +221,47 @@ static void test_write_read_basics(void)
 
 /* ==================================================================== */
 
+static void test_isatty_ioctl(void)
+{
+    section("isatty() / ioctl(TIOCGWINSZ)");
+
+    check_true("isatty(0) is true (stdin names the console)", pu_isatty(0));
+    check_true("isatty(1) is true (stdout names the console)", pu_isatty(1));
+    check_true("isatty(2) is true (stderr names the console)", pu_isatty(2));
+    check_true("isatty() on a negative fd is false", !pu_isatty(-1));
+    check_true("isatty() on a never-opened fd is false", !pu_isatty(9));
+
+    int fd = pu_open("/README.TXT", O_RDONLY);
+    check_true("opened /README.TXT to use as a non-tty fd", fd >= 3);
+    if (fd >= 3) {
+        check_true("isatty() on an open regular file is false", !pu_isatty(fd));
+    }
+
+    struct winsize ws;
+    check_eq("ioctl(0, TIOCGWINSZ, ...) succeeds", 0, pu_ioctl(0, TIOCGWINSZ, &ws));
+    check_eq("console reports 80 columns", 80, ws.ws_col);
+    check_eq("console reports 25 rows", 25, ws.ws_row);
+
+    struct winsize ws1, ws2;
+    pu_ioctl(1, TIOCGWINSZ, &ws1);
+    pu_ioctl(2, TIOCGWINSZ, &ws2);
+    check_true("fd 0/1/2 report the same size (one shared console)",
+               ws.ws_row == ws1.ws_row && ws1.ws_row == ws2.ws_row &&
+               ws.ws_col == ws1.ws_col && ws1.ws_col == ws2.ws_col);
+
+    check_eq("ioctl() with a null argp returns EINVAL", EINVAL, pu_ioctl(0, TIOCGWINSZ, (void *)0));
+    check_eq("ioctl() with an unsupported request returns EINVAL", EINVAL, pu_ioctl(0, 999, &ws));
+    check_eq("ioctl() on a negative fd returns EBADF", EBADF, pu_ioctl(-1, TIOCGWINSZ, &ws));
+    check_eq("ioctl() on a never-opened fd returns EBADF", EBADF, pu_ioctl(9, TIOCGWINSZ, &ws));
+
+    if (fd >= 3) {
+        check_eq("ioctl(TIOCGWINSZ) on an open regular file returns ENOTTY", ENOTTY, pu_ioctl(fd, TIOCGWINSZ, &ws));
+        pu_close(fd);
+    }
+}
+
+/* ==================================================================== */
+
 static void test_open_close(void)
 {
     section("SYS_OPEN / SYS_CLOSE");
@@ -1118,6 +1159,7 @@ int main(void)
     test_process_basics();
     test_fork_exec_wait();
     test_write_read_basics();
+    test_isatty_ioctl();
     test_open_close();
     test_lseek();
     test_stat_lstat_access();

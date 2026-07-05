@@ -64,6 +64,7 @@ static int syscall3(int n, int a, int b, int c)
 | 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | — | reaped child's pid, or `-1` if no such child |
 | 26 | `SYS_TCGETATTR` | fd (0, 1, or 2) | `struct termios *` | — | 0 or negative error |
 | 27 | `SYS_TCSETATTR` | fd (0, 1, or 2) | `struct termios *` | actions (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) | 0 or negative error |
+| 28 | `SYS_IOCTL` | fd (0, 1, or 2) | request (`TIOCGWINSZ`) | `struct winsize *` | 0 or negative error |
 
 ---
 
@@ -417,6 +418,33 @@ Changing `ICANON`/`ECHO` takes effect on the very next `SYS_READ` — see `SYS_R
 
 ---
 
+## SYS_IOCTL (28)
+
+Generic device control. PureUNIX implements exactly one request: `TIOCGWINSZ`, which reports the console's fixed 80x25 VGA text-grid size (`vga_get_size()`, `drivers/vga.c`) — there is no resize event, so this never changes at runtime.
+
+**Arguments**: `EBX`: fd, must be 0, 1, or 2. `ECX`: request (`TIOCGWINSZ`, the only supported value). `EDX`: pointer to a `struct winsize` to fill.
+
+```c
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel; /* unused: no pixel-accurate console geometry */
+    unsigned short ws_ypixel; /* unused, same reason */
+};
+```
+
+**Returns**: `0` on success, or a negative error code:
+
+| Code | Value | Condition |
+|---|---|---|
+| `-EINVAL` | -22 | `request` is not `TIOCGWINSZ`, or the `struct winsize *` is null |
+| `-EBADF` | -9 | fd is outside [0, `MAX_OPEN_FILES`), or fd is ≥ 3 and not an open descriptor |
+| `-ENOTTY` | -25 | fd is ≥ 3 and *is* an open descriptor, just not a terminal (it's a regular file) |
+
+There is no dedicated `isatty()` syscall — `pu_isatty(fd)` (`user/libpure.c`) is implemented as `pu_tcgetattr(fd, &t) == 0`, mirroring how real UNIX `isatty()` is conventionally just a `tcgetattr`/`ioctl(TCGETS)` call that succeeds or fails.
+
+---
+
 ## Error Return
 
 Any unrecognized syscall number returns `(uint32_t)-1`.
@@ -457,7 +485,7 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 `fstat`, `mmap`, `munmap`, `brk`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
 
-(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above.)
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above. `ioctl` (just `TIOCGWINSZ`) and `isatty` were added alongside it — see `SYS_IOCTL` above; `isatty` has no syscall of its own, see that section.)
 
 `ISIG`'s `VINTR`/`VQUIT`/`VSUSP` are recognized by the tty layer (`drivers/tty.c`) but only `VINTR` has an effect (aborting the current read with `-EINTR`) — there is no signal delivery mechanism yet (`kill`/`signal` above are unimplemented stubs), so `VQUIT` and `VSUSP` are accepted but inert, and no process is ever actually killed or stopped by them.
 
@@ -487,6 +515,8 @@ int    pu_exec(const char *path);                               // SYS_EXEC
 int    pu_wait(int pid, int *status);                           // SYS_WAIT
 int    pu_tcgetattr(int fd, struct termios *out);               // SYS_TCGETATTR
 int    pu_tcsetattr(int fd, int actions, const struct termios *in); // SYS_TCSETATTR
+int    pu_ioctl(int fd, int request, void *argp);               // SYS_IOCTL
+int    pu_isatty(int fd);           // no syscall — pu_tcgetattr() succeeding
 void   pu_exit(int code);           // int $0x81 directly — see docs/scheduler.md's SYS_EXIT note
 void   pu_puts(const char *s);                                  // SYS_WRITE to fd 1
 void   pu_puti(int value);                                      // integer to decimal on fd 1

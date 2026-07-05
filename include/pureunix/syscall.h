@@ -43,6 +43,12 @@ enum {
      * include/pureunix/termios.h and drivers/tty.c. */
     SYS_TCGETATTR = 26,
     SYS_TCSETATTR = 27,
+
+    /* Device control. Currently supports exactly one request (TIOCGWINSZ)
+     * on the console tty — see include/pureunix/ioctl.h. There is no
+     * separate isatty() syscall: userspace derives it from whether
+     * SYS_TCGETATTR succeeds (see pu_isatty() in user/libpure.c). */
+    SYS_IOCTL = 28,
 };
 
 #endif

@@ -151,6 +151,17 @@ int pu_tcsetattr(int fd, int actions, const struct termios *in)
     return syscall3(SYS_TCSETATTR, fd, (int)in, actions);
 }
 
+int pu_ioctl(int fd, int request, void *argp)
+{
+    return syscall3(SYS_IOCTL, fd, request, (int)argp);
+}
+
+int pu_isatty(int fd)
+{
+    struct termios t;
+    return pu_tcgetattr(fd, &t) == 0 ? 1 : 0;
+}
+
 void pu_exit(int code)
 {
     __asm__ volatile("int $0x81" : : "b"(code) : "memory");

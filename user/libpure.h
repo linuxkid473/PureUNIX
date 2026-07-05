@@ -32,6 +32,7 @@
 #define SYS_WAIT     25
 #define SYS_TCGETATTR 26
 #define SYS_TCSETATTR 27
+#define SYS_IOCTL     28
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -159,6 +160,16 @@ struct dirent {
 #define TCSADRAIN 1
 #define TCSAFLUSH 2
 
+/* ioctl() — must match include/pureunix/ioctl.h. */
+#define TIOCGWINSZ 1
+
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+
 typedef unsigned int tcflag_t;
 typedef unsigned char cc_t;
 
@@ -250,6 +261,16 @@ void   pu_exit(int code) __attribute__((noreturn));
  * (not a valid/open descriptor at all). */
 int    pu_tcgetattr(int fd, struct termios *out);
 int    pu_tcsetattr(int fd, int actions, const struct termios *in);
+/* Generic device control. The only supported request is TIOCGWINSZ, which
+ * fills *argp (a struct winsize *) with the console's fixed 80x25 size.
+ * Same fd/error contract as pu_tcgetattr above, plus -EINVAL for a request
+ * other than TIOCGWINSZ or a null argp. */
+int    pu_ioctl(int fd, int request, void *argp);
+/* POSIX isatty(): 1 if fd names the console (0, 1, or 2), 0 otherwise —
+ * including a bad or non-terminal fd. Implemented as pu_tcgetattr()
+ * succeeding, exactly like isatty() on a real UNIX is ioctl(TCGETS)
+ * succeeding; there is no dedicated syscall for it. */
+int    pu_isatty(int fd);
 
 void   pu_puts(const char *s);
 void   pu_puti(int value);

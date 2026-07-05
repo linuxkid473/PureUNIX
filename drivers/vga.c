@@ -326,6 +326,16 @@ void vga_get_cursor(size_t *out_row, size_t *out_col)
     }
 }
 
+void vga_get_size(size_t *out_rows, size_t *out_cols)
+{
+    if (out_rows) {
+        *out_rows = VGA_HEIGHT;
+    }
+    if (out_cols) {
+        *out_cols = VGA_WIDTH;
+    }
+}
+
 /* Move write position + serial cursor WITHOUT touching the visible cursor.
    Use during bulk screen redraws to avoid cursor flicker on row 0. */
 void vga_goto(size_t new_row, size_t new_col)
