@@ -4,8 +4,10 @@
 /* Positive error codes; negate when returning from syscalls. */
 #define EPERM    1   /* operation not permitted */
 #define ENOENT   2   /* no such file or directory */
+#define EINTR    4   /* interrupted (VINTR fired mid-read; see drivers/tty.c) */
 #define EIO      5   /* I/O error */
 #define EBADF    9   /* bad file descriptor */
+#define ENOTTY   25  /* not a tty (tcgetattr()/tcsetattr() on a non-console fd) */
 #define EEXIST   17  /* file already exists */
 #define ENOTDIR  20  /* not a directory */
 #define EISDIR   21  /* is a directory */

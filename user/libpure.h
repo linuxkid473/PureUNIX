@@ -30,6 +30,8 @@
 #define SYS_FORK     23
 #define SYS_EXEC     24
 #define SYS_WAIT     25
+#define SYS_TCGETATTR 26
+#define SYS_TCSETATTR 27
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -65,6 +67,8 @@
 #define ENAMETOOLONG (-36)
 #define ENOTEMPTY (-39)
 #define ELOOP   (-40)
+#define EINTR   (-4)
+#define ENOTTY  (-25)
 
 /* Must match PUREUNIX_MAX_NAME in include/pureunix/config.h. */
 #define PU_MAX_NAME 64
@@ -124,6 +128,46 @@ struct dirent {
     char name[PU_MAX_NAME];
     unsigned int type;   /* 1 = file, 2 = directory, 3 = symlink */
     unsigned int size;
+};
+
+/* Terminal control — must match include/pureunix/termios.h. */
+#define NCCS 8
+
+#define VINTR  0
+#define VQUIT  1
+#define VERASE 2
+#define VKILL  3
+#define VEOF   4
+#define VMIN   5
+#define VTIME  6
+#define VSUSP  7
+
+#define ICRNL  0x0001
+#define INLCR  0x0002
+
+#define OPOST  0x0001
+#define ONLCR  0x0002
+
+#define ISIG   0x0001
+#define ICANON 0x0002
+#define ECHO   0x0004
+#define ECHOE  0x0008
+#define ECHOK  0x0010
+#define ECHONL 0x0020
+
+#define TCSANOW   0
+#define TCSADRAIN 1
+#define TCSAFLUSH 2
+
+typedef unsigned int tcflag_t;
+typedef unsigned char cc_t;
+
+struct termios {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    cc_t     c_cc[NCCS];
 };
 
 /* Raw syscall gate, for probing a syscall directly rather than through one
@@ -196,6 +240,17 @@ int    pu_wait(int pid, int *status);
  * callable mid-program (e.g. by a fork()ed child that must not fall
  * through to the parent's remaining code). */
 void   pu_exit(int code) __attribute__((noreturn));
+
+/* -------------------------------------------------------------------- */
+/* Terminal control                                                       */
+/* -------------------------------------------------------------------- */
+
+/* fd must be 0, 1, or 2 (stdin/stdout/stderr all name the same console);
+ * any other fd fails with -ENOTTY (open, but not a terminal) or -EBADF
+ * (not a valid/open descriptor at all). */
+int    pu_tcgetattr(int fd, struct termios *out);
+int    pu_tcsetattr(int fd, int actions, const struct termios *in);
+
 void   pu_puts(const char *s);
 void   pu_puti(int value);
 size_t pu_strlen(const char *s);

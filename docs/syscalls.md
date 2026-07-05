@@ -62,6 +62,8 @@ static int syscall3(int n, int a, int b, int c)
 | 23 | `SYS_FORK` | — | — | — | child's pid in the parent, `0` in the child, or `-1` |
 | 24 | `SYS_EXEC` | path pointer | — | — | only returns (negative error) on failure |
 | 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | — | reaped child's pid, or `-1` if no such child |
+| 26 | `SYS_TCGETATTR` | fd (0, 1, or 2) | `struct termios *` | — | 0 or negative error |
+| 27 | `SYS_TCSETATTR` | fd (0, 1, or 2) | `struct termios *` | actions (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) | 0 or negative error |
 
 ---
 
@@ -83,7 +85,13 @@ Reads from `fd`.
 
 **fd == 0 (stdin)**:
 
-Reads up to `len` bytes from the keyboard into `buf`. Blocks on `keyboard_getkey()` until the user presses Enter. On Enter, a `\n` byte is appended and the read terminates. Extended key codes (values ≥ 128) and `KEY_NONE` (0) are discarded. No echo is performed.
+Routed through `tty_read()` (`drivers/tty.c`), which applies whatever `struct termios` is currently in effect for the console — see `SYS_TCGETATTR`/`SYS_TCSETATTR` below. By default (canonical mode, `ICANON|ECHO|ECHOE|ISIG`):
+
+Reads up to `len` bytes from the keyboard into `buf`, echoing each character as it's typed and honoring `VERASE`/`VKILL`/`VEOF` line editing. Blocks until the user presses Enter (a trailing `\n` is included in the returned bytes) or `VEOF` (Ctrl-D) is pressed on an empty line (returns 0). `VINTR` (Ctrl-C) aborts the read and returns `-EINTR`. Extended key codes with no ASCII meaning (arrows, F-keys, ...) are silently dropped.
+
+In raw mode (`ICANON` clear), returns as soon as at least one byte is available (blocking for the first byte, then draining whatever else is already queued without blocking further), without line editing; echo still follows `ECHO`. See `docs/api/drivers.md` for `tty_read()`'s exact contract.
+
+Note for anyone adding future syscalls that can block waiting on the keyboard: `int $0x80` runs with interrupts masked (see `arch/i386/interrupt_stubs.S`'s `isr128`), so a blocking read must call `arch_enable_interrupts()` before waiting — otherwise `keyboard_getkey()`'s `hlt` loop can never be woken by the keyboard IRQ. `tty_read()` does this already.
 
 **fd ≥ 3 (open file)**:
 
@@ -389,6 +397,26 @@ Blocks (cooperatively, via `task_yield()`) until a child of the caller becomes a
 
 ---
 
+## SYS_TCGETATTR (26) / SYS_TCSETATTR (27)
+
+Get/set the console's `struct termios` (`include/pureunix/termios.h`). PureUNIX has exactly one terminal — the VGA console fed by the PS/2 keyboard — so this is process-independent, kernel-global state (`drivers/tty.c`'s `console_termios`) shared by fds 0, 1, and 2, not per-open-file-description state like a real UNIX's tty layer.
+
+**Arguments** (both): `EBX`: fd, must be 0, 1, or 2. `ECX`: `struct termios *`. `SYS_TCSETATTR` additionally takes `EDX`: `actions` (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) — all three apply immediately, since there is no pending-output queue or unread-input buffer to drain or flush; the argument only exists so the syscall's shape matches POSIX.
+
+**Returns**: 0 on success, or a negative error.
+
+**Error returns**:
+
+| Code | Value | Condition |
+|---|---|---|
+| `-EINVAL` | -22 | null `struct termios *`, or (SYS_TCSETATTR only) `actions` is not `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` |
+| `-EBADF` | -9 | fd is outside [0, `MAX_OPEN_FILES`), or fd is ≥ 3 and not an open descriptor |
+| `-ENOTTY` | -25 | fd is ≥ 3 and *is* an open descriptor, just not a terminal (it's a regular file) |
+
+Changing `ICANON`/`ECHO` takes effect on the very next `SYS_READ` — see `SYS_READ`'s fd == 0 case above.
+
+---
+
 ## Error Return
 
 Any unrecognized syscall number returns `(uint32_t)-1`.
@@ -403,6 +431,7 @@ Defined in `include/pureunix/errno.h` (kernel) and `user/libpure.h` (user progra
 |---|---|---|
 | `EPERM` | 1 | operation not permitted (e.g. `SYS_LINK` on a directory) |
 | `ENOENT` | 2 | no such file or directory |
+| `EINTR` | 4 | a blocking read was aborted by `VINTR` (Ctrl-C) with `ISIG` set |
 | `EIO` | 5 | I/O error |
 | `EBADF` | 9 | bad file descriptor |
 | `EACCES` | 13 | permission denied |
@@ -412,6 +441,7 @@ Defined in `include/pureunix/errno.h` (kernel) and `user/libpure.h` (user progra
 | `EISDIR` | 21 | is a directory |
 | `EINVAL` | 22 | invalid argument |
 | `EMFILE` | 24 | too many open files |
+| `ENOTTY` | 25 | `SYS_TCGETATTR`/`SYS_TCSETATTR` on a valid, open, but non-terminal fd |
 | `ENOSPC` | 28 | no space left on device (allocator exhausted) |
 | `EROFS` | 30 | read-only filesystem |
 | `ENAMETOOLONG` | 36 | path or component too long |
@@ -427,7 +457,9 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 `fstat`, `mmap`, `munmap`, `brk`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
 
-(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above.)
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above.)
+
+`ISIG`'s `VINTR`/`VQUIT`/`VSUSP` are recognized by the tty layer (`drivers/tty.c`) but only `VINTR` has an effect (aborting the current read with `-EINTR`) — there is no signal delivery mechanism yet (`kill`/`signal` above are unimplemented stubs), so `VQUIT` and `VSUSP` are accepted but inert, and no process is ever actually killed or stopped by them.
 
 `SYS_CHMOD`/`SYS_CHOWN` exist as syscall numbers but currently always return `-EROFS` — see above.
 
@@ -453,6 +485,8 @@ int    pu_debug_setcred(uid_t uid, gid_t gid);                  // SYS_DEBUG_SET
 int    pu_fork(void);                                           // SYS_FORK
 int    pu_exec(const char *path);                               // SYS_EXEC
 int    pu_wait(int pid, int *status);                           // SYS_WAIT
+int    pu_tcgetattr(int fd, struct termios *out);               // SYS_TCGETATTR
+int    pu_tcsetattr(int fd, int actions, const struct termios *in); // SYS_TCSETATTR
 void   pu_exit(int code);           // int $0x81 directly — see docs/scheduler.md's SYS_EXIT note
 void   pu_puts(const char *s);                                  // SYS_WRITE to fd 1
 void   pu_puti(int value);                                      // integer to decimal on fd 1

@@ -141,6 +141,16 @@ int pu_wait(int pid, int *status)
     return syscall3(SYS_WAIT, pid, (int)status, 0);
 }
 
+int pu_tcgetattr(int fd, struct termios *out)
+{
+    return syscall3(SYS_TCGETATTR, fd, (int)out, 0);
+}
+
+int pu_tcsetattr(int fd, int actions, const struct termios *in)
+{
+    return syscall3(SYS_TCSETATTR, fd, (int)in, actions);
+}
+
 void pu_exit(int code)
 {
     __asm__ volatile("int $0x81" : : "b"(code) : "memory");

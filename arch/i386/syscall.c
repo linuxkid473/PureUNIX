@@ -3,13 +3,14 @@
 #include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
-#include <pureunix/keyboard.h>
 #include <pureunix/memory.h>
 #include <pureunix/stat.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
+#include <pureunix/termios.h>
+#include <pureunix/tty.h>
 #include <pureunix/vfs.h>
 
 /* Collects vfs_readdir() callback entries into the caller's SYS_READDIR
@@ -33,6 +34,24 @@ static int readdir_collect_cb(const vfs_dirent_t *entry, void *ctx_)
     d->size = entry->size;
     ctx->count++;
     return 0;
+}
+
+/* fds 0/1/2 all name the same single console tty (see drivers/tty.c);
+ * anything else is either a bad descriptor or a real open file that just
+ * isn't a terminal. Shared by SYS_TCGETATTR and SYS_TCSETATTR. */
+static int tty_fd_check(int fd)
+{
+    if (fd == 0 || fd == 1 || fd == 2) {
+        return 0;
+    }
+    if (fd < 0 || fd >= MAX_OPEN_FILES) {
+        return -EBADF;
+    }
+    task_t *t = task_current();
+    if (t && t->fds[fd].used) {
+        return -ENOTTY;
+    }
+    return -EBADF;
 }
 
 void syscall_init(void)
@@ -106,22 +125,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         size_t len = (size_t)regs->edx;
 
         if (fd == 0) {
-            /* stdin: keyboard — preserve original behaviour */
-            if (!buf) {
-                return (uint32_t)-EINVAL;
-            }
-            size_t i = 0;
-            while (i < len) {
-                int key = keyboard_getkey();
-                if (key == KEY_ENTER) {
-                    buf[i++] = '\n';
-                    break;
-                }
-                if (key > 0 && key < 128) {
-                    buf[i++] = (char)key;
-                }
-            }
-            return (uint32_t)i;
+            /* stdin: routed through the termios-aware console tty driver —
+             * see drivers/tty.c. Behaves like the classic canonical/echoing
+             * console unless SYS_TCSETATTR has put it in raw mode. */
+            return (uint32_t)tty_read(buf, len);
         }
 
         /* fds 1 and 2 are write-only; anything outside [3, MAX_OPEN_FILES) is invalid */
@@ -530,6 +537,28 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             *status = st;
         }
         return (uint32_t)rc;
+    }
+    case SYS_TCGETATTR: {
+        int fd = (int)regs->ebx;
+        struct termios *out = (struct termios *)regs->ecx;
+        int chk = tty_fd_check(fd);
+        if (chk != 0) {
+            return (uint32_t)chk;
+        }
+        return (uint32_t)tty_get_termios(out);
+    }
+    case SYS_TCSETATTR: {
+        int fd = (int)regs->ebx;
+        const struct termios *in = (const struct termios *)regs->ecx;
+        int actions = (int)regs->edx;
+        int chk = tty_fd_check(fd);
+        if (chk != 0) {
+            return (uint32_t)chk;
+        }
+        if (actions != TCSANOW && actions != TCSADRAIN && actions != TCSAFLUSH) {
+            return (uint32_t)-EINVAL;
+        }
+        return (uint32_t)tty_set_termios(in);
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

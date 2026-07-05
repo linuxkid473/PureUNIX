@@ -33,6 +33,7 @@ PureUNIX/
 │   ├── vga.c           80×25 VGA text mode; ANSI SGR colors; hardware cursor; serial mirror
 │   ├── keyboard.c      PS/2 IRQ1 driver; scan set 1; 128-entry ring buffer; shift/caps
 │   ├── serial.c        COM1 38400 baud; mirrors VGA output; ANSI cursor sequences
+│   ├── tty.c           Console termios: one shared struct termios; canonical/raw SYS_READ(fd 0)
 │   └── ata.c           ATA PIO; primary master + slave; LBA28; IDENTIFY; sector read/write
 │
 ├── fs/
@@ -96,6 +97,8 @@ PureUNIX/
 │       ├── ext2.h      ext2_mount, ext2_unmount, ext2_is_mounted, ext2_stat, ext2_read_file, ext2_readdir
 │       ├── disk.h      disk_device_t, ata_init, ata_primary_master, ata_primary_slave
 │       ├── keyboard.h  KEY_* constants, keyboard_init, keyboard_getkey, keyboard_try_getkey
+│       ├── termios.h   struct termios, NCCS/V*/ICANON/ECHO/ISIG/... constants
+│       ├── tty.h        tty_init, tty_get_termios, tty_set_termios, tty_read
 │       ├── shell.h     shell_run, shell_execute_line, shell_getenv/setenv, shell_set_home_cwd
 │       ├── users.h     user_record_t, users_first_boot, users_login, users_adduser, users_passwd
 │       ├── vga.h       vga_color enum, vga_init, vga_putc, vga_clear, cursor functions

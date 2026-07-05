@@ -15,6 +15,7 @@
 #include <pureunix/stdio.h>
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
+#include <pureunix/tty.h>
 #include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
@@ -42,6 +43,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     syscall_init();
     pit_init(100);
     keyboard_init();
+    tty_init();
     ata_init();
     vfs_init();
 

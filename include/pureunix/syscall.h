@@ -38,6 +38,11 @@ enum {
     SYS_FORK     = 23,
     SYS_EXEC     = 24,
     SYS_WAIT     = 25,
+
+    /* Terminal control: get/set the console's struct termios. See
+     * include/pureunix/termios.h and drivers/tty.c. */
+    SYS_TCGETATTR = 26,
+    SYS_TCSETATTR = 27,
 };
 
 #endif

@@ -176,6 +176,46 @@ Returns `true` if the Ctrl key is currently held down.
 
 ---
 
+## Console TTY / termios
+
+**Headers**: `<pureunix/termios.h>`, `<pureunix/tty.h>`
+
+One `struct termios` for the whole machine (`drivers/tty.c`'s static `console_termios`) — there's exactly one terminal (the VGA console / PS2 keyboard), so unlike a real kernel this isn't per-open-file-description state. Backs `SYS_TCGETATTR`/`SYS_TCSETATTR` (see `docs/syscalls.md`) and `SYS_READ`'s fd == 0 case.
+
+```c
+struct termios {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    cc_t     c_cc[NCCS];   // NCCS == 8
+};
+```
+
+`c_cc[]` indices: `VINTR`, `VQUIT`, `VERASE`, `VKILL`, `VEOF`, `VMIN`, `VTIME`, `VSUSP`. `c_lflag` bits: `ISIG`, `ICANON`, `ECHO`, `ECHOE`, `ECHOK`, `ECHONL`. `c_iflag`/`c_oflag` (`ICRNL`/`INLCR`, `OPOST`/`ONLCR`) are defined for API completeness but currently have no effect — `vga_putc` already renders `\n`/`\r` correctly without translation.
+
+Default (cooked) mode: `ISIG|ICANON|ECHO|ECHOE|ECHOK`, `VINTR`=^C (3), `VQUIT`=^\\ (28), `VERASE`=DEL (127), `VKILL`=^U (21), `VEOF`=^D (4), `VMIN`=1, `VTIME`=0, `VSUSP`=^Z (26).
+
+```c
+void tty_init(void);
+```
+Resets `console_termios` to the cooked defaults above. Called once from `kernel_main`, after `keyboard_init()`.
+
+```c
+int tty_get_termios(struct termios *out);
+int tty_set_termios(const struct termios *in);
+```
+Copy the current termios out to `*out`, or replace it wholesale from `*in`. Both return `-EINVAL` on a null pointer; there is no partial/masked update.
+
+```c
+int tty_read(char *buf, size_t len);
+```
+The fd-0 half of `SYS_READ`. In canonical mode (`ICANON` set): line-buffered, with `ECHO`/`ECHOE`/`ECHOK` controlling echo and `VERASE`/`VKILL`/`VEOF` editing; returns the line including its trailing `\n`, or 0 on `VEOF` with an empty line. In raw mode: blocks for one byte, then drains whatever else is already queued without blocking again (approximates `VMIN`=1, `VTIME`=0; arbitrary `VMIN`/`VTIME` combinations are not implemented — there's no timer-driven read yet). `VINTR` aborts either mode and returns `-EINTR` when `ISIG` is set. Returns `-EINVAL` on a null buffer.
+
+Re-enables interrupts (`arch_enable_interrupts()`) before it may block — `SYS_READ` arrives via `int $0x80`, which runs with interrupts masked from entry (see `arch/i386/interrupt_stubs.S`'s `isr128`) until its own `iret`; without this, `keyboard_getkey()`'s `hlt`-based wait could never be woken by the keyboard IRQ.
+
+---
+
 ## ATA PIO
 
 **Header**: `<pureunix/disk.h>`
