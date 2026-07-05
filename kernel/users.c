@@ -11,12 +11,13 @@
  * users_first_boot()): a fresh disk image ships /etc/passwd but no shadow
  * file, so the very first boot always runs the setup wizard.
  *
- * There is no crypto library in this freestanding kernel, so passwords are
- * hashed with a salted FNV-1a mix (hash_password() below) — enough to keep
- * /etc/shadow from holding plaintext, not a defense against an offline
- * attack. Good enough for a hobby OS; not a real KDF.
+ * Every password (root's included) is hashed and verified through
+ * CoreCrypto (kernel/crypto.c, include/pureunix/crypto.h) — PBKDF2-HMAC-
+ * SHA256 with a random per-account salt — instead of being compared as
+ * plaintext or with a non-cryptographic mix. See docs/crypto.md.
  */
 #include <pureunix/config.h>
+#include <pureunix/crypto.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/memory.h>
 #include <pureunix/shell.h>
@@ -63,34 +64,6 @@ static size_t read_line_raw(char *buf, size_t max, bool mask)
             putchar(mask ? '*' : (char)key);
         }
     }
-}
-
-/* Not a cryptographic hash (no crypto library exists in this kernel) — see
- * the file header. Salts with the username so two accounts sharing a
- * password don't share a hash. */
-static void put_hex32(char *buf, uint32_t v)
-{
-    static const char digits[] = "0123456789abcdef";
-    for (int i = 7; i >= 0; --i) {
-        buf[i] = digits[v & 0xF];
-        v >>= 4;
-    }
-}
-
-static void hash_password(const char *username, const char *password, char out[17])
-{
-    uint32_t h1 = 2166136261u;
-    for (const char *s = username; *s; ++s) { h1 ^= (uint8_t)*s; h1 *= 16777619u; }
-    h1 ^= 0x5Au; h1 *= 16777619u;
-    for (const char *s = password; *s; ++s) { h1 ^= (uint8_t)*s; h1 *= 16777619u; }
-
-    uint32_t h2 = h1 ^ 0x9E3779B9u;
-    for (const char *s = password; *s; ++s) { h2 ^= (uint8_t)*s; h2 *= 16777619u; }
-    for (const char *s = username; *s; ++s) { h2 ^= (uint8_t)*s; h2 *= 16777619u; }
-
-    put_hex32(out, h1);
-    put_hex32(out + 8, h2);
-    out[16] = '\0';
 }
 
 /* kmalloc'd NUL-terminated copy of a file's contents, or NULL if it doesn't
@@ -324,8 +297,8 @@ void users_first_boot_setup(void)
     char password[64];
     prompt_new_password("root", password, sizeof(password));
 
-    char hash[17];
-    hash_password("root", password, hash);
+    char hash[CRYPTO_HASH_STRING_MAX];
+    crypto_hash_password(password, hash, sizeof(hash));
     shadow_set_hash("root", hash);
 
     /* /etc/passwd already ships a root entry (tools/mkext2.py); this only
@@ -356,11 +329,10 @@ void users_login(void)
         read_line_raw(password, sizeof(password), true);
 
         user_record_t rec;
-        char want[17], got[17];
+        char want[CRYPTO_HASH_STRING_MAX];
         if (users_lookup(username, &rec) == 0 &&
             shadow_get_hash(username, want, sizeof(want)) == 0) {
-            hash_password(username, password, got);
-            if (strcmp(got, want) == 0) {
+            if (crypto_verify_password(password, want)) {
                 task_set_creds(rec.uid, rec.gid);
                 shell_setenv("USER", rec.name);
                 shell_setenv("HOME", rec.home);
@@ -414,8 +386,8 @@ int users_adduser(const char *name)
     char password[64];
     prompt_new_password(name, password, sizeof(password));
 
-    char hash[17];
-    hash_password(name, password, hash);
+    char hash[CRYPTO_HASH_STRING_MAX];
+    crypto_hash_password(password, hash, sizeof(hash));
 
     char line[LINE_SCRATCH_MAX];
     int n = snprintf(line, sizeof(line), "%s:x:%u:%u:%s:%s:/bin/sh\n", name, uid, gid, name, home);
@@ -446,8 +418,8 @@ int users_passwd(const char *name)
     char password[64];
     prompt_new_password(rec.name, password, sizeof(password));
 
-    char hash[17];
-    hash_password(rec.name, password, hash);
+    char hash[CRYPTO_HASH_STRING_MAX];
+    crypto_hash_password(password, hash, sizeof(hash));
     if (shadow_set_hash(rec.name, hash) != 0) {
         printf("passwd: failed to update /etc/shadow\n");
         return -1;

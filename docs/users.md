@@ -8,11 +8,19 @@ Account state and the boot-time login flow live in one file:
 |---|---|
 | `kernel/users.c` | `/etc/passwd`/`/etc/shadow` parsing, password hashing, first-boot wizard, login prompt, `adduser`/`passwd` logic |
 | `include/pureunix/users.h` | Public API (`user_record_t`, `users_first_boot`, `users_first_boot_setup`, `users_login`, `users_lookup`, `users_adduser`, `users_passwd`) |
+| `kernel/crypto.c` / `include/pureunix/crypto.h` | CoreCrypto — the SHA-256/HMAC/PBKDF2 primitives `kernel/users.c` hashes and verifies every password with. See `docs/crypto.md`. |
 
 `kernel_main` (`kernel/main.c`) calls into this module right after the filesystems are mounted and interrupts are enabled, before `shell_run()`:
 
 ```c
 arch_enable_interrupts();
+
+crypto_init();
+if (crypto_ready()) {
+    printf("Crypto OK\n");
+} else {
+    panic("CoreCrypto self-test failed; refusing to start login.");
+}
 
 if (users_first_boot()) {
     users_first_boot_setup();
@@ -22,7 +30,7 @@ users_login();
 shell_run();
 ```
 
-So every boot either runs the first-boot wizard once, then always ends with a `login:`/`Password:` prompt before the shell starts.
+CoreCrypto is initialized (and self-tested) before either the first-boot wizard or the login prompt runs, since both hash or verify a password — if the self-test fails there is no safe way to check a password, so the kernel panics instead of ever showing a `login:` prompt. So every successful boot prints `Crypto OK`, then either runs the first-boot wizard once, then always ends with a `login:`/`Password:` prompt before the shell starts.
 
 ---
 
@@ -41,7 +49,13 @@ The `x` placeholder field in `/etc/passwd` is vestigial (real Unix history — p
 
 ### Password hashing
 
-There is no crypto library in this freestanding kernel, so `hash_password()` mixes the username (as a salt) and password through a chained FNV-1a, producing a 16-hex-character digest stored in `/etc/shadow`. This keeps the shadow file from holding plaintext; it is **not** a cryptographic KDF and would not resist an offline attack. Good enough for a hobby OS, not a security boundary.
+Every password (root's included) is hashed and verified through CoreCrypto (`kernel/crypto.c`): `crypto_hash_password()` runs PBKDF2-HMAC-SHA256 (10,000 iterations) over the password with a fresh random 16-byte salt, and stores a self-describing string in `/etc/shadow`:
+
+```
+pbkdf2-sha256$<iterations>$<salt-hex>$<digest-hex>
+```
+
+`crypto_verify_password()` parses that string, recomputes the digest from the entered password, and compares it in constant time. See `docs/crypto.md` for the primitives themselves.
 
 ---
 
@@ -90,4 +104,5 @@ Both are shell builtins (`shell/builtins.c`) that call straight into `kernel/use
 - No password aging/expiry fields (`/etc/shadow` here is just `name:hash`, not the full 9-field format).
 - New home directories are owned by whoever ran `adduser` (root), not the new account — `chown`/`chmod` are unimplemented on both filesystem drivers (see `docs/filesystem.md`), so there's no way to fix that after creation.
 - No account lockout/attempt limiting on login.
-- Hashing is FNV-1a based, not a real KDF — see "Password hashing" above.
+- CoreCrypto's RNG (used only for salts) is seeded from `rdtsc`/PIT ticks, not a hardware entropy source — see `docs/crypto.md`.
+- Changing the hash format (as happened when CoreCrypto replaced the old FNV-1a mix) invalidates every existing `/etc/shadow` entry; accounts on disk images provisioned before that change must have their passwords reset via `passwd`/a fresh first-boot setup.

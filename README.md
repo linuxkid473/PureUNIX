@@ -14,6 +14,7 @@ A from-scratch operating system kernel for the i686 (IA-32) architecture, writte
 - **Filesystems**: EXT2 read/write driver (primary root filesystem, ATA slave) with symlinks, hard links, and Unix permissions; FAT16 read/write driver (compatibility/testing store, ATA master)
 - **VFS**: mount-table router with longest-prefix path resolution, symlink-following path resolution, and Unix permission enforcement (`uid`/`gid`/mode) on every call
 - **Accounts**: `/etc/passwd` + `/etc/shadow` accounts; a first-boot wizard sets the root password and prints a setup guide, and every subsequent boot requires a `login:`/`Password:` prompt before the shell starts; `adduser`/`passwd` builtins manage accounts afterward (see `docs/users.md`)
+- **CoreCrypto**: SHA-256, HMAC-SHA256, and PBKDF2-HMAC-SHA256 (10,000 iterations, random salt) back every password hash and login verification; self-tested at boot, printing `Crypto OK` (see `docs/crypto.md`)
 - **Shell**: interactive line editor with history (64 entries), tab completion, pipes (`|`), I/O redirection (`<`, `>`, `>>`), and 31 builtins
 - **Editor**: modal vim-like editor (`vim`/`vi`) with NORMAL, INSERT, COMMAND, and search modes
 - **Scheduler**: cooperative round-robin task scheduler; `elf_exec` spawns a ring-3 task per program and blocks until it exits
@@ -46,6 +47,7 @@ A from-scratch operating system kernel for the i686 (IA-32) architecture, writte
 | Cooperative scheduler | Complete | Round-robin; no preemption; `task_join()` lets a caller wait on a spawned task |
 | Syscall interface | Complete (21 syscalls + 1 test-only) | See Features above; `SYS_DEBUG_SETCRED` is test-only, no privilege check |
 | Accounts & login | Complete | `/etc/passwd` + `/etc/shadow`; first-boot root-password wizard; login prompt every boot; `adduser`/`passwd` builtins (see `docs/users.md`) |
+| CoreCrypto (password hashing) | Complete | SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256; boot-time self-test prints `Crypto OK` or panics (see `docs/crypto.md`) |
 | Shell builtins (31) | Complete | ls, cd, cat, echo, cp, mv, rm, mkdir, rmdir, touch, stat, mount, free, ps, kill, reboot, shutdown, env, export, adduser, passwd, etc. |
 | Shell pipeline/redirect | Complete | Up to 4 pipe stages, `<`, `>`, `>>` |
 | vim-like editor | Complete | Modal edit, undo, search, `:w`/`:q`/`:wq` |

@@ -1,6 +1,7 @@
 #include <pureunix/arch.h>
 #include <pureunix/bootsplash.h>
 #include <pureunix/config.h>
+#include <pureunix/crypto.h>
 #include <pureunix/disk.h>
 #include <pureunix/ext2.h>
 #include <pureunix/fat16.h>
@@ -8,6 +9,7 @@
 #include <pureunix/kernel.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/memory.h>
+#include <pureunix/panic.h>
 #include <pureunix/serial.h>
 #include <pureunix/shell.h>
 #include <pureunix/stdio.h>
@@ -64,6 +66,16 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     arch_enable_interrupts();
+
+    crypto_init();
+    if (crypto_ready()) {
+        printf("Crypto OK\n");
+    } else {
+        /* Every login is verified cryptographically (see kernel/users.c) —
+         * without a working CoreCrypto there is no safe way to check a
+         * password, so refuse to boot into a login prompt at all. */
+        panic("CoreCrypto self-test failed; refusing to start login.");
+    }
 
     if (users_first_boot()) {
         users_first_boot_setup();

@@ -26,7 +26,8 @@ PureUNIX/
 │   ├── elf.c           ELF32 loader; validates and loads PT_LOAD segments to 0x400000–0x700000
 │   ├── panic.c         panic() — white-on-red VGA + serial + halt
 │   ├── reboot.c        Keyboard controller reset; ACPI/QEMU power off ports
-│   └── users.c         /etc/passwd + /etc/shadow, first-boot setup wizard, login prompt, adduser/passwd
+│   ├── users.c         /etc/passwd + /etc/shadow, first-boot setup wizard, login prompt, adduser/passwd
+│   └── crypto.c        CoreCrypto — SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256 password hashing
 │
 ├── drivers/
 │   ├── vga.c           80×25 VGA text mode; ANSI SGR colors; hardware cursor; serial mirror
@@ -173,7 +174,8 @@ boot/multiboot2.S
             │               ├─ dir.c     (needs inode.c, block.c)
             │               ├─ file.c    (needs inode.c, block.c, heap)
             │               └─ mount.c   (needs super.c, dir.c, file.c)
-            ├─ kernel/users.c (needs vfs, keyboard, task, shell_setenv/shell_set_home_cwd)
+            ├─ kernel/crypto.c (needs arch/i386/pit.c for RNG seed)
+            ├─ kernel/users.c (needs vfs, keyboard, task, crypto, shell_setenv/shell_set_home_cwd)
             └─ shell/sh.c (needs vfs, keyboard, vga, task, elf)
                     ├─ shell/parser.c
                     ├─ shell/line.c
