@@ -688,3 +688,18 @@ int getchar(void)
     long n = read(0, &c, 1);
     return n == 1 ? (int)c : EOF;
 }
+
+/* ------------------------------------------------------------------ */
+/* termios.h — thin wrappers over libpure's pu_tc*attr, so term.c can put  */
+/* the console in raw mode like a real Neatvi does over a real tty.        */
+/* ------------------------------------------------------------------ */
+
+int tcgetattr(int fd, struct termios *out)
+{
+    return pu_tcgetattr(fd, out);
+}
+
+int tcsetattr(int fd, int actions, const struct termios *in)
+{
+    return pu_tcsetattr(fd, actions, in);
+}

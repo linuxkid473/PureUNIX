@@ -82,7 +82,13 @@ PureUNIX/
 │   ├── sh.c            Stub: prints "not yet implemented"
 │   ├── opentest.c      File syscall test: open, stat, lseek, close — success and error paths
 │   ├── readtest.c      SYS_READ test: reads from VFS-backed fd ≥ 3 via pu_open + pu_read
-│   └── ext2test.c      EXT2 integration test: 14 cases covering stat, read, seek, indirect blocks
+│   ├── ext2test.c      EXT2 integration test: 14 cases covering stat, read, seek, indirect blocks
+│   └── vi/             Vendored Neatvi (vi/ex clone) port — see docs/userland.md's "user/vi/ (neatvi)"
+│       ├── compat/     POSIX-named headers (stdio.h, unistd.h, termios.h, ...) for the vendored source
+│       ├── compat.c    malloc/free, open/read/write, printf family — backed by libpure.h's pu_* calls
+│       ├── term.c      Platform glue: raw-mode console via tcgetattr/tcsetattr, 25x80 fixed size
+│       ├── cmd.c       Platform glue: :!cmd/fork+exec stubs (PureUNIX has no pipe()/fork()+execvp())
+│       └── vi.c, ex.c, lbuf.c, regex.c, uc.c, ...   Unmodified upstream Neatvi source
 │
 ├── include/
 │   └── pureunix/
@@ -104,7 +110,7 @@ PureUNIX/
 │       ├── vga.h       vga_color enum, vga_init, vga_putc, vga_clear, cursor functions
 │       ├── serial.h    serial_init, serial_putc, serial_clear, serial_move_cursor
 │       ├── editor.h    editor_open
-│       ├── elf.h       elf_exec, Elf32_Ehdr/Phdr typedefs
+│       ├── elf.h       elf_exec, elf_exec_argv (argc/argv-passing), Elf32_Ehdr/Phdr typedefs
 │       ├── io.h        inb/outb/inw/outw port I/O inline functions
 │       ├── multiboot.h Multiboot1 and Multiboot2 struct definitions
 │       ├── panic.h     panic() macro/function

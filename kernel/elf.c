@@ -57,15 +57,77 @@ bool elf_is_valid(const uint8_t *image, size_t size)
            eh->e_ident[4] == 1 && eh->e_type == ET_EXEC && eh->e_machine == EM_386;
 }
 
+/* Writes a POSIX-shaped argv frame into the physical page backing the top
+ * of the new stack (top_frame, identity-mapped so it's directly writable
+ * from the kernel, and mapped into the child at virtual address
+ * top_page_va): the strings, then the argv[] pointer array (NULL-
+ * terminated), then argc — mirroring what "push argv; push argc; call
+ * main" would leave behind, so crt0's _start (see user/crt0.S) can hand
+ * them straight to main(argc, argv). Returns the resulting initial ESP
+ * (somewhere within [top_page_va, top_page_va + PUREUNIX_PAGE_SIZE)) via
+ * *out_esp, or -1 if argc/argv don't fit in one page. */
+static int build_argv_stack(phys_addr_t top_frame, uint32_t top_page_va,
+                             int argc, char *const argv[], uint32_t *out_esp)
+{
+    uint8_t *page = (uint8_t *)top_frame;
+    uint32_t off = PUREUNIX_PAGE_SIZE;
+    uint32_t str_va[ELF_MAX_ARGS];
+
+    if (argc < 0) {
+        argc = 0;
+    }
+    if (argc > ELF_MAX_ARGS) {
+        argc = ELF_MAX_ARGS;
+    }
+
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t len = strlen(argv[i]) + 1;
+        if (off < len) {
+            return -1;
+        }
+        off -= (uint32_t)len;
+        memcpy(page + off, argv[i], len);
+        str_va[i] = top_page_va + off;
+    }
+
+    off &= ~(uint32_t)3; /* align the pointer array */
+
+    uint32_t ptr_bytes = (uint32_t)(argc + 1) * 4;
+    if (off < ptr_bytes) {
+        return -1;
+    }
+    off -= ptr_bytes;
+    uint32_t argv_va = top_page_va + off;
+    uint32_t *argv_ptr = (uint32_t *)(page + off);
+    for (int i = 0; i < argc; i++) {
+        argv_ptr[i] = str_va[i];
+    }
+    argv_ptr[argc] = 0;
+
+    if (off < 8) {
+        return -1;
+    }
+    off -= 8;
+    uint32_t *frame_hdr = (uint32_t *)(page + off);
+    frame_hdr[0] = (uint32_t)argc;
+    frame_hdr[1] = argv_va;
+
+    *out_esp = top_page_va + off;
+    return 0;
+}
+
 /* Reads, validates, and loads path's PT_LOAD segments plus a fresh stack
  * into pd_phys (a page directory not necessarily currently active in CR3;
  * every write here goes through a freshly allocated frame's identity
  * mapping, never through pd_phys's own mapping — see vmm_map_page_in()).
- * On success, writes the entry point to *out_entry and returns 0; on
- * failure, returns a negative value and leaves pd_phys untouched by the
- * caller's perspective (any pages already mapped into it are the caller's
- * responsibility to free via vmm_free_user_directory()). */
-static int elf_load_into(const char *path, uint32_t pd_phys, uint32_t *out_entry)
+ * On success, writes the entry point to *out_entry, the initial ESP (argc/
+ * argv already in place at the top of the stack — see build_argv_stack())
+ * to *out_stack, and returns 0; on failure, returns a negative value and
+ * leaves pd_phys untouched by the caller's perspective (any pages already
+ * mapped into it are the caller's responsibility to free via
+ * vmm_free_user_directory()). */
+static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *const argv[],
+                          uint32_t *out_entry, uint32_t *out_stack)
 {
     /* Executing requires X_OK on the file itself — distinct from, and
      * checked in addition to, the R_OK that vfs_read_file() below enforces
@@ -140,6 +202,8 @@ static int elf_load_into(const char *path, uint32_t pd_phys, uint32_t *out_entry
     uint32_t entry = eh->e_entry;
     kfree(image);
 
+    uint32_t top_page_va = USER_WINDOW_END - PUREUNIX_PAGE_SIZE;
+    phys_addr_t top_frame = 0;
     for (uint32_t va = USER_WINDOW_END - USER_STACK_SIZE; va < USER_WINDOW_END;
          va += PUREUNIX_PAGE_SIZE) {
         phys_addr_t frame = pmm_alloc_frame();
@@ -149,13 +213,23 @@ static int elf_load_into(const char *path, uint32_t pd_phys, uint32_t *out_entry
         }
         memset((void *)frame, 0, PUREUNIX_PAGE_SIZE);
         vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
+        if (va == top_page_va) {
+            top_frame = frame;
+        }
+    }
+
+    uint32_t stack_top = USER_WINDOW_END;
+    if (build_argv_stack(top_frame, top_page_va, argc, argv, &stack_top) != 0) {
+        printf("%s: argument list too long\n", path);
+        return -1;
     }
 
     *out_entry = entry;
+    *out_stack = stack_top;
     return 0;
 }
 
-int elf_exec(const char *path)
+int elf_exec_argv(const char *path, int argc, char *const argv[])
 {
     uint32_t pd_phys = vmm_create_user_directory();
     if (!pd_phys) {
@@ -163,20 +237,26 @@ int elf_exec(const char *path)
         return -1;
     }
 
-    uint32_t entry;
-    int rc = elf_load_into(path, pd_phys, &entry);
+    uint32_t entry, stack_top;
+    int rc = elf_load_into(path, pd_phys, argc, argv, &entry, &stack_top);
     if (rc != 0) {
         vmm_free_user_directory(pd_phys);
         return rc;
     }
 
-    task_t *child = task_create_user("user", entry, USER_WINDOW_END, pd_phys);
+    task_t *child = task_create_user("user", entry, stack_top, pd_phys);
     if (!child) {
         vmm_free_user_directory(pd_phys);
         printf("%s: failed to create process\n", path);
         return -1;
     }
     return task_join(child);
+}
+
+int elf_exec(const char *path)
+{
+    char *const argv[] = { (char *)path, NULL };
+    return elf_exec_argv(path, 1, argv);
 }
 
 int elf_exec_current(interrupt_regs_t *regs, const char *path)
@@ -191,8 +271,9 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path)
         return -1;
     }
 
-    uint32_t entry;
-    int rc = elf_load_into(path, new_pd, &entry);
+    char *const argv[] = { (char *)path, NULL };
+    uint32_t entry, stack_top;
+    int rc = elf_load_into(path, new_pd, 1, argv, &entry, &stack_top);
     if (rc != 0) {
         vmm_free_user_directory(new_pd);
         return rc;
@@ -201,7 +282,7 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path)
     uint32_t old_pd = t->pd_phys;
     t->pd_phys = new_pd;
     t->user_entry = entry;
-    t->user_stack = USER_WINDOW_END;
+    t->user_stack = stack_top;
     vmm_switch_directory(new_pd);
     if (old_pd != vmm_kernel_directory_phys()) {
         vmm_free_user_directory(old_pd);
@@ -211,6 +292,6 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path)
      * these fields — redirect it into the freshly loaded program instead
      * of resuming the one just replaced. */
     regs->eip = entry;
-    regs->useresp = USER_WINDOW_END;
+    regs->useresp = stack_top;
     return 0;
 }

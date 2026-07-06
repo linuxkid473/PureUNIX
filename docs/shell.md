@@ -126,10 +126,12 @@ The two stage buffers alternate (`stage_a`, `stage_b`, `stage_a`, ...) so that n
 3. Otherwise, calls `exec_external`.
 
 `exec_external`:
-- If `argv[0]` contains `/`, resolves it against `cwd` via `vfs_normalize` and calls `elf_exec`.
+- If `argv[0]` contains `/`, resolves it against `cwd` via `vfs_normalize` and calls `elf_exec_argv(path, cmd->argc, cmd->argv)`.
 - Special case: `calculator` maps to `/bin/calc.elf`.
 - Otherwise, tries `/bin/NAME.elf`, then `/bin/NAME`.
 - If none found, prints "command not found".
+
+Every case passes the shell's own already-parsed `cmd->argc`/`cmd->argv` straight through, so the program's `main(int argc, char *argv[])` sees the real command line (see `docs/userland.md`'s "Passing argv").
 
 ---
 
@@ -209,9 +211,11 @@ All output is written via `shell_out_printf`/`shell_out_puts`, which routes to t
 | `help` | List all built-ins with descriptions |
 | `env` | Print all environment variables |
 | `export KEY=VALUE` | Set or create environment variable |
-| `vim FILE` / `vi FILE` | Open file in the vim-like editor |
+| `vim FILE` / `vi FILE` | Open file in PureUNIX's own small in-kernel modal editor (`editor/editor.c`) |
 | `adduser NAME` | Create a new account (root only); see docs/users.md |
 | `passwd [NAME]` | Change a password (root can change any user's, others only their own) |
+
+Not a builtin — an ordinary `/bin/neatvi.elf` external program, found the same way any other program is (see "Command Resolution" below): `neatvi [FILE]`, a vendored port of [Neatvi](https://github.com/aligrudi/neatvi) (see `docs/userland.md`'s "user/vi/ (neatvi)"). Deliberately a separate command from `vi`/`vim` above rather than replacing them, so both editors stay available.
 
 ### `date` Implementation
 

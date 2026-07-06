@@ -65,6 +65,10 @@ The task's first switch-in runs `enter_usermode()` (`arch/i386/usermode.S`), whi
 .section .text
 .global _start
 _start:
+    movl (%esp), %eax   /* argc, placed by kernel/elf.c's build_argv_stack() */
+    movl 4(%esp), %edx  /* argv */
+    pushl %edx
+    pushl %eax
     call main
     movl %eax, %ebx
     int $0x81
@@ -72,7 +76,11 @@ _start:
     jmp .Lhang
 ```
 
-`_start` is the ELF entry point. It calls `main`, then traps to `int $0x81` with the return value in `EBX`. This is **not** the public `SYS_*` syscall gate (`int $0x80`) — it is a separate, kernel-internal vector (`isr129`, wired up in `arch/i386/idt.c`) whose handler calls `task_exit(ebx)`. `task_exit()` never returns to the dying task; it context-switches to whichever task is blocked on it in `task_join()` (normally `elf_exec`'s caller). `.Lhang` is an unreachable safety net.
+`_start` is the ELF entry point. `kernel/elf.c`'s `elf_load_into()` builds a POSIX-shaped `argc`/`argv` frame at the top of every new process's stack before it ever runs (see `build_argv_stack()`), so `[esp]`/`[esp+4]` at `_start` are always valid — `_start` just re-pushes them in cdecl order before calling `main`. Programs declared `main(void)` (most of `user/*.c`) simply ignore the two extra stack slots, exactly like a real libc crt0 handles a program that doesn't care about its arguments. `main` then traps to `int $0x81` with the return value in `EBX`. This is **not** the public `SYS_*` syscall gate (`int $0x80`) — it is a separate, kernel-internal vector (`isr129`, wired up in `arch/i386/idt.c`) whose handler calls `task_exit(ebx)`. `task_exit()` never returns to the dying task; it context-switches to whichever task is blocked on it in `task_join()` (normally `elf_exec`'s caller). `.Lhang` is an unreachable safety net.
+
+### Passing argv
+
+`elf_exec_argv(path, argc, argv)` (the argv-aware sibling of `elf_exec(path)`, which just calls it with `argc=1, argv={path, NULL}`) is what the shell (`shell/sh.c`'s `exec_external`) calls with its own already-parsed `cmd->argc`/`cmd->argv`, so a program invoked as `neatvi /test.txt` really does see `argv[1] == "/test.txt"` — there is no `pipe()`/`dup()`/PATH search (see `user/vi/cmd.c`'s header comment for what that rules out), but plain argv passing now works end to end. Before this existed, every program had to declare `main(void)`; a `main(int argc, char *argv[])` would have read uninitialized register/stack garbage as `argc`/`argv` and almost certainly crashed on the first `argv[0]` dereference — exactly what happened when `user/vi/vi.c` (see below) was first ported.
 
 **Note**: `SYS_EXIT` (syscall 1, reachable via `int $0x80`) is a different thing entirely and still does not terminate the task — it is a documented pass-through that just echoes `EBX` back (see `docs/syscalls.md` and the "SYS_EXIT does not terminate the caller" checks in `user/systest.c`). Actual process termination only happens through the `int $0x81` trap above, which user code never issues directly — only `crt0` does, after `main` returns.
 
@@ -198,6 +206,17 @@ Demo. Demonstrates `pu_puti`. Uses hardcoded values (prints `12 * 12 = 144`, `14
 ### viewer.c / sh.c / editor.c
 
 Stubs. Print "not yet implemented" messages. The actual shell and editor run as kernel builtins (`vim FILE`, `sh` launches the in-kernel shell, etc.).
+
+### user/vi/ (neatvi)
+
+A vendored, close-to-unmodified port of [Neatvi](https://github.com/aligrudi/neatvi), Ali Gholami Rudi's small vi/ex clone — built as `/bin/neatvi.elf` and reachable from the shell as `neatvi FILE` (deliberately a separate command from the `vi`/`vim` builtins, which still open PureUNIX's own in-kernel modal editor — see `docs/shell.md`). Unlike every other program under `user/`, it's ~20 `.c` files rather than one, so it gets its own object/link rules in the Makefile (`VI_SRCS`/`VI_OBJS`/`VI_CFLAGS`, next to the single-file `%.o`/`%.elf` pattern rules) rather than an entry in `USER_PROGRAMS`.
+
+Upstream Neatvi assumes a POSIX host (`malloc`, `open`/`read`/`write`, a real `<termios.h>`, `fork`+`pipe`+`execvp` for `:!cmd`). `user/vi/compat/` supplies POSIX-named headers (`stdio.h`, `stdlib.h`, `string.h`, `unistd.h`, `fcntl.h`, `ctype.h`, `signal.h`, `sys/stat.h`, `termios.h`) backed by `user/vi/compat.c`'s implementations (a first-fit `malloc`/`free` over a static 1 MiB arena, `open`/`read`/`write`/... as thin wrappers over `libpure.h`'s `pu_*` syscalls, a fuller `vsnprintf` than the kernel's own since Neatvi uses width/zero-padding it doesn't support, and `tcgetattr`/`tcsetattr` wrappers over `pu_tcgetattr`/`pu_tcsetattr`). `user/vi/term.c` and `user/vi/cmd.c` are the two files with real platform-specific logic (everything else — `vi.c`, `ex.c`, `lbuf.c`, `regex.c`, the Unicode/`uc.c` layer, syntax highlighting, ...  — is unmodified upstream source):
+
+- **`term.c`**: puts the console in raw mode (`ICANON`/`ECHO`/`ISIG` cleared via `tcsetattr`) on `term_init()` and restores it on `term_done()`, exactly like a real vi over a real tty — necessary because PureUNIX's console defaults to canonical+echo (see `drivers/tty.c`), which without this both echoes every keystroke into the screen redraw and delivers input a line at a time instead of a key at a time. Rows/cols are hardcoded to 25×80 (no `ioctl(TIOCGWINSZ)`); `term_suspend()` is a no-op (no job control).
+- **`cmd.c`**: `:!cmd`, `!motion`, `:r !cmd`, and `:make` all shell out via `fork()`+`pipe()`+`execvp()` upstream. PureUNIX has none of those (`pu_exec()` replaces the caller with a single path and no argv, no PATH search), so every function here is a stub that reports failure — every call site in `ex.c`/`vi.c` already handles that gracefully (same as a real Neatvi would if `execvp()` itself failed), so this is the one Neatvi feature area PureUNIX doesn't support.
+
+See [Passing argv](#passing-argv) above for the other missing piece this port needed: without it, `vi.c`'s `main(int argc, char *argv[])` read garbage and paged-faulted the kernel on the very first `argv[0]` dereference.
 
 ### opentest.c
 

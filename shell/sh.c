@@ -56,24 +56,24 @@ static int exec_external(shell_context_t *ctx, shell_command_t *cmd, shell_outpu
             shell_out_printf(out, "%s: command not found\n", cmd->argv[0]);
             return -1;
         }
-        return elf_exec(path);
+        return elf_exec_argv(path, cmd->argc, cmd->argv);
     }
 
     if (strcmp(cmd->argv[0], "calculator") == 0) {
         snprintf(path, sizeof(path), "/bin/calc.elf");
         vfs_stat_t st;
         if (vfs_stat(path, &st) == 0) {
-            return elf_exec(path);
+            return elf_exec_argv(path, cmd->argc, cmd->argv);
         }
     }
 
     snprintf(path, sizeof(path), "/bin/%s.elf", cmd->argv[0]);
     vfs_stat_t st;
-    if (vfs_stat(path, &st) == 0 && elf_exec(path) == 0) {
+    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv) == 0) {
         return 0;
     }
     snprintf(path, sizeof(path), "/bin/%s", cmd->argv[0]);
-    if (vfs_stat(path, &st) == 0 && elf_exec(path) == 0) {
+    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv) == 0) {
         return 0;
     }
     shell_out_printf(out, "%s: command not found\n", cmd->argv[0]);

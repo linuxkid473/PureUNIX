@@ -67,18 +67,22 @@ The INT 0x80 gate is already installed with DPL=3; no IDT changes are required f
 ## Adding a User Program
 
 1. Create `user/<name>.c`. Include `user/libpure.h` for the runtime library.
-2. Write a `main(void)` function returning `int`.
+2. Write a `main(void)` function returning `int` — or `main(int argc, char *argv[])` if the program needs its arguments; both work (see "argv" below).
 3. Add the program name to `USER_PROGRAMS` in `Makefile`:
    ```makefile
    USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test <name>
    ```
 4. `make` will compile, link, and include it in the FAT16 image under `/BIN/<NAME>.ELF`.
 
+**Multi-file programs**: if a program is more than one `.c` file (see `user/vi/`, Neatvi's vendored ~20-file source), the single-file `%.o`/`%.elf` pattern rules above don't apply — add its own `VI_SRCS`/`VI_OBJS`-style object list and an explicit `$(BUILD)/user/<name>.elf` link rule instead (an explicit rule takes precedence over the generic pattern rule for that one target). See the Makefile's "Neatvi" section for the full pattern.
+
+**argv**: `user/crt0.S`'s `_start` re-pushes the `argc`/`argv` that `kernel/elf.c`'s `elf_load_into()` places on every new process's initial stack, so `main(int argc, char *argv[])` sees real values — `argv[0]` is the invoked name, `argv[1..]` whatever the shell (or another caller of `elf_exec_argv`) passed after it. `elf_exec(path)` (used by callers that don't have real args to pass) is just `elf_exec_argv(path, 1, {path, NULL})`.
+
 **Constraints**:
-- No standard library. Only `libpure` functions are available.
-- Programs run in kernel address space with no memory protection.
-- File I/O: `pu_open` (EXT2 or FAT16), `pu_read`, `pu_lseek`, `pu_close`, `pu_stat` all work. Writing to an open fd via syscall is not implemented.
-- Stack is the kernel boot stack; deep recursion may corrupt kernel data.
+- No standard library. Only `libpure` functions are available (unless the program opts into newlib — see `docs/userland.md`'s "A real C library (newlib)").
+- Programs run in ring 3, each in its own address space (see `docs/userland.md`); there is no isolation *between* the code/data of concurrently-loaded programs beyond that.
+- File I/O: `pu_open` (EXT2 or FAT16), `pu_read`, `pu_write`, `pu_lseek`, `pu_close`, `pu_stat` all work.
+- No PATH search, no `pipe()`/`dup()`; `pu_exec()` replaces the caller with a single path and no argv of its own (see `user/vi/cmd.c` for what that rules out for a shelled-out `:!cmd`-style program).
 
 ---
 

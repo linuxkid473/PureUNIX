@@ -5,13 +5,16 @@
  * term_seqattr/term_seqkill/term_push/term_cmd/term_commit — is copied
  * byte-for-byte from upstream: it only ever calls write()/sbuf_*()/sprintf(),
  * all of which the compat/ shim backs. Only four functions differ from
- * upstream, and only because PureUNIX has no termios/tty layer:
+ * upstream:
  *
- *   - term_init/term_done: no tcgetattr/tcsetattr raw-mode dance (PureUNIX's
- *     keyboard driver already delivers unbuffered, unechoed keypresses —
- *     see drivers/keyboard.c's keyboard_getkey(), which SYS_READ on fd 0
- *     calls directly), and no ioctl(TIOCGWINSZ)/$LINES/$COLUMNS sizing —
- *     rows/cols are hardcoded to PureUNIX's actual VGA text mode, 25x80.
+ *   - term_init/term_done: real tcgetattr/tcsetattr raw-mode dance, same as
+ *     upstream, backed by PureUNIX's own termios (drivers/tty.c) rather
+ *     than a real tty driver — the console defaults to canonical+echo (see
+ *     tty.c's termios_set_defaults()), which both garbles the screen (every
+ *     keystroke echoed back) and delivers input a line at a time instead of
+ *     a key at a time, so this is not optional. No ioctl(TIOCGWINSZ)/$LINES/
+ *     $COLUMNS sizing though — rows/cols are hardcoded to PureUNIX's actual
+ *     VGA text mode, 25x80.
  *   - term_suspend: no-op (no job control / SIGSTOP on PureUNIX).
  *   - term_read: no poll() before the blocking read — PureUNIX's read(0,...)
  *     already blocks (via keyboard_getkey()'s arch_halt() loop) until a key
@@ -21,15 +24,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
 #include "vi.h"
 
 static struct sbuf *term_sbuf;	/* output buffer if not NULL */
 static int rows, cols;		/* number of terminal rows and columns */
 static int win_top, win_rows;	/* active window rows */
 static int win_left, win_cols;	/* active window columns */
+static struct termios term_orig;	/* console mode before term_init() */
 
 void term_init(void)
 {
+	struct termios raw;
+	tcgetattr(0, &term_orig);
+	raw = term_orig;
+	raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+	raw.c_cc[VMIN] = 1;
+	raw.c_cc[VTIME] = 0;
+	tcsetattr(0, TCSANOW, &raw);
+
 	term_sbuf = sbuf_make();
 	rows = 25;
 	cols = 80;
@@ -60,6 +73,7 @@ void term_done(void)
 	term_commit();
 	sbuf_free(term_sbuf);
 	term_sbuf = NULL;
+	tcsetattr(0, TCSANOW, &term_orig);
 }
 
 void term_suspend(void)

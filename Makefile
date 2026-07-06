@@ -37,6 +37,29 @@ DEPS := $(KERNEL_OBJS:.o=.d)
 USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test systest termiostest
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
+# Neatvi (vi/ex clone, vendored under user/vi/ — see user/vi/vi.h's header
+# comment): many .c files compiled into one program, so it needs its own
+# object/link rules rather than the single-file %.o/%.elf pattern above.
+# user/vi/compat/ supplies the POSIX headers upstream Neatvi expects.
+# Named "neatvi" rather than "vi" so it doesn't collide with the shell's
+# existing `vi`/`vim` builtins (editor/editor.c, PureUNIX's own small
+# in-kernel modal editor) — both are available side by side.
+VI_SRCS := $(sort $(wildcard user/vi/*.c))
+VI_OBJS := $(patsubst user/vi/%.c,$(BUILD)/user/vi/%.o,$(VI_SRCS))
+VI_CFLAGS := $(USER_CFLAGS) -Iuser/vi/compat -Iuser/vi -Iuser
+
+$(BUILD)/user/vi/%.o: user/vi/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(VI_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/neatvi.elf: $(VI_OBJS) $(BUILD)/user/crt0.o $(BUILD)/user/libpure.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(USER_LDFLAGS) $(BUILD)/user/crt0.o $(BUILD)/user/libpure.o $(VI_OBJS) -lgcc -o $@
+
+USER_PROGRAMS += neatvi
+USER_ELFS += $(BUILD)/user/neatvi.elf
+DEPS += $(VI_OBJS:.o=.d)
+
 NEWLIB_PROGRAMS := libctest
 NEWLIB_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(NEWLIB_PROGRAMS)))
 
