@@ -7,10 +7,10 @@
 
 ### Responsibilities
 
-- Manages the 80×25 VGA text mode framebuffer at `0xB8000`.
+- Manages the 80×25 text grid, backed by either the legacy VGA text mode framebuffer at `0xB8000`, or — when GRUB/multiboot2 granted a usable linear framebuffer (`drivers/framebuffer.c`) at least as big as the grid — a software text renderer that draws each cell as a glyph bitmap onto that framebuffer instead (`use_fb`; see `vga_init()`). `cell_char[][]`/`cell_attr[][]` hold the grid's true contents either way, so both backends can be driven by the exact same escape-sequence parser below.
 - Interprets a subset of ANSI/VT100 escape sequences for color and cursor control.
-- Synchronizes all output to the serial port (every character written to VGA is also sent to COM1).
-- Provides the hardware cursor position via CRTC registers.
+- Synchronizes all output to the serial port (every character written to VGA is also sent to COM1) — since `serial_putc()` is called unconditionally before any escape-sequence interpretation, the serial mirror reflects the raw byte stream regardless of whether this driver's own parsing of it is complete or correct.
+- Provides the hardware cursor position via CRTC registers in text mode, or a software-drawn inverted-cell overlay in framebuffer mode.
 
 ### Initialization
 
@@ -33,14 +33,19 @@ Every character is also forwarded to `serial_putc(c)`.
 
 ### ANSI Escape Sequences
 
-The parser is a two-state machine: state 1 (saw `\033`), state 2 (saw `[`, accumulating parameters). The following CSI sequences are handled:
+The parser is a two-state machine: state 1 (saw `\033`), state 2 (saw `[`, accumulating parameters). `ansi_params()` parses up to 4 `;`-separated decimal parameters out of the accumulated buffer (an empty/omitted parameter defaults to 0) before `ansi_execute()` dispatches on the final byte:
 
 | Sequence | Action |
 |---|---|
 | `\033[...m` | SGR: set foreground/background color |
 | `\033[2J` | Clear screen (`vga_clear`) |
-| `\033[K` | Erase to end of line (`erase_current_line`) |
-| `\033[H` | Move cursor to (0, 0) |
+| `\033[K` | Erase from the cursor to end of line (`erase_current_line`) |
+| `\033[row;colH` / `\033[...f` | Move cursor to `(row-1, col-1)`, 1-indexed like real ANSI CUP; a bare `\033[H` homes to `(0,0)` |
+| `\033[colG` | Move cursor to column `col-1` on the current row (CHA) |
+| `\033[top;botr` | DECSTBM: confine scrolling to `[top-1, bot-1]` (0-indexed, inclusive); a bare `\033[r` resets it to the whole screen. Homes the cursor, matching real terminals. |
+| `\033[nL` / `\033[nM` | VT100 IL/DL: insert/delete `n` blank lines at the cursor row, shifting the rest of the scroll region down/up (`insert_lines()`/`delete_lines()`) |
+
+This is the actual set Neatvi (`user/vi/term.c`, vendored under `user/vi/` — see `docs/userland.md`) needs for full-screen redraws: it positions with `H`/`G`, confines scrolling to everything above its status line with `r`, and uses `K` to blank leftover trailing characters after writing each line's real content.
 
 SGR color mapping:
 
@@ -51,11 +56,15 @@ SGR color mapping:
 | `90–97` | Set foreground to VGA bright color 8–15 |
 | `40–47` | Set background to VGA color 0–7 |
 
+The 8 basic ANSI color numbers (black/red/green/yellow/blue/magenta/cyan/white) count in a different order than the VGA/CGA palette this driver indexes (black/blue/green/cyan/red/magenta/brown/white) — `ansi_to_vga[]` remaps one to the other before indexing `vga_rgb_palette[]`, so e.g. ANSI "34" (blue) actually renders as VGA color 1 (blue), not VGA color 4 (red).
+
 Multiple parameters separated by `;` are processed left to right.
 
 ### Scrolling
 
-When `row >= VGA_HEIGHT` (25), `scroll()` copies rows 1–24 to rows 0–23, clears row 24 with the current color, and sets `row = 24`.
+`scroll_top`/`scroll_bottom` (0-indexed, inclusive; reset to the whole screen by `vga_init()`/`vga_clear()`, and set by DECSTBM above) bound where `newline()`/`scroll()` are allowed to shift content: when the cursor is at `scroll_bottom` and a `\n` (or column-wrap) occurs, `scroll()` shifts `[scroll_top, scroll_bottom]` up by one row and blanks the newly exposed bottom row of *that region only* — rows outside it (e.g. a fixed status line below `scroll_bottom`) are left untouched. With the default full-screen region this reproduces the old unconditional "shift rows 1–24 into 0–23" behavior exactly.
+
+Without this, a program that reserves the last line as a status bar (again, Neatvi) would have that line scroll away with the rest of the buffer on every line feed.
 
 ### Cursor Control Functions
 
@@ -86,7 +95,7 @@ The VGA attribute byte is `fg | (bg << 4)`.
 ### Limitations
 
 - Tab stop is hard-coded to 4 columns.
-- No full ANSI cursor positioning sequence (`\033[row;colH` is handled only in the form `\033[H` for home).
+- No 256-color (`\033[38;5;Nm`/`\033[48;5;Nm`) or truecolor SGR support — only the 16 basic/bright ANSI color numbers.
 - No double-width or double-height characters.
 - No blinking cursor support.
 

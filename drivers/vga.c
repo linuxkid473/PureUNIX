@@ -28,6 +28,14 @@ static uint8_t color;
 static int esc_state;
 static char esc_buf[16];
 static size_t esc_len;
+/* DECSTBM scroll region, 0-indexed and inclusive on both ends. Neatvi (see
+ * user/vi/term.c's term_window()) keeps the bottom line as a fixed status
+ * bar by confining the scrolling area to everything above it — newline()/
+ * scroll() must only ever shift rows in [scroll_top, scroll_bottom], never
+ * the whole 25-row screen, or that status line would scroll away with the
+ * rest of the buffer on every line feed. */
+static int scroll_top;
+static int scroll_bottom;
 
 /* Tracks where the software cursor overlay is currently drawn on the
  * framebuffer, so it can be erased (by redrawing the true cell contents)
@@ -109,55 +117,145 @@ static void update_cursor(void)
     outb(0x3D5, (pos >> 8) & 0xFF);
 }
 
+/* Shifts [scroll_top, scroll_bottom] up by one line, blanking the newly
+ * exposed bottom line of the region. Rows outside the region (e.g. a fixed
+ * status line below scroll_bottom) are left untouched. With the default
+ * full-screen region (0, VGA_HEIGHT-1) this reproduces the previous
+ * whole-screen-scroll behavior exactly. */
 static void scroll(void)
 {
-    if (row < VGA_HEIGHT) {
+    int top = scroll_top;
+    int bot = scroll_bottom;
+    if (bot <= top) {
         return;
     }
-    memmove(cell_char[0], cell_char[1], (VGA_HEIGHT - 1) * VGA_WIDTH);
-    memmove(cell_attr[0], cell_attr[1], (VGA_HEIGHT - 1) * VGA_WIDTH);
+    memmove(cell_char[top], cell_char[top + 1], (size_t)(bot - top) * VGA_WIDTH);
+    memmove(cell_attr[top], cell_attr[top + 1], (size_t)(bot - top) * VGA_WIDTH);
     for (size_t x = 0; x < VGA_WIDTH; ++x) {
-        cell_char[VGA_HEIGHT - 1][x] = ' ';
-        cell_attr[VGA_HEIGHT - 1][x] = color;
+        cell_char[bot][x] = ' ';
+        cell_attr[bot][x] = color;
     }
     if (use_fb) {
-        fb_scroll_up(origin_x, origin_y, VGA_WIDTH * FONT_CELL_W, VGA_HEIGHT * FONT_CELL_H,
+        fb_scroll_up(origin_x, origin_y + (uint32_t)top * FONT_CELL_H,
+                     VGA_WIDTH * FONT_CELL_W, (uint32_t)(bot - top + 1) * FONT_CELL_H,
                      FONT_CELL_H, vga_rgb_palette[(color >> 4) & 0xF]);
-        if (cursor_valid) {
-            if (cur_row == 0) {
+        if (cursor_valid && (int)cur_row >= top && (int)cur_row <= bot) {
+            if ((int)cur_row == top) {
                 cursor_valid = false;
             } else {
                 cur_row--;
             }
         }
     } else {
-        for (size_t y = 1; y < VGA_HEIGHT; ++y) {
+        for (int y = top + 1; y <= bot; ++y) {
             for (size_t x = 0; x < VGA_WIDTH; ++x) {
-                vga_memory[(y - 1) * VGA_WIDTH + x] = vga_memory[y * VGA_WIDTH + x];
+                vga_memory[(size_t)(y - 1) * VGA_WIDTH + x] = vga_memory[(size_t)y * VGA_WIDTH + x];
             }
         }
         for (size_t x = 0; x < VGA_WIDTH; ++x) {
-            vga_memory[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = vga_entry(' ', color);
+            vga_memory[(size_t)bot * VGA_WIDTH + x] = vga_entry(' ', color);
         }
     }
-    row = VGA_HEIGHT - 1;
+}
+
+/* Inserts/deletes |n| blank lines at the cursor row, shifting the rest of
+ * the scroll region down/up (VT100 IL/DL — CSI n L / CSI n M) — used by
+ * term_room() in user/vi/term.c during partial-screen scroll redraws.
+ * Implemented as a full redraw of the affected rows via set_cell() rather
+ * than scroll()'s memmove+fb_scroll_up fast path, since it's not the hot
+ * path and works identically for both the text-mode and framebuffer
+ * backends without a "scroll down" primitive. */
+static void insert_lines(int n)
+{
+    int top = (int)row;
+    int bot = scroll_bottom;
+    if (top > bot || n <= 0) {
+        return;
+    }
+    if (n > bot - top + 1) {
+        n = bot - top + 1;
+    }
+    for (int y = bot; y >= top + n; --y) {
+        memcpy(cell_char[y], cell_char[y - n], VGA_WIDTH);
+        memcpy(cell_attr[y], cell_attr[y - n], VGA_WIDTH);
+    }
+    for (int y = top; y < top + n; ++y) {
+        for (size_t x = 0; x < VGA_WIDTH; ++x) {
+            cell_char[y][x] = ' ';
+            cell_attr[y][x] = color;
+        }
+    }
+    for (int y = top; y <= bot; ++y) {
+        for (size_t x = 0; x < VGA_WIDTH; ++x) {
+            set_cell((size_t)y, x, cell_char[y][x], cell_attr[y][x]);
+        }
+    }
+}
+
+static void delete_lines(int n)
+{
+    int top = (int)row;
+    int bot = scroll_bottom;
+    if (top > bot || n <= 0) {
+        return;
+    }
+    if (n > bot - top + 1) {
+        n = bot - top + 1;
+    }
+    for (int y = top; y <= bot - n; ++y) {
+        memcpy(cell_char[y], cell_char[y + n], VGA_WIDTH);
+        memcpy(cell_attr[y], cell_attr[y + n], VGA_WIDTH);
+    }
+    for (int y = bot - n + 1; y <= bot; ++y) {
+        for (size_t x = 0; x < VGA_WIDTH; ++x) {
+            cell_char[y][x] = ' ';
+            cell_attr[y][x] = color;
+        }
+    }
+    for (int y = top; y <= bot; ++y) {
+        for (size_t x = 0; x < VGA_WIDTH; ++x) {
+            set_cell((size_t)y, x, cell_char[y][x], cell_attr[y][x]);
+        }
+    }
 }
 
 static void newline(void)
 {
     col = 0;
-    row++;
-    scroll();
+    if ((int)row == scroll_bottom) {
+        scroll();
+    } else if (row + 1 < VGA_HEIGHT) {
+        row++;
+    }
 }
 
+/* CSI K (EL, "Erase in Line") with no parameter — real ANSI's default
+ * parameter 0 means "erase from the cursor to the end of the line", not
+ * the whole line: this used to start from column 0 and reset col to 0
+ * unconditionally, silently wiping out whatever had just been written
+ * earlier on the same line before the cursor's current position. Neatvi's
+ * redraw pattern (see user/vi/term.c) is exactly "position, write the
+ * line's real content, then \33[K to blank any leftover trailing chars
+ * from a previously-longer line at that row" — with the old whole-line
+ * erase, that \33[K deleted the content it had just drawn, on every row,
+ * every redraw. Matches vga_erase_eol() below, which already had this
+ * right; cursor position is left unchanged, matching real EL0. */
 static void erase_current_line(void)
 {
     serial_erase_line();
-    for (size_t x = 0; x < VGA_WIDTH; ++x) {
+    for (size_t x = col; x < VGA_WIDTH; ++x) {
         set_cell(row, x, ' ', color);
     }
-    col = 0;
 }
+
+/* ANSI SGR color numbers (black,red,green,yellow,blue,magenta,cyan,white,
+ * i.e. 30-37/90-97/40-47) count in a different order than the VGA/CGA
+ * palette this driver indexes directly (vga_rgb_palette[] above: black,
+ * blue,green,cyan,red,magenta,brown,grey) — red and blue are swapped, and
+ * so are yellow and cyan. Neatvi's term_seqattr() (user/vi/term.c) emits
+ * plain ANSI numbers, so without this table its blue ("34") rendered as
+ * VGA index 4 (red) and its red ("31") rendered as VGA index 1 (blue). */
+static const uint8_t ansi_to_vga[8] = {0, 4, 2, 6, 1, 5, 3, 7};
 
 static void ansi_sgr(const char *seq)
 {
@@ -174,11 +272,11 @@ static void ansi_sgr(const char *seq)
             if (!have_value || value == 0) {
                 color = make_color(VGA_LIGHT_GREY, VGA_BLACK);
             } else if (value >= 30 && value <= 37) {
-                color = make_color((uint8_t)(value - 30), color >> 4);
+                color = make_color(ansi_to_vga[value - 30], color >> 4);
             } else if (value >= 90 && value <= 97) {
-                color = make_color((uint8_t)(value - 90 + 8), color >> 4);
+                color = make_color((uint8_t)(ansi_to_vga[value - 90] + 8), color >> 4);
             } else if (value >= 40 && value <= 47) {
-                color = make_color(color & 0x0F, (uint8_t)(value - 40));
+                color = make_color(color & 0x0F, ansi_to_vga[value - 40]);
             }
             value = 0;
             have_value = false;
@@ -189,22 +287,96 @@ static void ansi_sgr(const char *seq)
     }
 }
 
+/* Parses up to `max` semicolon-separated decimal parameters from seq[0..n),
+ * defaulting an empty/omitted parameter to 0 (the caller decides what that
+ * means — usually "1" for a 1-indexed position, or "act as if absent"). */
+static int ansi_params(const char *seq, size_t n, int *out, int max)
+{
+    int count = 0;
+    int val = 0;
+    bool have = false;
+    for (size_t i = 0; i <= n; ++i) {
+        char c = i < n ? seq[i] : ';';
+        if (c >= '0' && c <= '9') {
+            val = val * 10 + (c - '0');
+            have = true;
+        } else if (c == ';') {
+            if (count < max) {
+                out[count++] = have ? val : 0;
+            }
+            val = 0;
+            have = false;
+        }
+    }
+    return count;
+}
+
 static void ansi_execute(void)
 {
     esc_buf[esc_len] = '\0';
     char final = esc_len ? esc_buf[esc_len - 1] : '\0';
-    if (final == 'm') {
+    int params[4];
+    int n = ansi_params(esc_buf, esc_len > 0 ? esc_len - 1 : 0, params, 4);
+
+    switch (final) {
+    case 'm':
         ansi_sgr(esc_buf);
-    } else if (final == 'J') {
+        break;
+    case 'J':
         vga_clear();
-    } else if (final == 'K') {
+        break;
+    case 'K':
         erase_current_line();
-    } else if (final == 'H') {
+        break;
+    case 'H':
+    case 'f': {
+        /* CUP: 1-indexed row;col, both defaulting to 1 (i.e. row/col 0). */
+        int r = (n > 0 && params[0] > 0) ? params[0] - 1 : 0;
+        int c = (n > 1 && params[1] > 0) ? params[1] - 1 : 0;
+        row = (size_t)(r >= VGA_HEIGHT ? VGA_HEIGHT - 1 : r);
+        col = (size_t)(c >= VGA_WIDTH ? VGA_WIDTH - 1 : c);
+        break;
+    }
+    case 'G': {
+        /* CHA: 1-indexed column only, same row. */
+        int c = (n > 0 && params[0] > 0) ? params[0] - 1 : 0;
+        col = (size_t)(c >= VGA_WIDTH ? VGA_WIDTH - 1 : c);
+        break;
+    }
+    case 'r': {
+        /* DECSTBM: 1-indexed top;bottom, or reset to the full screen when
+         * either parameter is missing/zero (also how a bare "\33[r" — no
+         * parameters at all — parses: n == 1, params[0] == 0). */
+        if (n >= 2 && params[0] > 0 && params[1] > 0) {
+            scroll_top = params[0] - 1;
+            scroll_bottom = params[1] - 1;
+            if (scroll_bottom >= VGA_HEIGHT) {
+                scroll_bottom = VGA_HEIGHT - 1;
+            }
+            if (scroll_top > scroll_bottom) {
+                scroll_top = scroll_bottom;
+            }
+        } else {
+            scroll_top = 0;
+            scroll_bottom = VGA_HEIGHT - 1;
+        }
+        /* Real terminals home the cursor after changing the scroll region. */
         row = 0;
         col = 0;
+        break;
+    }
+    case 'L':
+        insert_lines((n > 0 && params[0] > 0) ? params[0] : 1);
+        break;
+    case 'M':
+        delete_lines((n > 0 && params[0] > 0) ? params[0] : 1);
+        break;
+    default:
+        break;
     }
     esc_state = 0;
     esc_len = 0;
+    update_cursor();
 }
 
 void vga_init(void)
@@ -225,6 +397,8 @@ void vga_init(void)
     col = 0;
     esc_state = 0;
     esc_len = 0;
+    scroll_top = 0;
+    scroll_bottom = VGA_HEIGHT - 1;
     cursor_valid = false;
     vga_clear();
 }
@@ -241,6 +415,8 @@ void vga_clear(void)
     col = 0;
     esc_state = 0;
     esc_len = 0;
+    scroll_top = 0;
+    scroll_bottom = VGA_HEIGHT - 1;
     cursor_valid = false;
     update_cursor();
 }
