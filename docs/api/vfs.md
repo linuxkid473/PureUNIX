@@ -284,14 +284,14 @@ The single reusable permission check; every read/write/traverse/execute gate in 
 - **uid 0 (root)**: read and write are always granted. Execute is granted only if `st_mode` has at least one of `S_IXUSR`/`S_IXGRP`/`S_IXOTH` set — traditional Unix behaviour (root can't execute a file nobody can execute).
 - **Non-root**: owner bits apply if `st->st_uid == uid`; otherwise group bits apply if `st->st_gid == gid`; otherwise other bits apply. These are mutually exclusive tiers, not combined — matching the file's owner means *only* the owner bits are consulted, even if group/other would have been more permissive.
 
-### `vfs_chmod` / `vfs_chown` — syscall infrastructure only
+### `vfs_chmod` / `vfs_chown`
 
 ```c
 int vfs_chmod(const char *path, mode_t mode);
 int vfs_chown(const char *path, uid_t uid, gid_t gid);
 ```
 
-Resolve the path and confirm it exists (`-ENOENT` if not), then call the mount's `ops->chmod`/`ops->chown`. Both are `NULL` on every driver today — Stage 4 made EXT2 writable for file/directory/link content, but neither it nor FAT16 stores mutable ownership/permission bits on disk — so every existing path currently gets `-EROFS`. No actual chmod/chown behaviour exists yet — this is scaffolding so a future on-disk permission format can plug in without any VFS-level API change.
+Resolve the path and confirm it exists (`-ENOENT` if not). If the mount's `ops->chmod`/`ops->chown` is `NULL` (FAT16 — no on-disk Unix ownership/permission bits exist there at all), returns `-EROFS`. Otherwise runs the traditional Unix permission rule directly (`current_uid()`, same pattern as `vfs_access()`'s callers): `chmod` requires being the file's owner or root (`-EPERM` otherwise); `chown` requires being root outright — PureUNIX's one-uid/one-gid-per-task model has no supplementary-group concept that would let a non-root owner hand a file to a group they belong to, so unlike a real Unix, a non-root caller can never successfully `chown` *any* file, even one they own. Only then does it call through to the filesystem's own `ops->chmod`/`ops->chown`. EXT2 (`fs/ext2/mount.c`'s `ext2_chmod()`/`ext2_chown()`) mutates the target inode's `i_mode`/`i_uid`/`i_gid` in place and persists it to disk; `chmod` preserves the inode's file-type bits regardless of what's passed, and `chown`'s uid/gid accept `(uid_t)-1`/`(gid_t)-1` to mean "leave this one unchanged" (POSIX `chown(2)`'s convention).
 
 ### What is *not* here yet
 

@@ -4,6 +4,7 @@
 /* Positive error codes; negate when returning from syscalls. */
 #define EPERM    1   /* operation not permitted */
 #define ENOENT   2   /* no such file or directory */
+#define ESRCH    3   /* no such process (SYS_KILL on a nonexistent pid) */
 #define EINTR    4   /* interrupted (VINTR fired mid-read; see drivers/tty.c) */
 #define EIO      5   /* I/O error */
 #define EBADF    9   /* bad file descriptor */
@@ -21,5 +22,7 @@
 #define ENOTEMPTY 39 /* directory not empty */
 #define ELOOP    40  /* too many symbolic links encountered */
 #define EACCES   13  /* permission denied */
+#define ERANGE   34  /* result too large for the caller's buffer (getcwd()) */
+#define EPIPE    32  /* write() on a pipe with no readers left (SYS_WRITE, SYS_PIPE) */
 
 #endif

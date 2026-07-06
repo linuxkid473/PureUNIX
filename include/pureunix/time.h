@@ -11,4 +11,13 @@
  * opposite direction (civil date -> epoch, rather than epoch -> civil). */
 uint32_t time_now(void);
 
+/* Layout-compatible with newlib's own struct timespec (both {long tv_sec;
+ * long tv_nsec;} on i686) — see SYS_NANOSLEEP in arch/i386/syscall.c and
+ * user/newlib_syscalls.c's nanosleep(), which passes this straight through
+ * with no field-by-field translation, unlike struct stat/dirent. */
+struct pureunix_timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+
 #endif

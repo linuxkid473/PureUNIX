@@ -117,10 +117,77 @@ int ext2_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx)
 }
 
 /* -------------------------------------------------------------------------
+ * chmod/chown — mutate the on-disk inode's i_mode/i_uid/i_gid directly.
+ * Permission checks (owner-or-root for chmod, root-only for chown) already
+ * happened in fs/vfs.c's vfs_chmod()/vfs_chown() before either of these is
+ * called, so these only need to touch the inode.
+ * ---------------------------------------------------------------------- */
+
+int ext2_chmod(const char *path, mode_t mode)
+{
+    if (!ext2_get_fs()->mounted || !path) return -1;
+
+    uint32_t ino;
+    if (ext2_path_to_inode(path, &ino) != 0) return -1;
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) != 0) return -1;
+
+    /* Keep the file-type bits (EXT2_S_IFMT) exactly as they are — mode only
+     * ever carries permission bits (POSIX chmod(2) ignores any type bits a
+     * caller might pass), same 12-bit window ext2_stat() exposes as st->mode. */
+    inode.i_mode = (uint16_t)((inode.i_mode & EXT2_S_IFMT) | (mode & 0x0FFF));
+    inode.i_ctime = time_now();
+    if (ext2_write_inode(ino, &inode) != 0) return -1;
+    return 0;
+}
+
+int ext2_chown(const char *path, uid_t uid, gid_t gid)
+{
+    if (!ext2_get_fs()->mounted || !path) return -1;
+
+    uint32_t ino;
+    if (ext2_path_to_inode(path, &ino) != 0) return -1;
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) != 0) return -1;
+
+    if (uid != (uid_t)-1) {
+        inode.i_uid = (uint16_t)uid;
+    }
+    if (gid != (gid_t)-1) {
+        inode.i_gid = (uint16_t)gid;
+    }
+    inode.i_ctime = time_now();
+    if (ext2_write_inode(ino, &inode) != 0) return -1;
+    return 0;
+}
+
+int ext2_utime(const char *path, uint32_t atime, uint32_t mtime)
+{
+    if (!ext2_get_fs()->mounted || !path) return -1;
+
+    uint32_t ino;
+    if (ext2_path_to_inode(path, &ino) != 0) return -1;
+
+    ext2_inode_t inode;
+    if (ext2_read_inode(ino, &inode) != 0) return -1;
+
+    if (atime != 0xFFFFFFFFu) {
+        inode.i_atime = atime;
+    }
+    if (mtime != 0xFFFFFFFFu) {
+        inode.i_mtime = mtime;
+    }
+    inode.i_ctime = time_now();
+    if (ext2_write_inode(ino, &inode) != 0) return -1;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * VFS mount-table registration (Stage 4: EXT2 is now writable — see
  * fs/ext2/write.c for create/unlink/rename/link/symlink/readlink/
- * write_file). chmod/chown remain NULL: no on-disk mutable-ownership path
- * was added for this stage, so they still resolve to -EROFS.
+ * write_file). chmod/chown/utime are real now too — see above.
  * ---------------------------------------------------------------------- */
 
 static const vfs_ops_t ext2_vfs_ops_table = {
@@ -131,8 +198,9 @@ static const vfs_ops_t ext2_vfs_ops_table = {
     .unlink = ext2_unlink,
     .rename = ext2_rename,
     .readdir = ext2_readdir,
-    .chmod = NULL,
-    .chown = NULL,
+    .chmod = ext2_chmod,
+    .chown = ext2_chown,
+    .utime = ext2_utime,
     .readlink = ext2_readlink,
     .link = ext2_link,
     .symlink = ext2_symlink,

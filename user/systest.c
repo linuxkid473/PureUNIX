@@ -93,6 +93,22 @@ static int str_eq(const char *a, const char *b)
     }
 }
 
+/* String check: reports PASS/FAIL like check_eq, printing both strings on
+ * failure instead of a numeric expected/got pair. */
+static void check_str(const char *desc, const char *expected, const char *got)
+{
+    t_begin(desc);
+    if (str_eq(expected, got)) {
+        g_pass++;
+        pu_puts("PASS\n");
+    } else {
+        g_fail++;
+        pu_puts("FAIL\n");
+        pu_puts("  expected \""); pu_puts(expected);
+        pu_puts("\" got \""); pu_puts(got); pu_puts("\"\n");
+    }
+}
+
 static int find_name(struct dirent *entries, int count, const char *name)
 {
     for (int i = 0; i < count; i++) {
@@ -207,6 +223,193 @@ static void test_fork_exec_wait(void)
 
 /* ==================================================================== */
 
+static void test_chdir_getcwd(void)
+{
+    section("SYS_CHDIR / SYS_GETCWD");
+
+    char buf[PU_MAX_NAME * 2];
+    int r = pu_getcwd(buf, sizeof(buf));
+    check_eq("getcwd() succeeds at startup", 0, r);
+    check_str("a fresh task's cwd starts at '/'", "/", buf);
+
+    pu_rmdir("/systest_chdir_dir");
+    check_eq("mkdir() for the chdir test directory succeeds", 0, pu_mkdir("/systest_chdir_dir"));
+
+    r = pu_chdir("/systest_chdir_dir");
+    check_eq("chdir() into a real directory succeeds", 0, r);
+    r = pu_getcwd(buf, sizeof(buf));
+    check_eq("getcwd() after chdir() succeeds", 0, r);
+    check_str("getcwd() reports the new absolute path", "/systest_chdir_dir", buf);
+
+    r = pu_chdir("/README.TXT");
+    check_eq("chdir() onto a regular file returns ENOTDIR", ENOTDIR, r);
+    r = pu_chdir("/no/such/directory");
+    check_eq("chdir() onto a missing path returns ENOENT", ENOENT, r);
+
+    r = pu_getcwd(buf, sizeof(buf));
+    check_eq("getcwd() is unaffected by a failed chdir()", 0, r);
+    check_str("cwd is still the last successful chdir() target", "/systest_chdir_dir", buf);
+
+    char tiny[4];
+    r = pu_getcwd(tiny, sizeof(tiny));
+    check_eq("getcwd() into a too-small buffer returns ERANGE", ERANGE, r);
+
+    /* A forked child's chdir() must not leak back into the parent — the two
+     * tasks have independent cwd state, exactly like independent address
+     * spaces and file descriptor tables (test_fork_exec_wait() above). */
+    int pid = pu_fork();
+    check_true("fork() (for chdir isolation test) returns a value >= 0", pid >= 0);
+    if (pid == 0) {
+        int child_rc = pu_chdir("/");
+        pu_exit(child_rc == 0 ? 0 : 1);
+    }
+    int status = -1;
+    pu_wait(pid, &status);
+    check_eq("the forked child's chdir('/') itself succeeded", 0, status);
+    r = pu_getcwd(buf, sizeof(buf));
+    check_str("the parent's cwd is unaffected by the child's chdir()", "/systest_chdir_dir", buf);
+
+    check_eq("chdir() back to '/' succeeds", 0, pu_chdir("/"));
+    pu_rmdir("/systest_chdir_dir");
+}
+
+/* ==================================================================== */
+
+static void test_pipe_dup(void)
+{
+    section("SYS_PIPE / SYS_DUP / SYS_DUP2");
+
+    int fds[2] = { -1, -1 };
+    int r = pu_pipe(fds);
+    check_eq("pipe() succeeds", 0, r);
+    check_true("pipe() read end is a real fd", fds[0] >= 3);
+    check_true("pipe() write end is a real fd", fds[1] >= 3);
+    check_true("pipe()'s two ends are distinct", fds[0] != fds[1]);
+
+    char msg[] = "hello pipe";
+    int wn = pu_write(fds[1], msg, sizeof(msg));
+    check_eq("write() into a pipe returns the full length", (int)sizeof(msg), wn);
+
+    char buf[32] = { 0 };
+    int rn = pu_read(fds[0], buf, sizeof(buf));
+    check_eq("read() from a pipe returns the full length", (int)sizeof(msg), rn);
+    check_true("data read back from a pipe matches what was written", bytes_eq(buf, msg, sizeof(msg)));
+
+    pu_close(fds[1]);
+    int eof = pu_read(fds[0], buf, sizeof(buf));
+    check_eq("read() on a pipe with no writers left and an empty buffer returns EOF (0)", 0, eof);
+    pu_close(fds[0]);
+
+    /* write() with no readers left returns -EPIPE (no SIGPIPE — no signal
+       delivery exists yet, see docs/syscalls.md). */
+    int fds2[2] = { -1, -1 };
+    pu_pipe(fds2);
+    pu_close(fds2[0]);
+    int wr = pu_write(fds2[1], msg, sizeof(msg));
+    check_eq("write() to a pipe with no readers left returns EPIPE", EPIPE, wr);
+    pu_close(fds2[1]);
+
+    /* dup(): the new fd shares the SAME open file description as the
+       original — including its seek offset — exactly like a real UNIX
+       dup(), and unlike this project's own fork() before this feature
+       existed (which used to deep-copy fds, giving independent offsets). */
+    pu_unlink("/systest_dup_file");
+    int fd = pu_creat("/systest_dup_file");
+    pu_write(fd, "0123456789", 10);
+    pu_lseek(fd, 0, SEEK_SET);
+    int dupfd = pu_dup(fd);
+    check_true("dup() returns a distinct, valid fd", dupfd >= 3 && dupfd != fd);
+    char b1[4] = { 0 }, b2[4] = { 0 };
+    pu_read(fd, b1, 4);    /* advances the shared offset to 4 */
+    pu_read(dupfd, b2, 4); /* continues from 4, not from 0 */
+    check_true("dup()'d fd shares the original's file offset",
+               bytes_eq(b1, "0123", 4) && bytes_eq(b2, "4567", 4));
+    pu_close(fd);
+    pu_close(dupfd);
+    pu_unlink("/systest_dup_file");
+
+    /* dup2(): closes whatever newfd previously held, then makes it an
+       alias for oldfd's description — every subsequent op on newfd really
+       goes through oldfd's own description. */
+    pu_unlink("/systest_dup2_a");
+    pu_unlink("/systest_dup2_b");
+    int fda = pu_creat("/systest_dup2_a");
+    int fdb = pu_creat("/systest_dup2_b");
+    int dr = pu_dup2(fda, fdb);
+    check_eq("dup2() returns newfd", fdb, dr);
+    pu_write(fdb, "X", 1); /* really writes through fda's description now */
+    pu_close(fda);
+    pu_close(fdb);
+    struct stat sta;
+    pu_stat("/systest_dup2_a", &sta);
+    check_eq("dup2()'d fd actually wrote through the original file description", 1, (int)sta.st_size);
+    pu_unlink("/systest_dup2_a");
+    pu_unlink("/systest_dup2_b");
+
+    /* Real cross-process IPC: a forked child writes, the parent reads —
+       this is what a pipe is actually *for*. The parent's read() blocks
+       (cooperatively yielding — see arch/i386/syscall.c's pipe_read())
+       until the child has written and closed its end. */
+    int fds3[2] = { -1, -1 };
+    pu_pipe(fds3);
+    int pid = pu_fork();
+    check_true("fork() (for pipe IPC test) returns a value >= 0", pid >= 0);
+    if (pid == 0) {
+        pu_close(fds3[0]); /* child only writes */
+        pu_write(fds3[1], "from-child", 10);
+        pu_close(fds3[1]);
+        pu_exit(0);
+    }
+
+    pu_close(fds3[1]); /* parent only reads */
+    char ipcbuf[16] = { 0 };
+    int ipcn = pu_read(fds3[0], ipcbuf, sizeof(ipcbuf));
+    int status = -1;
+    pu_wait(pid, &status);
+    check_eq("fork()+pipe(): parent read the exact byte count the child wrote", 10, ipcn);
+    check_true("fork()+pipe(): parent received the child's actual data",
+               bytes_eq(ipcbuf, "from-child", 10));
+    pu_close(fds3[0]);
+}
+
+/* ==================================================================== */
+
+static void test_kill(void)
+{
+    section("SYS_KILL");
+
+    /* kill(pid, 0): the POSIX "null signal" probes existence without
+       killing. Self always exists. */
+    check_eq("kill(self, 0) succeeds (self always exists)", 0, pu_kill(pu_getpid(), 0));
+    check_eq("kill(a definitely-nonexistent pid, 0) returns ESRCH", ESRCH, pu_kill(999999, 0));
+    check_eq("kill(pid <= 0, anything) returns EINVAL (no process-group support)", EINVAL, pu_kill(0, SIGTERM));
+
+    /* A forked child that just spins yielding (so the parent actually gets
+       scheduled to kill it) — killed from the parent with SIGTERM, then
+       reaped: wait() must report it died *by that signal*, not that it
+       exited normally, and the raw exit code convention (docs/syscalls.md)
+       is exit_code == -signal. */
+    int pid = pu_fork();
+    check_true("fork() (for kill test) returns a value >= 0", pid >= 0);
+    if (pid == 0) {
+        for (;;) {
+            pu_yield();
+        }
+        /* unreachable */
+    }
+
+    check_eq("kill() on a real, running child succeeds", 0, pu_kill(pid, SIGTERM));
+    int status = 1; /* deliberately not 0, so a no-op wait() wouldn't false-pass */
+    int reaped = pu_wait(pid, &status);
+    check_eq("wait() reaps the killed child", pid, reaped);
+    check_eq("wait() reports exit_code == -SIGTERM (killed by signal, not a normal exit)",
+             -SIGTERM, status);
+
+    check_eq("kill() on an already-reaped pid returns ESRCH", ESRCH, pu_kill(pid, SIGTERM));
+}
+
+/* ==================================================================== */
+
 static void test_write_read_basics(void)
 {
     section("SYS_WRITE / SYS_READ basics");
@@ -271,7 +474,15 @@ static void test_open_close(void)
     check_eq("close() on a freshly opened fd returns 0", 0, pu_close(fd));
     check_eq("close() on an already-closed fd returns EBADF", EBADF, pu_close(fd));
     check_eq("close() on an out-of-range fd returns EBADF", EBADF, pu_close(99));
-    check_eq("close() on a reserved fd (stdout) returns EBADF", EBADF, pu_close(1));
+    /* close() on fd 0/1/2 now succeeds — it reverts that slot to the
+       default console binding rather than returning EBADF (the old,
+       pre-SYS_PIPE/SYS_DUP2 behavior — see include/pureunix/task.h's
+       fd_entry_t comment). This is what makes stdout redirection work at
+       all: dup2()ing something onto fd 1, using it, then dup2()ing a saved
+       copy of the original console binding back requires fd 1 to be a
+       normal, closeable/rebindable descriptor like any other. */
+    check_eq("close() on a reserved fd (stdout) succeeds now (reverts to console)", 0, pu_close(1));
+    check_true("write(stdout) still reaches the console after close() reverted it", pu_write(1, "", 0) >= 0);
 
     check_eq("open() on a missing path returns ENOENT", ENOENT, pu_open("/no/such/file.txt", O_RDONLY));
     check_eq("open() on a directory returns EISDIR", EISDIR, pu_open("/etc", O_RDONLY));
@@ -471,15 +682,71 @@ static void test_permissions(void)
 
 static void test_chmod_chown(void)
 {
-    section("SYS_CHMOD / SYS_CHOWN (infrastructure-only stubs)");
+    section("SYS_CHMOD / SYS_CHOWN");
 
-    /* Neither filesystem stores mutable ownership/permission bits yet, so
-       both always resolve to -EROFS for an existing path (or -ENOENT for a
-       missing one) — see docs/api/vfs.md. */
-    check_eq("chmod() on an existing file returns EROFS", EROFS, pu_chmod("/README.TXT", 0600));
+    /* A dedicated file rather than /README.TXT — other sections (e.g.
+       test_stat_lstat_access(), test_elf_exec_preconditions()) depend on
+       its exact mode/uid/gid, and this section would otherwise permanently
+       mutate them for every test that runs afterward (or on the next boot,
+       since EXT2 persists these to disk now). */
+    pu_unlink("/systest_chmod_file");
+    int fd = pu_creat("/systest_chmod_file");
+    check_true("creat() for the chmod/chown test file succeeds", fd >= 3);
+    pu_close(fd);
+
     check_eq("chmod() on a missing file returns ENOENT", ENOENT, pu_chmod("/no/such/file", 0600));
-    check_eq("chown() on an existing file returns EROFS", EROFS, pu_chown("/README.TXT", 5, 5));
     check_eq("chown() on a missing file returns ENOENT", ENOENT, pu_chown("/no/such/file", 5, 5));
+
+    /* As root: chmod/chown are real now (EXT2 stores i_mode/i_uid/i_gid —
+       see fs/ext2/mount.c's ext2_chmod()/ext2_chown()), not the old
+       infrastructure-only -EROFS stubs. */
+    int r = pu_chmod("/systest_chmod_file", 0640);
+    check_eq("root: chmod() to 0640 succeeds", 0, r);
+    struct stat st;
+    pu_stat("/systest_chmod_file", &st);
+    check_eq("chmod()'d file reports the new mode via stat()", 0640, (int)(st.st_mode & 0777));
+
+    r = pu_chown("/systest_chmod_file", 1000, 100);
+    check_eq("root: chown() to uid=1000/gid=100 succeeds", 0, r);
+    pu_stat("/systest_chmod_file", &st);
+    check_true("chown()'d file reports the new uid/gid via stat()",
+               st.st_uid == 1000 && st.st_gid == 100);
+
+    /* uid/gid of -1 means "leave unchanged" (POSIX chown(2) convention) —
+       change only the group, confirm the uid from above survives. */
+    r = pu_chown("/systest_chmod_file", (uid_t)-1, 200);
+    check_eq("chown() with uid=-1 succeeds (group-only change)", 0, r);
+    pu_stat("/systest_chmod_file", &st);
+    check_true("chown(uid=-1) left uid untouched and only changed gid",
+               st.st_uid == 1000 && st.st_gid == 200);
+
+    /* Non-root: chmod requires owning the file; chown is root-only outright
+       (PureUNIX has no supplementary-group model to let a non-root owner
+       hand a file to a group they belong to). */
+    pu_debug_setcred(1000, 200);
+    r = pu_chmod("/systest_chmod_file", 0666);
+    check_eq("non-root owner: chmod() on an owned file succeeds", 0, r);
+    r = pu_chown("/systest_chmod_file", 1000, 1000);
+    check_eq("non-root: chown() is always EPERM, even on a file you own", EPERM, r);
+
+    pu_debug_setcred(2000, 2000);
+    r = pu_chmod("/systest_chmod_file", 0600);
+    check_eq("non-root, non-owner: chmod() returns EPERM", EPERM, r);
+
+    /* Restore root — leaving credentials changed would corrupt every test
+       after this one (see test_permissions()'s identical note). */
+    pu_debug_setcred(0, 0);
+    check_eq("credentials restored to uid=0/gid=0", 0, pu_access("/systest_chmod_file", F_OK));
+
+    pu_unlink("/systest_chmod_file");
+
+    /* FAT16 stores no Unix ownership/permission bits at all (fs/fat16.c has
+       no ops->chmod/ops->chown), so it still resolves to -EROFS regardless
+       of caller — only EXT2 gained real chmod/chown above. */
+    check_eq("chmod() on a FAT16 file still returns EROFS (no on-disk mode bits)", EROFS,
+             pu_chmod("/fat/README.TXT", 0600));
+    check_eq("chown() on a FAT16 file still returns EROFS (no on-disk owner bits)", EROFS,
+             pu_chown("/fat/README.TXT", 5, 5));
 }
 
 /* ==================================================================== */
@@ -1158,6 +1425,9 @@ int main(void)
 
     test_process_basics();
     test_fork_exec_wait();
+    test_chdir_getcwd();
+    test_pipe_dup();
+    test_kill();
     test_write_read_basics();
     test_isatty_ioctl();
     test_open_close();

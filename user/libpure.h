@@ -33,6 +33,12 @@
 #define SYS_TCGETATTR 26
 #define SYS_TCSETATTR 27
 #define SYS_IOCTL     28
+#define SYS_CHDIR     29
+#define SYS_GETCWD    30
+#define SYS_PIPE      36
+#define SYS_DUP       37
+#define SYS_DUP2      38
+#define SYS_KILL      39
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -55,6 +61,7 @@
 /* Negative error codes returned by syscalls */
 #define EPERM   (-1)
 #define ENOENT  (-2)
+#define ESRCH   (-3)
 #define EACCES  (-13)
 #define EBADF   (-9)
 #define EEXIST  (-17)
@@ -70,6 +77,14 @@
 #define ELOOP   (-40)
 #define EINTR   (-4)
 #define ENOTTY  (-25)
+#define ERANGE  (-34)
+#define EPIPE   (-32)
+
+/* Signal numbers for pu_kill() — must match include/pureunix/signal.h
+ * (kernel-side) and newlib's <signal.h> (real POSIX numbering for this
+ * target, see that file's own header comment). */
+#define SIGKILL 9
+#define SIGTERM 15
 
 /* Must match PUREUNIX_MAX_NAME in include/pureunix/config.h. */
 #define PU_MAX_NAME 64
@@ -227,6 +242,34 @@ int    pu_link(const char *old_path, const char *new_path);
 int    pu_symlink(const char *target, const char *path);
 /* Equivalent to open(path, O_WRONLY|O_CREAT|O_TRUNC) — POSIX creat(). */
 int    pu_creat(const char *path);
+/* Changes this task's working directory to path (resolved relative to its
+ * current one). Fails with -ENOTDIR if path isn't a directory, -EACCES
+ * without X_OK on it, or -ENAMETOOLONG if the resolved path doesn't fit. */
+int    pu_chdir(const char *path);
+/* Copies this task's absolute working directory into buf (size bytes,
+ * NUL-terminated). Fails with -ERANGE if it doesn't fit. */
+int    pu_getcwd(char *buf, size_t size);
+
+/* Creates a pipe: fds[0] becomes the read end, fds[1] the write end.
+ * Returns 0 on success, or a negative error code (-EMFILE if no two fds
+ * are free). */
+int    pu_pipe(int fds[2]);
+/* Duplicates oldfd onto the lowest-numbered free fd, sharing the same
+ * open file description (offset included) — dup()/fork() do the same
+ * sharing internally; see include/pureunix/task.h's open_file_t.
+ * Returns the new fd, or a negative error code. */
+int    pu_dup(int oldfd);
+/* Same as pu_dup(), but the caller picks newfd — if it was already open,
+ * it's closed first. A no-op returning newfd if oldfd == newfd. */
+int    pu_dup2(int oldfd, int newfd);
+/* Terminates task pid with signal sig's POSIX default action (there's no
+ * handler-dispatch mechanism — see docs/syscalls.md's SYS_KILL section —
+ * so every nonzero sig just kills the target outright); sig == 0 is
+ * POSIX's "null signal", probing whether pid exists without killing it.
+ * If pid is the caller's own, this never returns on success (the kernel
+ * stops the caller directly, same as pu_exit()). Returns 0 on success, or
+ * -EINVAL (pid <= 0 — no process-group support) / -ESRCH (no such pid). */
+int    pu_kill(int pid, int sig);
 
 /* -------------------------------------------------------------------- */
 /* Per-process address spaces: fork / exec / wait                        */
@@ -238,8 +281,17 @@ int    pu_creat(const char *path);
 int    pu_fork(void);
 /* Replaces the calling process's own memory image with the program at
  * path, in place. Only returns (with a negative error code) on failure —
- * on success control never comes back here. */
+ * on success control never comes back here. Equivalent to
+ * pu_execve(path, NULL, NULL). */
 int    pu_exec(const char *path);
+/* Same as pu_exec(), but argv is copied onto the new process's stack (a
+ * NULL-terminated array — NULL here means the same as pu_exec(): the new
+ * process sees a bare argv = {path, NULL}), and envp similarly becomes the
+ * new process's environ (NULL means an empty environment). Both arrays and
+ * every string they point to are read from *this* process's memory before
+ * the new image replaces it, so they don't need to (and can't) survive the
+ * call themselves. */
+int    pu_execve(const char *path, char *const argv[], char *const envp[]);
 /* Blocks until the child identified by pid (or, if pid == -1, any child)
  * exits, then reaps it. Returns the reaped child's pid, or a negative
  * value if the caller has no such child. If status is non-NULL, the

@@ -2,4 +2,8 @@ build/
 *.o
 *.d
 *.elf
+# Deliberately vendored prebuilt binary (see third_party/busybox/README.md
+# and tools/build-busybox.sh) — not a build artifact, exempt from the *.elf
+# rule above.
+!third_party/busybox/busybox.elf
 graphify-out/

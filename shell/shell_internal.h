@@ -58,5 +58,6 @@ void shell_out_printf(shell_output_t *out, const char *fmt, ...);
 const char *shell_getenv(const char *key);
 int shell_setenv(const char *key, const char *value);
 void shell_env_list(shell_output_t *out);
+char *const *shell_build_envp(void);
 
 #endif

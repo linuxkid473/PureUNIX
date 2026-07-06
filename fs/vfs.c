@@ -642,34 +642,58 @@ bool vfs_access(const vfs_stat_t *st, uid_t uid, gid_t gid, int requested)
     return (bits & req_bits) == req_bits;
 }
 
-/* ---- chmod/chown: syscall infrastructure only ----
- * EXT2 still stores no mutable permission/ownership metadata path (Stage 4
- * only wires up create/write/unlink/rename/link/symlink — chmod/chown
- * remain out of scope per the Stage 4 spec), so these still resolve to
- * -EROFS for FAT16 and EXT2 alike. */
+/* ---- chmod/chown ----
+ * EXT2 stores real mutable i_mode/i_uid/i_gid (fs/ext2/mount.c's
+ * ext2_chmod()/ext2_chown()); FAT16 has no Unix ownership/permission
+ * concept at all, so its ops->chmod/ops->chown stay NULL and these still
+ * resolve to -EROFS there. Permission rules mirror a traditional Unix:
+ * chmod requires being the file's owner or root; chown, simplified for
+ * PureUNIX's single-gid-per-task model (no supplementary groups), requires
+ * root outright — a non-root user can never change any file's ownership,
+ * not even to themselves. */
 
 int vfs_chmod(const char *path, mode_t mode)
 {
-    (void)mode;
     char sub[PUREUNIX_MAX_PATH];
     const vfs_mount_t *m = vfs_dispatch(path, sub, sizeof(sub));
     if (!m) return -ENOENT;
     vfs_stat_t st;
     if (!m->ops->stat || m->ops->stat(sub, &st) != 0) return -ENOENT;
     if (!m->ops->chmod) return -EROFS;
+
+    uid_t uid = current_uid();
+    if (uid != 0 && st.st_uid != uid) return -EPERM;
+
     return m->ops->chmod(sub, mode);
 }
 
 int vfs_chown(const char *path, uid_t uid, gid_t gid)
 {
-    (void)uid; (void)gid;
     char sub[PUREUNIX_MAX_PATH];
     const vfs_mount_t *m = vfs_dispatch(path, sub, sizeof(sub));
     if (!m) return -ENOENT;
     vfs_stat_t st;
     if (!m->ops->stat || m->ops->stat(sub, &st) != 0) return -ENOENT;
     if (!m->ops->chown) return -EROFS;
+
+    if (current_uid() != 0) return -EPERM;
+
     return m->ops->chown(sub, uid, gid);
+}
+
+int vfs_utime(const char *path, uint32_t atime, uint32_t mtime)
+{
+    char sub[PUREUNIX_MAX_PATH];
+    const vfs_mount_t *m = vfs_dispatch(path, sub, sizeof(sub));
+    if (!m) return -ENOENT;
+    vfs_stat_t st;
+    if (!m->ops->stat || m->ops->stat(sub, &st) != 0) return -ENOENT;
+    if (!m->ops->utime) return -EROFS;
+
+    uid_t uid = current_uid(), gid = current_gid();
+    if (uid != 0 && st.st_uid != uid && !vfs_access(&st, uid, gid, W_OK)) return -EPERM;
+
+    return m->ops->utime(sub, atime, mtime);
 }
 
 /* ---- Path normalisation (unchanged) ---- */

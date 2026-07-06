@@ -63,11 +63,14 @@ typedef struct vfs_ops {
     int (*unlink)(const char *path, bool directory);
     int (*rename)(const char *old_path, const char *new_path);
     int (*readdir)(const char *path, vfs_readdir_cb_t cb, void *ctx);
-    /* Both NULL on every driver today — no filesystem stores mutable
-     * ownership/permission bits yet. Present so a future writable
-     * filesystem can plug in without any VFS-level API change. */
+    /* Real on EXT2 (fs/ext2/mount.c's ext2_chmod()/ext2_chown()); NULL on
+     * FAT16 (no mutable ownership/permission bits stored there at all). */
     int (*chmod)(const char *path, mode_t mode);
     int (*chown)(const char *path, uid_t uid, gid_t gid);
+    /* Sets atime/mtime directly — atime/mtime of 0xFFFFFFFF means "leave
+     * this one unchanged" (mirrors POSIX utimensat()'s UTIME_OMIT). Same
+     * real-on-EXT2/NULL-on-FAT16 story as chmod/chown above. */
+    int (*utime)(const char *path, uint32_t atime, uint32_t mtime);
     /* Symlink/hardlink support (Stage 4). NULL on any driver that can't
      * store them (FAT16 has neither concept). readlink returns the number
      * of bytes copied into buf (never NUL-terminated, truncated to
@@ -151,11 +154,18 @@ int vfs_symlink(const char *target, const char *path);
  * S_IXUSR/S_IXGRP/S_IXOTH bits is set on st_mode. */
 bool vfs_access(const vfs_stat_t *st, uid_t uid, gid_t gid, int requested);
 
-/* Syscall-infrastructure-only stubs: no filesystem driver implements mutable
- * ownership/permission storage yet (EXT2 is read-only; FAT16 has none), so
- * both currently return -EROFS for any existing path, or -ENOENT if the
- * path doesn't exist. */
+/* Real on EXT2 (fs/ext2/mount.c); -EROFS on FAT16 (no mutable ownership/
+ * permission storage there at all), or -ENOENT if the path doesn't exist.
+ * chmod requires being the file's owner or root; chown is root-only
+ * outright (no supplementary-group model to soften that) — both checked
+ * here via current_uid(), before ever calling the filesystem's own
+ * ops->chmod/ops->chown. */
 int vfs_chmod(const char *path, mode_t mode);
 int vfs_chown(const char *path, uid_t uid, gid_t gid);
+/* Sets atime/mtime directly; atime/mtime of 0xFFFFFFFF means "leave that
+ * one unchanged" (mirrors POSIX utimensat()'s UTIME_OMIT). Requires being
+ * the file's owner, root, or having W_OK on it (the traditional Unix
+ * utime(2) rule) — same real-on-EXT2/-EROFS-on-FAT16 story as chmod/chown. */
+int vfs_utime(const char *path, uint32_t atime, uint32_t mtime);
 
 #endif

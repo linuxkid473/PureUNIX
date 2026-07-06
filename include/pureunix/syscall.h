@@ -49,6 +49,45 @@ enum {
      * separate isatty() syscall: userspace derives it from whether
      * SYS_TCGETATTR succeeds (see pu_isatty() in user/libpure.c). */
     SYS_IOCTL = 28,
+
+    /* Per-task working directory. See docs/syscalls.md. */
+    SYS_CHDIR  = 29,
+    SYS_GETCWD = 30,
+
+    /* Blocking sleep, backed by the PIT tick counter (arch/i386/pit.c).
+     * See docs/syscalls.md. */
+    SYS_NANOSLEEP = 31,
+
+    /* Read-only credential getters — the write side is SYS_DEBUG_SETCRED
+     * (test-only, no privilege check) until a real login/setuid model
+     * exists. No separate "effective" uid/gid: PureUNIX has no setuid
+     * model, so effective always equals real (see user/newlib_syscalls.c's
+     * geteuid()/getegid(), which just alias these). See docs/syscalls.md. */
+    SYS_GETUID = 32,
+    SYS_GETGID = 33,
+
+    /* Sets a file's atime/mtime directly (EBX: path, ECX: atime, EDX:
+     * mtime — each a Unix epoch second count, or 0xFFFFFFFF to leave that
+     * one unchanged). Real on EXT2 (fs/ext2/mount.c's ext2_utime()); same
+     * -EROFS-on-FAT16 story as SYS_CHMOD/SYS_CHOWN. See docs/syscalls.md. */
+    SYS_UTIME = 34,
+
+    /* Wall-clock time as a Unix epoch second count (EBX: pointer to a
+     * uint32_t to receive it) — a thin userspace-visible wrapper around
+     * kernel/time.c's time_now(), which every write-path timestamp
+     * already uses internally. No sub-second resolution exists. See
+     * docs/syscalls.md. */
+    SYS_GETTIMEOFDAY = 35,
+
+    /* pipe()/dup()/dup2() — see include/pureunix/task.h's open_file_t and
+     * docs/syscalls.md. */
+    SYS_PIPE = 36,
+    SYS_DUP  = 37,
+    SYS_DUP2 = 38,
+
+    /* Terminates another task with a signal's POSIX default action — see
+     * kernel/task.c's task_kill() and docs/syscalls.md. */
+    SYS_KILL = 39,
 };
 
 #endif

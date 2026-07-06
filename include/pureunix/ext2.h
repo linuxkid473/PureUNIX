@@ -26,6 +26,16 @@ int ext2_link(const char *old_path, const char *new_path);
 int ext2_symlink(const char *target, const char *path);
 int ext2_readlink(const char *path, char *buf, size_t bufsize);
 
+/* Real chmod/chown, backed by the on-disk inode's i_mode/i_uid/i_gid — see
+ * fs/ext2/mount.c. uid/gid of (uid_t)-1/(gid_t)-1 mean "leave unchanged",
+ * matching POSIX chown(2)'s convention (e.g. chown(path, uid, -1) to
+ * change owner without touching group). */
+int ext2_chmod(const char *path, mode_t mode);
+int ext2_chown(const char *path, uid_t uid, gid_t gid);
+/* atime/mtime of 0xFFFFFFFF means "leave that one unchanged" — see
+ * include/pureunix/vfs.h's vfs_ops_t.utime. */
+int ext2_utime(const char *path, uint32_t atime, uint32_t mtime);
+
 /* Table of the above, for registration via vfs_mount(). */
 const vfs_ops_t *ext2_vfs_ops(void);
 

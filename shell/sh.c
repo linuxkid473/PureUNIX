@@ -2,9 +2,12 @@
 #include <stdarg.h>
 #include <pureunix/config.h>
 #include <pureunix/elf.h>
+#include <pureunix/errno.h>
+#include <pureunix/fcntl.h>
 #include <pureunix/memory.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/task.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 
@@ -46,7 +49,66 @@ void shell_out_printf(shell_output_t *out, const char *fmt, ...)
     shell_out_puts(out, tmp);
 }
 
-static int exec_external(shell_context_t *ctx, shell_command_t *cmd, shell_output_t *out)
+/* Real fd-based stdout redirection for an external program — unlike a
+ * builtin (which never touches a real fd; its output redirection goes
+ * through shell_output_t instead, in shell_execute_line() below), a
+ * launched ELF program's writes go through its own SYS_WRITE(1, ...),
+ * which shell_output_t knows nothing about. There is no separate task for
+ * the interactive shell (it runs as task_current(), the same task that
+ * calls kernel_main()), so redirecting *this* task's own fd 1 before
+ * elf_exec_argv() is what makes the launched program inherit that
+ * binding — task_create_user() now shares fds with its creator exactly
+ * like task_fork() does (see kernel/task.c) — the same effect a real
+ * shell gets from fork()+dup2()+exec(). shell_restore_stdout() undoes it
+ * afterward, which is also what actually flushes the write: the shell's
+ * own fd 1 was the last reference once the launched program's own copy
+ * closed at its exit (see kernel/task.c's close_all_fds()). */
+static int shell_redirect_stdout(shell_context_t *ctx, const char *target, bool append)
+{
+    char path[PUREUNIX_MAX_PATH];
+    vfs_normalize(path, ctx->cwd, target);
+
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) {
+        int cr = vfs_create(path);
+        if (cr != 0 && cr != -EEXIST) {
+            return cr;
+        }
+    } else if (st.type != VFS_FILE) {
+        return -EISDIR;
+    }
+
+    open_file_t *f = open_file_alloc(FD_KIND_FILE);
+    if (!f) {
+        return -ENOSPC;
+    }
+    f->flags = O_WRONLY;
+    strncpy(f->path, path, PUREUNIX_MAX_PATH - 1);
+    f->path[PUREUNIX_MAX_PATH - 1] = '\0';
+    if (append) {
+        vfs_read_file(path, &f->data, &f->size); /* best-effort; empty is fine */
+        f->offset = f->size;
+    }
+
+    task_t *t = task_current();
+    open_file_unref(t->fds[1].file); /* normally NULL (console binding) — a no-op */
+    t->fds[1].used = true;
+    t->fds[1].file = f;
+    return 0;
+}
+
+static void shell_restore_stdout(void)
+{
+    task_t *t = task_current();
+    open_file_unref(t->fds[1].file);
+    t->fds[1].file = NULL;
+}
+
+/* The actual path resolution + launch, wrapped by exec_external() below
+ * with redirect setup/teardown so every existing return point here (there
+ * are several, one per resolution attempt) doesn't need to know about
+ * redirection at all. */
+static int exec_external_inner(shell_context_t *ctx, shell_command_t *cmd, shell_output_t *out)
 {
     char path[PUREUNIX_MAX_PATH];
     if (strchr(cmd->argv[0], '/')) {
@@ -56,28 +118,42 @@ static int exec_external(shell_context_t *ctx, shell_command_t *cmd, shell_outpu
             shell_out_printf(out, "%s: command not found\n", cmd->argv[0]);
             return -1;
         }
-        return elf_exec_argv(path, cmd->argc, cmd->argv);
+        return elf_exec_argv(path, cmd->argc, cmd->argv, shell_build_envp());
     }
 
     if (strcmp(cmd->argv[0], "calculator") == 0) {
         snprintf(path, sizeof(path), "/bin/calc.elf");
         vfs_stat_t st;
         if (vfs_stat(path, &st) == 0) {
-            return elf_exec_argv(path, cmd->argc, cmd->argv);
+            return elf_exec_argv(path, cmd->argc, cmd->argv, shell_build_envp());
         }
     }
 
     snprintf(path, sizeof(path), "/bin/%s.elf", cmd->argv[0]);
     vfs_stat_t st;
-    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv) == 0) {
+    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv, shell_build_envp()) == 0) {
         return 0;
     }
     snprintf(path, sizeof(path), "/bin/%s", cmd->argv[0]);
-    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv) == 0) {
+    if (vfs_stat(path, &st) == 0 && elf_exec_argv(path, cmd->argc, cmd->argv, shell_build_envp()) == 0) {
         return 0;
     }
     shell_out_printf(out, "%s: command not found\n", cmd->argv[0]);
     return -1;
+}
+
+static int exec_external(shell_context_t *ctx, shell_command_t *cmd, shell_output_t *out)
+{
+    if (!cmd->output[0]) {
+        return exec_external_inner(ctx, cmd, out);
+    }
+    if (shell_redirect_stdout(ctx, cmd->output, cmd->append) != 0) {
+        shell_out_printf(out, "%s: cannot open for writing\n", cmd->output);
+        return -1;
+    }
+    int status = exec_external_inner(ctx, cmd, out);
+    shell_restore_stdout();
+    return status;
 }
 
 static int run_command(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
@@ -152,10 +228,21 @@ int shell_execute_line(const char *line)
             input = redir_input;
         }
 
+        /* A builtin's output only ever exists in out.buffer (it's built by
+         * explicit shell_out_*() calls — see shell/builtins.c), so
+         * redirecting/printing it here is the only place that can happen.
+         * An external ELF program's own output goes through its own real
+         * fd 1 instead (out.buffer stays empty for it) — exec_external()
+         * already redirected that fd before launching it if cmd->output
+         * was set (see shell_redirect_stdout() above), and its normal,
+         * unredirected output already reached the console directly via
+         * SYS_WRITE, so there's nothing left to do here for it either
+         * way. */
+        bool is_builtin = shell_find_builtin(cmd->argv[0]) != NULL;
         status = run_command(&shell_ctx, cmd, input, &out);
         input = out.buffer;
 
-        if (final) {
+        if (final && is_builtin) {
             if (cmd->output[0]) {
                 char path[PUREUNIX_MAX_PATH];
                 vfs_normalize(path, shell_ctx.cwd, cmd->output);

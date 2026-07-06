@@ -11,6 +11,7 @@
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
 #include <pureunix/termios.h>
+#include <pureunix/time.h>
 #include <pureunix/tty.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
@@ -38,22 +39,107 @@ static int readdir_collect_cb(const vfs_dirent_t *entry, void *ctx_)
     return 0;
 }
 
-/* fds 0/1/2 all name the same single console tty (see drivers/tty.c);
- * anything else is either a bad descriptor or a real open file that just
- * isn't a terminal. Shared by SYS_TCGETATTR and SYS_TCSETATTR. */
+/* fds 0/1/2 all name the same single console tty (see drivers/tty.c) as
+ * long as they still hold their default console binding (file == NULL —
+ * see include/pureunix/task.h); dup2()ing something else onto one of them
+ * makes it a real, non-tty fd, same as a real UNIX process redirecting
+ * its own stdin/stdout/stderr. Anything else is either a bad descriptor or
+ * a real open file that just isn't a terminal. Shared by SYS_TCGETATTR and
+ * SYS_TCSETATTR. */
 static int tty_fd_check(int fd)
 {
-    if (fd == 0 || fd == 1 || fd == 2) {
-        return 0;
-    }
     if (fd < 0 || fd >= MAX_OPEN_FILES) {
         return -EBADF;
     }
     task_t *t = task_current();
-    if (t && t->fds[fd].used) {
-        return -ENOTTY;
+    if (!t || !t->fds[fd].used) {
+        return -EBADF;
     }
-    return -EBADF;
+    if ((fd == 0 || fd == 1 || fd == 2) && !t->fds[fd].file) {
+        return 0;
+    }
+    return t->fds[fd].file ? -ENOTTY : -EBADF;
+}
+
+/* ---- Pipes (SYS_PIPE/SYS_DUP/SYS_DUP2) --------------------------------
+ * A fixed-size ring buffer (pipe_buf_t, include/pureunix/task.h) shared by
+ * both ends' open_file_t. No real blocking/wakeup mechanism exists (this
+ * kernel is strictly cooperative — see docs/scheduler.md), so "blocked on
+ * a full/empty pipe" is implemented the same way task_waitpid() blocks on
+ * a child that hasn't exited yet: spin task_yield() until the condition
+ * changes. This only actually accomplishes anything if some other task
+ * (typically a forked child on the other end of the pipe) runs in between
+ * yields and moves data — a single task written to read its own pipe with
+ * nothing else to run would spin forever, same caveat as any other
+ * cooperative-blocking call in this kernel. */
+
+static int pipe_read(open_file_t *f, char *buf, size_t len)
+{
+    if (f->pipe_is_write_end) {
+        return -EBADF;
+    }
+    pipe_buf_t *p = f->pipe_buf;
+    if (len == 0) {
+        return 0;
+    }
+    while (p->count == 0) {
+        if (p->write_ends == 0) {
+            return 0; /* EOF: no writers left, nothing buffered */
+        }
+        task_yield();
+    }
+    size_t to_copy = len < p->count ? len : p->count;
+    for (size_t i = 0; i < to_copy; ++i) {
+        buf[i] = (char)p->data[p->tail];
+        p->tail = (p->tail + 1) % PUREUNIX_PIPE_SIZE;
+    }
+    p->count -= to_copy;
+    return (int)to_copy;
+}
+
+static int pipe_write(open_file_t *f, const char *buf, size_t len)
+{
+    if (!f->pipe_is_write_end) {
+        return -EBADF;
+    }
+    pipe_buf_t *p = f->pipe_buf;
+    if (len == 0) {
+        return 0;
+    }
+    if (p->read_ends == 0) {
+        return -EPIPE;
+    }
+    size_t written = 0;
+    while (written < len) {
+        while (p->count == PUREUNIX_PIPE_SIZE) {
+            if (p->read_ends == 0) {
+                return written ? (int)written : -EPIPE;
+            }
+            task_yield();
+        }
+        size_t space = PUREUNIX_PIPE_SIZE - p->count;
+        size_t chunk = (len - written) < space ? (len - written) : space;
+        for (size_t i = 0; i < chunk; ++i) {
+            p->data[p->head] = (uint8_t)buf[written + i];
+            p->head = (p->head + 1) % PUREUNIX_PIPE_SIZE;
+        }
+        p->count += chunk;
+        written += chunk;
+    }
+    return (int)written;
+}
+
+/* SYS_OPEN's error paths, after open_file_alloc() but before the new
+ * open_file_t is ever installed into a fd table slot: releases it back to
+ * the pool without the "flush to the VFS" side effect open_file_unref()
+ * (a real close()) performs — nothing was ever really opened, so nothing
+ * should be written. Frees f->data in case it was already populated
+ * (currently only reachable in the read-only path's vfs_read_file()
+ * failure case, where it's actually always NULL, but safe regardless). */
+static void open_file_discard(open_file_t *f)
+{
+    kfree(f->data);
+    f->refcount = 0;
 }
 
 void syscall_init(void)
@@ -75,29 +161,39 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         const char *buf = (const char *)regs->ecx;
         size_t len = regs->edx;
 
-        if (fd == 1 || fd == 2) {
+        if (fd < 0 || fd >= MAX_OPEN_FILES) {
+            return (uint32_t)-EBADF;
+        }
+        task_t *t = task_current();
+        if (!t || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        open_file_t *f = t->fds[fd].file;
+
+        if ((fd == 1 || fd == 2) && !f) {
+            /* Default console binding — see include/pureunix/task.h. */
             for (size_t i = 0; i < len; ++i) {
                 putchar(buf[i]);
             }
             return len;
         }
-
-        /* Stage 4: writable file descriptors. Writes accumulate in a
-         * kmalloc'd in-memory buffer (growing it as needed) and are flushed
-         * to the underlying filesystem in one shot on close() — the same
-         * "whole file lives in memory" model the read side already uses,
-         * just mirrored for writes. */
-        if (fd < 3 || fd >= MAX_OPEN_FILES) {
-            return (uint32_t)-EBADF;
-        }
-
-        task_t *t = task_current();
-        fd_entry_t *f = &t->fds[fd];
-        if (!f->used || !(f->flags & O_WRONLY)) {
+        if (!f) {
             return (uint32_t)-EBADF;
         }
         if (!buf) {
             return (uint32_t)-EINVAL;
+        }
+
+        if (f->kind == FD_KIND_PIPE) {
+            return (uint32_t)pipe_write(f, buf, len);
+        }
+
+        /* FD_KIND_FILE: writes accumulate in a kmalloc'd in-memory buffer
+         * (growing it as needed) and are flushed to the underlying
+         * filesystem in one shot on close() — see open_file_unref()
+         * (kernel/task.c). */
+        if (!(f->flags & O_WRONLY)) {
+            return (uint32_t)-EBADF;
         }
         if (len == 0) {
             return 0;
@@ -126,30 +222,30 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         char *buf = (char *)regs->ecx;
         size_t len = (size_t)regs->edx;
 
-        if (fd == 0) {
+        if (fd < 0 || fd >= MAX_OPEN_FILES) {
+            return (uint32_t)-EBADF;
+        }
+        task_t *t = task_current();
+        if (!t || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        open_file_t *f = t->fds[fd].file;
+
+        if (fd == 0 && !f) {
             /* stdin: routed through the termios-aware console tty driver —
              * see drivers/tty.c. Behaves like the classic canonical/echoing
              * console unless SYS_TCSETATTR has put it in raw mode. */
             return (uint32_t)tty_read(buf, len);
         }
-
-        /* fds 1 and 2 are write-only; anything outside [3, MAX_OPEN_FILES) is invalid */
-        if (fd < 3 || fd >= MAX_OPEN_FILES) {
+        if (!f) {
             return (uint32_t)-EBADF;
         }
-
-        task_t *t = task_current();
-        if (!t) {
-            return (uint32_t)-EBADF;
-        }
-
-        fd_entry_t *f = &t->fds[fd];
-        if (!f->used || !f->data) {
-            return (uint32_t)-EBADF;
-        }
-
         if (!buf) {
             return (uint32_t)-EINVAL;
+        }
+
+        if (f->kind == FD_KIND_PIPE) {
+            return (uint32_t)pipe_read(f, buf, len);
         }
 
         /* Zero-length read: valid per POSIX; nothing to copy */
@@ -202,39 +298,45 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EMFILE;
         }
 
+        open_file_t *f = open_file_alloc(FD_KIND_FILE);
+        if (!f) {
+            return (uint32_t)-ENOSPC;
+        }
+        f->flags = flags;
+        strncpy(f->path, path, PUREUNIX_MAX_PATH - 1);
+        f->path[PUREUNIX_MAX_PATH - 1] = '\0';
+
         if (!want_write) {
             /* Read-only open (unchanged since Stage 3A). */
             vfs_stat_t st;
             int srs = vfs_stat(path, &st);
             if (srs != 0) {
+                open_file_discard(f);
                 return (uint32_t)srs;
             }
             if (st.type != VFS_FILE) {
+                open_file_discard(f);
                 return (uint32_t)-EISDIR;
             }
             if (!vfs_access(&st, current_uid(), current_gid(), R_OK)) {
+                open_file_discard(f);
                 return (uint32_t)-EACCES;
             }
 
-            uint8_t *data = NULL;
-            size_t   size = 0;
-            int rrc = vfs_read_file(path, &data, &size);
+            int rrc = vfs_read_file(path, &f->data, &f->size);
             if (rrc != 0) {
+                open_file_discard(f);
                 return (uint32_t)rrc;
             }
 
-            t->fds[fd].used   = true;
-            t->fds[fd].flags  = flags;
-            t->fds[fd].data   = data;
-            t->fds[fd].size   = size;
-            t->fds[fd].offset = 0;
-            strncpy(t->fds[fd].path, path, PUREUNIX_MAX_PATH - 1);
-            t->fds[fd].path[PUREUNIX_MAX_PATH - 1] = '\0';
+            t->fds[fd].used = true;
+            t->fds[fd].file = f;
             return (uint32_t)fd;
         }
 
         /* Writable open (Stage 4): the whole file is buffered in memory and
-         * flushed to the filesystem in one shot on close(). */
+         * flushed to the filesystem in one shot on close() — see
+         * open_file_unref() (kernel/task.c). */
         vfs_stat_t st;
         int sws = vfs_stat(path, &st);
         if (sws != 0) {
@@ -242,56 +344,56 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
              * from a traversal check) is a real resolution failure and
              * must be reported as such, not papered over as ENOENT. */
             if (sws != -ENOENT) {
+                open_file_discard(f);
                 return (uint32_t)sws;
             }
             if (!want_creat) {
+                open_file_discard(f);
                 return (uint32_t)-ENOENT;
             }
             int cr = vfs_create(path);
             if (cr != 0 && cr != -EEXIST) {
+                open_file_discard(f);
                 return (uint32_t)cr;
             }
             sws = vfs_stat(path, &st);
             if (sws != 0) {
+                open_file_discard(f);
                 return (uint32_t)sws;
             }
         }
         if (st.type != VFS_FILE) {
+            open_file_discard(f);
             return (uint32_t)-EISDIR;
         }
         if (!vfs_access(&st, current_uid(), current_gid(), W_OK)) {
+            open_file_discard(f);
             return (uint32_t)-EACCES;
         }
 
-        uint8_t *data = NULL;
-        size_t   size = 0;
         if (want_append) {
-            vfs_read_file(path, &data, &size); /* best-effort; empty is fine */
+            vfs_read_file(path, &f->data, &f->size); /* best-effort; empty is fine */
         }
+        f->offset = want_append ? f->size : 0;
 
-        t->fds[fd].used   = true;
-        t->fds[fd].flags  = flags;
-        t->fds[fd].data   = data;
-        t->fds[fd].size   = size;
-        t->fds[fd].offset = want_append ? size : 0;
-        strncpy(t->fds[fd].path, path, PUREUNIX_MAX_PATH - 1);
-        t->fds[fd].path[PUREUNIX_MAX_PATH - 1] = '\0';
+        t->fds[fd].used = true;
+        t->fds[fd].file = f;
         return (uint32_t)fd;
     }
     case SYS_CLOSE: {
         int fd = (int)regs->ebx;
         task_t *t = task_current();
-        if (fd < 3 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
             return (uint32_t)-EBADF;
         }
-        fd_entry_t *f = &t->fds[fd];
-        int rc = 0;
-        if (f->flags & O_WRONLY) {
-            int wr = vfs_write_file(f->path, f->data ? f->data : (const uint8_t *)"", f->size, 0);
-            if (wr != 0) rc = wr;
+        int rc = open_file_unref(t->fds[fd].file);
+        t->fds[fd].file = NULL;
+        if (fd >= 3) {
+            t->fds[fd].used = false;
         }
-        kfree(f->data);
-        memset(f, 0, sizeof(*f));
+        /* fd 0/1/2: left `used = true`, `file = NULL` — reverts to the
+         * default console binding rather than becoming truly closed (see
+         * include/pureunix/task.h's fd_entry_t comment). */
         return (uint32_t)rc;
     }
     case SYS_LSEEK: {
@@ -299,8 +401,12 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         int offset = (int)regs->ecx;
         int whence = (int)regs->edx;
         task_t *t = task_current();
-        if (fd < 3 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file) {
             return (uint32_t)-EBADF;
+        }
+        open_file_t *f = t->fds[fd].file;
+        if (f->kind != FD_KIND_FILE) {
+            return (uint32_t)-EINVAL; /* pipes aren't seekable */
         }
         int new_offset;
         switch (whence) {
@@ -308,10 +414,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             new_offset = offset;
             break;
         case SEEK_CUR:
-            new_offset = (int)t->fds[fd].offset + offset;
+            new_offset = (int)f->offset + offset;
             break;
         case SEEK_END:
-            new_offset = (int)t->fds[fd].size + offset;
+            new_offset = (int)f->size + offset;
             break;
         default:
             return (uint32_t)-EINVAL;
@@ -319,8 +425,120 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (new_offset < 0) {
             return (uint32_t)-EINVAL;
         }
-        t->fds[fd].offset = (size_t)new_offset;
+        f->offset = (size_t)new_offset;
         return (uint32_t)new_offset;
+    }
+    case SYS_PIPE: {
+        int *fds_out = (int *)regs->ebx;
+        if (!fds_out) {
+            return (uint32_t)-EINVAL;
+        }
+        task_t *t = task_current();
+        int read_fd = -1, write_fd = -1;
+        for (int i = 3; i < MAX_OPEN_FILES; i++) {
+            if (!t->fds[i].used) {
+                if (read_fd < 0) {
+                    read_fd = i;
+                } else {
+                    write_fd = i;
+                    break;
+                }
+            }
+        }
+        if (read_fd < 0 || write_fd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+
+        pipe_buf_t *p = kcalloc(1, sizeof(pipe_buf_t));
+        open_file_t *rf = open_file_alloc(FD_KIND_PIPE);
+        open_file_t *wf = open_file_alloc(FD_KIND_PIPE);
+        if (!p || !rf || !wf) {
+            kfree(p);
+            kfree(rf);
+            kfree(wf);
+            return (uint32_t)-ENOSPC;
+        }
+        p->read_ends = 1;
+        p->write_ends = 1;
+        rf->pipe_buf = p;
+        rf->pipe_is_write_end = false;
+        wf->pipe_buf = p;
+        wf->pipe_is_write_end = true;
+        wf->flags = O_WRONLY;
+
+        t->fds[read_fd].used = true;
+        t->fds[read_fd].file = rf;
+        t->fds[write_fd].used = true;
+        t->fds[write_fd].file = wf;
+
+        fds_out[0] = read_fd;
+        fds_out[1] = write_fd;
+        return 0;
+    }
+    case SYS_DUP: {
+        int oldfd = (int)regs->ebx;
+        task_t *t = task_current();
+        if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || !t->fds[oldfd].used) {
+            return (uint32_t)-EBADF;
+        }
+        int newfd = -1;
+        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+            if (!t->fds[i].used) {
+                newfd = i;
+                break;
+            }
+        }
+        if (newfd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+        t->fds[newfd].used = true;
+        t->fds[newfd].file = t->fds[oldfd].file;
+        open_file_ref(t->fds[newfd].file);
+        return (uint32_t)newfd;
+    }
+    case SYS_DUP2: {
+        int oldfd = (int)regs->ebx;
+        int newfd = (int)regs->ecx;
+        task_t *t = task_current();
+        if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || !t->fds[oldfd].used) {
+            return (uint32_t)-EBADF;
+        }
+        if (newfd < 0 || newfd >= MAX_OPEN_FILES) {
+            return (uint32_t)-EBADF;
+        }
+        if (oldfd == newfd) {
+            return (uint32_t)newfd;
+        }
+        if (t->fds[newfd].used) {
+            open_file_unref(t->fds[newfd].file);
+        }
+        t->fds[newfd].used = true;
+        t->fds[newfd].file = t->fds[oldfd].file;
+        open_file_ref(t->fds[newfd].file);
+        return (uint32_t)newfd;
+    }
+    case SYS_KILL: {
+        int pid = (int)regs->ebx;
+        int sig = (int)regs->ecx;
+        if (pid <= 0) {
+            return (uint32_t)-EINVAL; /* no process-group support */
+        }
+        task_t *t = task_current();
+        if (t && (uint32_t)pid == t->id) {
+            if (sig == 0) {
+                return 0; /* the null signal: self always "exists" */
+            }
+            /* Killing yourself: must actually stop running, not just get
+             * marked a zombie and fall through to this syscall's normal
+             * iret-back-to-ring3 return path — task_exit() (already used
+             * by every other process-termination path in this kernel)
+             * yields away and never comes back. */
+            task_exit(-sig);
+        }
+        if (task_kill((uint32_t)pid, sig) != 0) {
+            return (uint32_t)-ESRCH;
+        }
+        return 0;
     }
     case SYS_STAT: {
         const char *path = (const char *)regs->ebx;
@@ -522,13 +740,29 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     }
     case SYS_EXEC: {
         const char *path = (const char *)regs->ebx;
+        /* argv/envp are user-space pointers, read while this task's own
+         * address space is still the active one (elf_exec_current() only
+         * switches CR3 after copying everything out of them — see its
+         * comment). A NULL argv (ecx == 0, e.g. old callers/pu_exec())
+         * means "just the bare path"; a NULL envp (edx == 0) means an
+         * empty environment, same as real execve(path, argv, NULL). */
+        char *const default_argv[] = { (char *)path, NULL };
+        char *const *argv = (char *const *)regs->ecx;
+        char *const *envp = (char *const *)regs->edx;
         if (!path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)elf_exec_current(regs, path);
+        if (!argv) {
+            argv = default_argv;
+        }
+        int argc = 0;
+        while (argc < ELF_MAX_ARGS && argv[argc]) {
+            argc++;
+        }
+        return (uint32_t)elf_exec_current(regs, path, argc, argv, envp);
     }
     case SYS_WAIT: {
         int pid = (int)regs->ebx;
@@ -583,6 +817,87 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         ws->ws_col = (unsigned short)cols;
         ws->ws_xpixel = 0;
         ws->ws_ypixel = 0;
+        return 0;
+    }
+    case SYS_CHDIR: {
+        const char *path = (const char *)regs->ebx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        char resolved[PUREUNIX_MAX_PATH];
+        vfs_normalize(resolved, task_current_cwd(), path);
+        vfs_stat_t st;
+        int rc = vfs_stat(resolved, &st);
+        if (rc != 0) {
+            return (uint32_t)rc;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            return (uint32_t)-ENOTDIR;
+        }
+        if (!vfs_access(&st, current_uid(), current_gid(), X_OK)) {
+            return (uint32_t)-EACCES;
+        }
+        if (task_set_cwd(resolved) != 0) {
+            return (uint32_t)-ENAMETOOLONG;
+        }
+        return 0;
+    }
+    case SYS_GETCWD: {
+        char *buf = (char *)regs->ebx;
+        size_t size = (size_t)regs->ecx;
+        if (!buf || size == 0) {
+            return (uint32_t)-EINVAL;
+        }
+        const char *cwd = task_current_cwd();
+        size_t len = strlen(cwd);
+        if (len + 1 > size) {
+            return (uint32_t)-ERANGE;
+        }
+        memcpy(buf, cwd, len + 1);
+        return 0;
+    }
+    case SYS_NANOSLEEP: {
+        const struct pureunix_timespec *req = (const struct pureunix_timespec *)regs->ebx;
+        struct pureunix_timespec *rem = (struct pureunix_timespec *)regs->ecx;
+        if (!req || req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
+            return (uint32_t)-EINVAL;
+        }
+        uint32_t ms = (uint32_t)req->tv_sec * 1000u + (uint32_t)(req->tv_nsec / 1000000L);
+        pit_sleep(ms);
+        /* No signal delivery exists yet (docs/syscalls.md's "Unimplemented
+         * Syscalls"), so a sleep can never be interrupted early — it always
+         * completes in full, leaving no remaining time to report. */
+        if (rem) {
+            rem->tv_sec = 0;
+            rem->tv_nsec = 0;
+        }
+        return 0;
+    }
+    case SYS_GETUID:
+        return (uint32_t)current_uid();
+    case SYS_GETGID:
+        return (uint32_t)current_gid();
+    case SYS_UTIME: {
+        const char *path = (const char *)regs->ebx;
+        uint32_t atime = regs->ecx;
+        uint32_t mtime = regs->edx;
+        if (!path) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        return (uint32_t)vfs_utime(path, atime, mtime);
+    }
+    case SYS_GETTIMEOFDAY: {
+        uint32_t *out = (uint32_t *)regs->ebx;
+        if (!out) {
+            return (uint32_t)-EINVAL;
+        }
+        *out = time_now();
         return 0;
     }
     case SYS_DEBUG_SETCRED: {

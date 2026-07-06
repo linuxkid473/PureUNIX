@@ -7,6 +7,7 @@
 #include <pureunix/io.h>
 #include <pureunix/kernel.h>
 #include <pureunix/memory.h>
+#include <pureunix/signal.h>
 #include <pureunix/stat.h>
 #include <pureunix/stdio.h>
 #include <pureunix/stdlib.h>
@@ -69,6 +70,23 @@ void shell_env_list(shell_output_t *out)
     for (size_t i = 0; i < env_count; ++i) {
         shell_out_printf(out, "%s=%s\n", env[i].key, env[i].value);
     }
+}
+
+/* Renders the current env table as a NULL-terminated "KEY=VALUE" envp array
+ * suitable for elf_exec_argv()/elf_exec_current(), which copy every string
+ * onto the new process's stack before returning — so it's safe for this to
+ * be reused/overwritten by the next call. */
+char *const *shell_build_envp(void)
+{
+    static char slots[ARRAY_SIZE(env)][sizeof(((env_var_t *)0)->key) + 1 + sizeof(((env_var_t *)0)->value)];
+    static char *ptrs[ARRAY_SIZE(env) + 1];
+
+    for (size_t i = 0; i < env_count; ++i) {
+        snprintf(slots[i], sizeof(slots[i]), "%s=%s", env[i].key, env[i].value);
+        ptrs[i] = slots[i];
+    }
+    ptrs[env_count] = NULL;
+    return ptrs;
 }
 
 static int cmd_help(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out);
@@ -426,6 +444,11 @@ static int cmd_cd(shell_context_t *ctx, shell_command_t *cmd, const char *input,
         return -1;
     }
     strcpy(ctx->cwd, path);
+    /* Keeps the kernel's own "current task" (there is no separate task for
+     * the interactive shell itself — see task_set_cwd()'s doc comment) in
+     * sync, so a child process launched afterward via elf_exec_argv()
+     * starts in the directory the shell is actually in. */
+    task_set_cwd(ctx->cwd);
     return 0;
 }
 
@@ -666,7 +689,7 @@ static int cmd_ps(shell_context_t *ctx, shell_command_t *cmd, const char *input,
 static int cmd_kill(shell_context_t *ctx, shell_command_t *cmd, const char *input, shell_output_t *out)
 {
     if (require_args(cmd, 2, out, "kill PID") != 0) return -1;
-    if (task_kill((uint32_t)atoi(cmd->argv[1])) != 0) {
+    if (task_kill((uint32_t)atoi(cmd->argv[1]), SIGTERM) != 0) {
         shell_out_puts(out, "kill: no such task\n");
         return -1;
     }

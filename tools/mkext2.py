@@ -416,6 +416,16 @@ class Ext2Builder:
 
 # Short-name aliases for docs files, mirrored from tools/mkfat16.py so both
 # filesystems present the same lookup names under /docs and /fat/docs.
+# The applet set enabled in third_party/busybox/pureunix.config — kept in
+# sync by hand (there's no way to introspect a prebuilt busybox.elf's
+# applet table from Python without running it). See docs/userland.md's
+# "BusyBox" section and tools/build-busybox.sh.
+BUSYBOX_APPLETS = [
+    "basename", "cat", "cp", "dirname", "echo", "false", "ln", "ls",
+    "mkdir", "mv", "pwd", "rm", "rmdir", "sleep", "test", "touch", "true",
+    "wc", "yes",
+]
+
 DOC_ALIASES = {
     "architecture.md": "arch.md",
     "boot.md":         "boot.md",
@@ -485,6 +495,14 @@ def add_bin(fs, programs):
     # elf_exec()'s X_OK check runs against hello.elf's own resolved mode.
     if any(os.path.basename(p).lower() == 'hello.elf' for p in programs):
         fs.add_symlink(bin_ino, 'hello', 'hello.elf')
+
+    # BusyBox multi-call binary: one ELF, dispatched by argv[0]'s basename
+    # (applets/applets.c's find_applet_by_name()) — every applet name is
+    # just a symlink to the same busybox.elf, exactly like a real BusyBox
+    # install's /bin/ls -> busybox. See docs/userland.md's "BusyBox" section.
+    if any(os.path.basename(p).lower() == 'busybox.elf' for p in programs):
+        for applet in BUSYBOX_APPLETS:
+            fs.add_symlink(bin_ino, applet, 'busybox.elf')
 
 
 def main(argv):

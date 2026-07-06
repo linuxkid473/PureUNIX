@@ -109,11 +109,13 @@ typedef struct shell_context {
    - If input redirection (`cmd->input` is set), reads the file via VFS into a heap buffer.
    - Runs the command with `run_command(ctx, cmd, input, &out)`, where `out` is a `shell_output_t` backed by the current stage buffer.
    - The output buffer from this stage becomes the `input` for the next.
-4. For the final command:
+4. For the final command, **only if it was a builtin** (`shell_find_builtin()` still finds it — checked again in this same loop, since `run_command()`'s own check isn't visible here):
    - If output redirection is set, writes `out.buffer` to the VFS file (append or truncate).
    - Otherwise, writes `out.buffer` to the VGA console via `vga_write_len`.
 
-The two stage buffers alternate (`stage_a`, `stage_b`, `stage_a`, ...) so that no extra allocation is needed for up to 4 pipe stages.
+An **external** program's output never goes through `out.buffer` at all — a real ELF program's own `write(1, ...)` calls go straight through its own file descriptor table, which `shell_output_t` knows nothing about (`out.buffer` stays empty for it, always). Its normal, unredirected output already reaches the console directly (routed by `SYS_WRITE` — see `docs/syscalls.md`), which is why this never looked broken for the ordinary case. Output *redirection* for an external program instead happens inside `exec_external()` itself (see "Command Resolution" below), by giving the launched program's fd 1 a real redirected binding *before* it starts — this only became possible once `SYS_DUP2`/shared file descriptions existed (see `docs/syscalls.md`'s "File descriptors are now shared, refcounted open file descriptions"); before that, `cmd->output` on an external command silently produced an empty file while the real output leaked to the console.
+
+The two stage buffers alternate (`stage_a`, `stage_b`, `stage_a`, ...) so that no extra allocation is needed for up to 4 pipe stages. This buffer-relay mechanism only actually carries data between **builtin** pipeline stages — an external program's real output was never captured into it to relay to a next stage either, so `cmd1 | cmd2` where either side is an external ELF program doesn't work yet (needs real `SYS_PIPE`-based stage wiring, not just the redirect fix above).
 
 ---
 
@@ -126,7 +128,8 @@ The two stage buffers alternate (`stage_a`, `stage_b`, `stage_a`, ...) so that n
 3. Otherwise, calls `exec_external`.
 
 `exec_external`:
-- If `argv[0]` contains `/`, resolves it against `cwd` via `vfs_normalize` and calls `elf_exec_argv(path, cmd->argc, cmd->argv)`.
+- If `cmd->output` is set, calls `shell_redirect_stdout()` first — resolves the target path, creates it if needed, and installs a real `open_file_t` onto the shell's own fd 1 (there's no separate task for the interactive shell; it runs as `task_current()`, the same task `kernel_main()` calls into). `task_create_user()` (`kernel/task.c`) now shares fds with its creator exactly like `task_fork()` does, so the launched program inherits that redirected fd 1 the same way a real shell's `fork()`+`dup2()`+`exec()` sequence would give it one. `shell_restore_stdout()` puts fd 1 back to the console binding afterward — which is also what flushes the write, since the shell's own reference was the last one once the launched program's own copy closed at its exit (`kernel/task.c`'s `close_all_fds()`, run when a task is reaped).
+- Path resolution itself (`exec_external_inner`) is unchanged: if `argv[0]` contains `/`, resolves it against `cwd` via `vfs_normalize` and calls `elf_exec_argv(path, cmd->argc, cmd->argv, envp)`.
 - Special case: `calculator` maps to `/bin/calc.elf`.
 - Otherwise, tries `/bin/NAME.elf`, then `/bin/NAME`.
 - If none found, prints "command not found".

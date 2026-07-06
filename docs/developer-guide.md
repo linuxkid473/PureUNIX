@@ -200,7 +200,9 @@ User ELF programs run at ring 0 in the kernel address space. A bad pointer in a 
 
 ### Stack Overflow in Tasks
 
-Task stacks are 16 KiB with no guard page. Deep recursion or large stack frames silently overwrite adjacent heap blocks. The heap magic value (`0xC0FFEE42`) in adjacent `heap_block_t` headers may be used to detect corruption manually.
+Task stacks are 64 KiB (raised from an original 16 KiB — see below) with no guard page. Deep recursion or large stack frames silently overwrite adjacent heap blocks. The heap magic value (`0xC0FFEE42`) in adjacent `heap_block_t` headers may be used to detect corruption manually.
+
+This actually happened: the original 16 KiB budget silently overran during the BusyBox port's `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` work, corrupting kernel memory as far away as EXT2's block group descriptor table, with symptoms (`[ext2] block: read of block 0 rejected`, spurious `-ENOENT`s) that pointed everywhere except the stack. The trigger: EXT2's own functions keep whole block-sized buffers on the stack rather than sharing one (`fs/ext2/alloc.c`'s `ext2_alloc_block()` alone stacks two 4 KiB locals), and the deepest real call chain — creating a file that triggers directory growth, `SYS_OPEN` → `vfs_create()` → `ext2_create()` → `ext2_dir_insert()` → `ext2_alloc_block()` — stacks three or more of these on top of each other, on top of the interrupt frame every syscall already carries (there is no separate per-syscall stack — see `kernel/task.c`'s `TASK_STACK_SIZE`). `user/systest.c`'s 200-file directory-growth stress section was enough to trip it. If stack corruption resurfaces after further changes here, suspect this exact chain first.
 
 ### Cooperative Scheduling Only
 

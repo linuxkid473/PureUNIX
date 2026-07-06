@@ -7,16 +7,88 @@
 
 #define MAX_OPEN_FILES 16
 
-/* One slot in a task's file descriptor table.
-   data is the entire file loaded at open() time via vfs_read_file(). */
+typedef enum fd_kind {
+    FD_KIND_FILE = 0,
+    FD_KIND_PIPE = 1,
+} fd_kind_t;
+
+/* Ring buffer shared by both ends of one pipe() call — allocated once per
+ * pipe() (SYS_PIPE, arch/i386/syscall.c) and freed once both ends' last
+ * reference is gone. read_ends/write_ends count *distinct open_file_t's*
+ * holding that end open, not fd-table slots aliasing one of them (dup()/
+ * dup2()/fork() bump an open_file_t's own refcount instead — see below). */
+#define PUREUNIX_PIPE_SIZE 4096
+typedef struct pipe_buf {
+    uint8_t data[PUREUNIX_PIPE_SIZE];
+    size_t head, tail, count;
+    int read_ends;
+    int write_ends;
+} pipe_buf_t;
+
+/* An open file description (POSIX's term) — the thing dup()/dup2()/fork()
+ * actually share between multiple fd-table slots, distinct from a file
+ * descriptor (just a task-local index into fd_entry_t[] pointing at one of
+ * these). Refcounted: open_file_unref() only actually frees it (flushing a
+ * FD_KIND_FILE write to the VFS, or retiring a FD_KIND_PIPE end) once the
+ * last fd slot referencing it — across every task that shared it via
+ * dup()/dup2()/fork() — has been closed. */
+typedef struct open_file {
+    int refcount;
+    fd_kind_t kind;
+    int flags; /* open() flags: O_RDONLY / O_WRONLY / O_RDWR */
+
+    /* FD_KIND_FILE: whole-file-in-memory, same model this project has
+     * always used — data is the entire file loaded at open() time via
+     * vfs_read_file(), flushed back in one shot via vfs_write_file() when
+     * the last reference is closed. */
+    char     path[PUREUNIX_MAX_PATH]; /* VFS path — used for the close()-time flush */
+    uint8_t *data;                    /* kmalloc'd file contents; freed on close */
+    size_t   size;                    /* total file size in bytes */
+    size_t   offset;                  /* current seek position — shared by every fd
+                                        * slot referencing this description, exactly
+                                        * like a real UNIX open file description */
+
+    /* FD_KIND_PIPE: which end of *pipe_buf this description represents
+     * (a pipe() call always produces two open_file_t's sharing one
+     * pipe_buf_t, one per end). */
+    pipe_buf_t *pipe_buf;
+    bool pipe_is_write_end;
+} open_file_t;
+
+/* One slot in a task's file descriptor table. Slots 0/1/2 start out with
+ * file == NULL, meaning "the default console binding" (SYS_READ/SYS_WRITE
+ * special-case fd 0/1/2 with a null file pointer straight to the tty/VGA
+ * driver — see arch/i386/syscall.c); dup2()ing something onto 0/1/2
+ * installs a real open_file_t there instead, exactly like redirecting a
+ * real UNIX process's stdin/stdout/stderr. Explicitly close()ing 0/1/2
+ * reverts to the console binding rather than leaving the slot truly
+ * closed — deliberately simpler than real UNIX (where it would become a
+ * genuinely invalid fd available for reuse), since nothing in this
+ * project's userland relies on that distinction. */
 typedef struct fd_entry {
-    bool     used;
-    int      flags;              /* open() flags: O_RDONLY / O_WRONLY / O_RDWR */
-    char     path[PUREUNIX_MAX_PATH]; /* VFS path — used for re-stat and debugging */
-    uint8_t *data;               /* kmalloc'd file contents; freed on close */
-    size_t   size;               /* total file size in bytes */
-    size_t   offset;             /* current seek position */
+    bool used;
+    open_file_t *file;
 } fd_entry_t;
+
+/* Allocates a new, zeroed, refcount-1 open file description of the given
+ * kind. Returns NULL on allocation failure. */
+open_file_t *open_file_alloc(fd_kind_t kind);
+/* Bumps refcount — used by dup()/dup2() (arch/i386/syscall.c) and by
+ * task_fork() below (fork() shares open file descriptions with the
+ * child, per POSIX — including the current seek offset — rather than
+ * deep-copying them, exactly like a real UNIX fork()). */
+void open_file_ref(open_file_t *f);
+/* Drops refcount; once it reaches zero, flushes a FD_KIND_FILE's buffered
+ * writes to the VFS (vfs_write_file()) or retires a FD_KIND_PIPE end
+ * (decrementing pipe_buf's read_ends/write_ends, freeing pipe_buf itself
+ * once both are zero), then frees f. Safe to call with f == NULL (no-op) —
+ * every fd_entry_t's file starts NULL for the console-bound stdio slots.
+ * Returns the flush's result (0 or a negative errno) if this was the last
+ * reference to a written FD_KIND_FILE, or 0 otherwise — SYS_CLOSE
+ * (arch/i386/syscall.c) surfaces this as its own return value; dup2()/
+ * fork()'s cleanup paths ignore it, matching real close()/dup2() (which
+ * never reports another fd's flush errors either). */
+int open_file_unref(open_file_t *f);
 
 typedef enum task_state {
     TASK_READY,
@@ -62,6 +134,12 @@ typedef struct task {
      * credentials at task_create() time. */
     uid_t uid;
     gid_t gid;
+    /* Working directory, used to resolve relative paths a syscall hands
+     * the VFS (see SYS_CHDIR/SYS_GETCWD in arch/i386/syscall.c). Always an
+     * absolute, normalized path (vfs_normalize()'s output). A child
+     * inherits its creator's cwd at task_create()/task_fork() time — see
+     * task_alloc() — exactly like uid/gid above. */
+    char cwd[PUREUNIX_MAX_PATH];
 } task_t;
 
 void tasking_init(void);
@@ -90,7 +168,15 @@ int task_join(task_t *t);
 int task_waitpid(int pid, int *status);
 task_t *task_current(void);
 void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx);
-int task_kill(uint32_t id);
+/* Terminates task `id` (never the initial kernel task) with the POSIX
+ * *default action* for signal `sig` — there is no handler-dispatch
+ * mechanism (see docs/syscalls.md's SYS_KILL section for why), so every
+ * nonzero `sig` just kills it outright, recorded as exit_code = -sig (see
+ * SYS_WAIT's status convention below) so a waiting parent can tell a
+ * signaled death from a normal exit. `sig == 0` is POSIX's "null signal":
+ * probes whether `id` exists and is killable without killing it. Returns
+ * 0 if `id` was found, -1 otherwise. */
+int task_kill(uint32_t id, int sig);
 
 /* Credentials of the currently scheduled task. Never reads a global —
  * always goes through task_current(), so callers (chiefly the VFS
@@ -102,5 +188,19 @@ gid_t current_gid(void);
  * called only by the kernel-mode login flow (kernel/users.c) once a
  * username/password pair has been verified against /etc/shadow. */
 void task_set_creds(uid_t uid, gid_t gid);
+
+/* Working directory of the currently scheduled task — same current()-
+ * indirection rationale as current_uid()/current_gid() above. Always an
+ * absolute, normalized path; "/" for the initial kernel task. */
+const char *task_current_cwd(void);
+/* Sets the *current* task's cwd outright (SYS_CHDIR has already resolved
+ * and validated path as a real, accessible directory — see
+ * arch/i386/syscall.c). Also used by shell/sh.c to keep the kernel's own
+ * "current" task (there is no separate task for the interactive shell — it
+ * runs as the same task that calls kernel_main()) in sync with the shell's
+ * own cwd tracking, so a child process spawned via elf_exec_argv() starts
+ * in the directory the shell was actually in, not always "/". Returns -1 if
+ * path doesn't fit in the task's cwd buffer. */
+int task_set_cwd(const char *path);
 
 #endif

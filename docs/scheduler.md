@@ -74,7 +74,7 @@ void tasking_init(void) {
 `task_create(name, entry, arg)`:
 
 1. Allocates a `task_t` via `kcalloc`.
-2. Allocates a 16 KiB stack via `kmalloc`.
+2. Allocates a kernel stack via `kmalloc` (`TASK_STACK_SIZE`, `kernel/task.c` — 64 KiB; see `docs/developer-guide.md`'s "Stack Overflow in Tasks" for why it was raised from the original 16 KiB).
 3. Initializes the stack frame so that when `context_switch` first resumes this task, it begins executing `task_bootstrap`.
 
 The stack setup places the following in memory growing downward from `stack_base + TASK_STACK_SIZE`:
@@ -197,7 +197,7 @@ Sets the current task to ZOMBIE and yields. If `task_yield` ever returns (it sho
 1. `task_alloc()` a new `task_t` + kernel stack, same as any other task.
 2. `vmm_create_user_directory()` + `vmm_fork_address_space()` give the child a private, deep copy of the parent's user window (see `docs/memory.md`) — parent and child are independent from this point on.
 3. `is_fork_child = true` and `fork_regs = *parent_regs` with `fork_regs.eax` cleared to 0, so the child "returns" 0 from `fork()` the first time it's scheduled (see Task Bootstrap above); the parent gets the child's id back from the normal syscall return path.
-4. Every fd the parent has open is deep-copied (not shared) — this kernel has no shared-file-description concept, so seeking/closing one process's copy never affects the other's.
+4. Every fd the parent has open is *shared* with the child (each `fd_entry_t.file` pointer is copied and the underlying `open_file_t`'s refcount bumped via `open_file_ref()` — see `docs/syscalls.md`'s "File descriptors are now shared, refcounted open file descriptions"), exactly like a real UNIX `fork()`: parent and child see the same seek offset on any fd open before the fork, and a pipe's two ends survive the fork intact on both sides. This used to be a deep copy (giving the child an independent offset on every inherited fd) before `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` existed.
 
 Returns the new `task_t *`, or `NULL` on failure (not a ring-3 caller, or allocation/address-space-copy failure).
 

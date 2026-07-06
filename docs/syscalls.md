@@ -47,8 +47,8 @@ static int syscall3(int n, int a, int b, int c)
 | 8 | `SYS_LSEEK` | fd | offset (signed) | whence | new offset or negative error |
 | 9 | `SYS_STAT` | path pointer | `struct stat *` | — | 0 or negative error |
 | 10 | `SYS_ACCESS` | path pointer | mode (`F_OK`/`R_OK`/`W_OK`/`X_OK`) | — | 0, `-EACCES`, or `-ENOENT` |
-| 11 | `SYS_CHMOD` | path pointer | mode | — | `-EROFS` (infrastructure only, see below) |
-| 12 | `SYS_CHOWN` | path pointer | uid | gid | `-EROFS` (infrastructure only, see below) |
+| 11 | `SYS_CHMOD` | path pointer | mode | — | 0, or negative error (real on EXT2, `-EROFS` on FAT16 — see below) |
+| 12 | `SYS_CHOWN` | path pointer | uid | gid | 0, or negative error (real on EXT2, `-EROFS` on FAT16 — see below) |
 | 13 | `SYS_READDIR` | path pointer | `struct dirent *` buffer | max entries | entry count or negative error |
 | 14 | `SYS_DEBUG_SETCRED` | uid | gid | — | 0 (test hook — see below) |
 | 15 | `SYS_READLINK` | path pointer | buffer pointer | buffer size | bytes copied or negative error |
@@ -60,11 +60,21 @@ static int syscall3(int n, int a, int b, int c)
 | 21 | `SYS_LINK` | old path pointer | new path pointer | — | 0 or negative error |
 | 22 | `SYS_SYMLINK` | target pointer | path pointer | — | 0 or negative error |
 | 23 | `SYS_FORK` | — | — | — | child's pid in the parent, `0` in the child, or `-1` |
-| 24 | `SYS_EXEC` | path pointer | — | — | only returns (negative error) on failure |
+| 24 | `SYS_EXEC` | path pointer | `argv[]` pointer, or 0 | `envp[]` pointer, or 0 | only returns (negative error) on failure |
 | 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | — | reaped child's pid, or `-1` if no such child |
 | 26 | `SYS_TCGETATTR` | fd (0, 1, or 2) | `struct termios *` | — | 0 or negative error |
 | 27 | `SYS_TCSETATTR` | fd (0, 1, or 2) | `struct termios *` | actions (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) | 0 or negative error |
 | 28 | `SYS_IOCTL` | fd (0, 1, or 2) | request (`TIOCGWINSZ`) | `struct winsize *` | 0 or negative error |
+| 29 | `SYS_CHDIR` | path pointer | — | — | 0 or negative error |
+| 30 | `SYS_GETCWD` | buffer pointer | buffer size | — | 0 or negative error |
+| 31 | `SYS_NANOSLEEP` | pointer to requested `struct pureunix_timespec` | pointer to remaining-time output, or NULL | — | 0 or negative error |
+| 32 | `SYS_GETUID` | — | — | — | the caller's uid |
+| 33 | `SYS_GETGID` | — | — | — | the caller's gid |
+| 34 | `SYS_UTIME` | path pointer | atime (or `0xFFFFFFFF`) | mtime (or `0xFFFFFFFF`) | 0 or negative error |
+| 35 | `SYS_GETTIMEOFDAY` | pointer to `uint32_t` | — | — | 0 or negative error |
+| 36 | `SYS_PIPE` | pointer to `int[2]` output | — | — | 0 or negative error |
+| 37 | `SYS_DUP` | fd to duplicate | — | — | new fd or negative error |
+| 38 | `SYS_DUP2` | fd to duplicate | fd to become a copy of it | — | newfd or negative error |
 
 ---
 
@@ -76,7 +86,7 @@ Returns the value of `EBX` from `syscall_dispatch` back to `isr_dispatch`, which
 
 ## SYS_WRITE (2)
 
-Writes `len` bytes from `buf` to the console. Only file descriptors 1 (stdout) and 2 (stderr) are accepted; both route to `putchar` → `vga_putc`. Any other file descriptor returns `-EBADF`.
+Writes `len` bytes from `buf`. fds 1 and 2 route to `putchar` → `vga_putc` (the console) *as long as they still hold their default console binding* — see "File descriptors are now shared, refcounted open file descriptions" below; `SYS_DUP2` can redirect either of them to a real open file or pipe, exactly like a real UNIX process's stdout/stderr redirection, in which case they behave like any other writable fd instead. Any fd outside `[0, MAX_OPEN_FILES)`, or one that isn't currently open, returns `-EBADF`.
 
 ---
 
@@ -84,7 +94,7 @@ Writes `len` bytes from `buf` to the console. Only file descriptors 1 (stdout) a
 
 Reads from `fd`.
 
-**fd == 0 (stdin)**:
+**fd == 0 (stdin), still holding its default console binding** (see "File descriptors are now shared, refcounted open file descriptions" below — `SYS_DUP2` can redirect fd 0 to a real file or pipe, in which case it's read like any other fd instead):
 
 Routed through `tty_read()` (`drivers/tty.c`), which applies whatever `struct termios` is currently in effect for the console — see `SYS_TCGETATTR`/`SYS_TCSETATTR` below. By default (canonical mode, `ICANON|ECHO|ECHOE|ISIG`):
 
@@ -94,16 +104,18 @@ In raw mode (`ICANON` clear), returns as soon as at least one byte is available 
 
 Note for anyone adding future syscalls that can block waiting on the keyboard: `int $0x80` runs with interrupts masked (see `arch/i386/interrupt_stubs.S`'s `isr128`), so a blocking read must call `arch_enable_interrupts()` before waiting — otherwise `keyboard_getkey()`'s `hlt` loop can never be woken by the keyboard IRQ. `tty_read()` does this already.
 
-**fd ≥ 3 (open file)**:
+**fd ≥ 3, or fd 0/1/2 redirected via `SYS_DUP2` (a real open file or pipe)**:
 
-Reads up to `len` bytes from the current file offset of the open descriptor into `buf`. Advances the offset by the number of bytes copied. Returns 0 at EOF (offset ≥ file size). Zero-length reads are valid and return 0. The file content was loaded into a kernel buffer at `SYS_OPEN` time; no disk I/O occurs during `SYS_READ`.
+For `FD_KIND_FILE`: reads up to `len` bytes from the current file offset into `buf`. Advances the offset by the number of bytes copied — shared with every other fd referencing the same open file description (see below), not just this one. Returns 0 at EOF (offset ≥ file size). Zero-length reads are valid and return 0. The file content was loaded into a kernel buffer at `SYS_OPEN` time; no disk I/O occurs during `SYS_READ`.
+
+For `FD_KIND_PIPE` (the read end of a `SYS_PIPE`): see `SYS_PIPE` below.
 
 **Error returns**:
 
 | Code | Value | Condition |
 |---|---|---|
 | `-EINVAL` | -22 | null `buf` pointer |
-| `-EBADF` | -9 | fd is 1 or 2 (write-only), or fd is outside [0, MAX_OPEN_FILES), or fd is ≥ 3 and not open |
+| `-EBADF` | -9 | fd 1/2 still console-bound (write-only), fd outside `[0, MAX_OPEN_FILES)`, fd not open, or (pipe) reading from the write end |
 
 ---
 
@@ -162,12 +174,12 @@ Closes an open file descriptor, flushing buffered writes first, then frees its k
 
 | Code | Value | Meaning |
 |---|---|---|
-| `-EBADF` | -9 | fd is not in range 3–15, or not currently open |
-| *(flush failure)* | | any negative errno `vfs_write_file()` returns, if the descriptor was opened writable |
+| `-EBADF` | -9 | fd is outside `[0, MAX_OPEN_FILES)`, or not currently open |
+| *(flush failure)* | | any negative errno `vfs_write_file()` returns, if this was the *last* reference (see below) to a descriptor opened writable |
 
-If the descriptor was opened with `O_WRONLY` (Stage 4), its entire in-memory write buffer is flushed to the filesystem via one `vfs_write_file()` call before the buffer is freed — the fd's whole write lifetime is "accumulate in memory, commit once on close," mirroring the read side's "load whole file into memory on open."
+This drops one reference to the fd's underlying open file description (`open_file_unref()`, `kernel/task.c`) — see "File descriptors are now shared, refcounted open file descriptions" below. Only once the *last* reference is gone does an `O_WRONLY` `FD_KIND_FILE`'s entire in-memory write buffer actually get flushed to the filesystem via one `vfs_write_file()` call (the fd's whole write lifetime is "accumulate in memory, commit once on the last close," mirroring the read side's "load whole file into memory on open"); a `FD_KIND_PIPE` end similarly only retires once every fd referencing that same end (across every task that reached it via `dup()`/`dup2()`/`fork()`) has been closed.
 
-Descriptors 0, 1, and 2 cannot be closed. After a successful close the descriptor slot is zeroed and available for reuse.
+Descriptors 0, 1, and 2 *can* now be closed (unlike before `SYS_DUP2` existed) — doing so reverts that slot to the default console binding rather than leaving it genuinely unusable. Fd slots ≥ 3 become fully free (available for a future `SYS_OPEN`/`SYS_PIPE`/`SYS_DUP`) after a successful close.
 
 ---
 
@@ -264,11 +276,19 @@ Checks whether the calling task's credentials would permit the requested access 
 
 ## SYS_CHMOD (11) / SYS_CHOWN (12)
 
-Syscall infrastructure only — no filesystem stores mutable permission/ownership bits yet.
+Real on EXT2 (`fs/ext2/mount.c`'s `ext2_chmod()`/`ext2_chown()` mutate the inode's `i_mode`/`i_uid`/`i_gid` directly and persist it), still `-EROFS` on FAT16 (no Unix ownership/permission concept exists there at all, so `ops->chmod`/`ops->chown` stay `NULL`).
 
-**SYS_CHMOD** — `EBX`: path pointer, `ECX`: mode. **SYS_CHOWN** — `EBX`: path pointer, `ECX`: uid, `EDX`: gid.
+**SYS_CHMOD** — `EBX`: path pointer, `ECX`: mode (only the low 12 bits — permission + setuid/setgid/sticky — are used; the on-disk file-type bits are preserved untouched no matter what's passed). **SYS_CHOWN** — `EBX`: path pointer, `ECX`: uid, `EDX`: gid; either can be `(uid_t)-1`/`(gid_t)-1` to mean "leave unchanged" (POSIX `chown(2)`'s convention, e.g. changing only the group).
 
-**Returns**: `-ENOENT` if the path doesn't exist, otherwise `-EROFS` (both EXT2 and FAT16 leave `ops->chmod`/`ops->chown` `NULL`). The syscalls exist now so a future writable filesystem can support them without any ABI change.
+**Returns**: `0` on success, or a negative error code:
+
+| Code | Condition |
+|---|---|
+| `-ENOENT` | the path doesn't exist |
+| `-EROFS` | the target filesystem doesn't support chmod/chown at all (FAT16) |
+| `-EPERM` | `SYS_CHMOD`: the caller is neither the file's owner nor root. `SYS_CHOWN`: the caller isn't root — chown is root-only outright, since PureUNIX's single-uid/gid-per-task model has no supplementary-group concept that would let a non-root owner hand a file to a group they belong to |
+
+Permission checks happen in `fs/vfs.c`'s `vfs_chmod()`/`vfs_chown()`, before the filesystem-specific `ops->chmod`/`ops->chown` is ever called — same `current_uid()`/`current_gid()` pattern every other permission-checked VFS entry point uses.
 
 ---
 
@@ -382,7 +402,9 @@ Duplicates the calling process, which must be a ring-3 task (kernel-mode callers
 
 Replaces the calling process's own address space with the ELF at `path`, in place — the userspace-visible equivalent of POSIX `execve()`. Builds an entirely new page directory and loads the program into it before touching the caller's state, so a failure (bad path, bad ELF, permission denied, out of memory) leaves the caller completely unaffected and returns normally with a negative error code. On success, the caller's old address space is freed, CR3 is switched, and the very same `int $0x80` return path is redirected (by overwriting the trap frame's `eip`/`useresp`) to start the new program instead of resuming the old one — there is no observable "return" from a successful call.
 
-**Arguments**: `EBX`: pointer to the ELF's path. **Returns**: only ever returns on failure (`-1`, or whatever negative errno the ELF loader produced — see `elf_load_into()` in `kernel/elf.c`).
+**Arguments**: `EBX`: pointer to the ELF's path. `ECX`: pointer to a NULL-terminated `argv[]` array (in the caller's own memory), or `0` for the bare `{path, NULL}` argv `pu_exec()` has always passed. `EDX`: pointer to a NULL-terminated `envp[]` array of `"KEY=VALUE"` strings (in the caller's own memory), or `0` for an empty environment. **Returns**: only ever returns on failure (`-1`, or whatever negative errno the ELF loader produced — see `elf_load_into()` in `kernel/elf.c`).
+
+`argv`/`envp` are read directly out of the caller's own address space — safe because the kernel only switches CR3 to the new program's page directory *after* every string and pointer has already been copied onto the new stack (see `elf_load_into()`/`build_argv_stack()` in `kernel/elf.c`), so there's no window where the old pointers are read through the wrong mapping. `argc` isn't a separate argument; the kernel counts `argv[]` up to `ELF_MAX_ARGS` (16) entries by scanning for the NULL terminator, same as any real `execve()`. A NULL `envp` means a genuinely empty environment, not "inherit the caller's" — there is no per-process environment state to inherit from (a forked child only sees env vars its parent explicitly passed to `SYS_EXEC`).
 
 Fork before exec (the classic `fork()` + `exec()` pattern) to run a new program while the caller keeps running — `elf_exec_current()` (this syscall's implementation) always replaces the *calling* task, never spawns a separate one.
 
@@ -395,6 +417,8 @@ Blocks (cooperatively, via `task_yield()`) until a child of the caller becomes a
 **Arguments**: `EBX`: pid to wait for (`-1` = any child of the caller), `ECX`: pointer to an `int` to receive the exit code, or NULL to discard it.
 
 **Returns**: the reaped child's pid, or `-1` if the caller has no child matching `pid` (neither running nor already a zombie).
+
+The `int` written to `*status` is the child's bare exit code (e.g. a child that called `pu_exit(7)` leaves `7` there) — not Linux's `(code << 8)`-style encoding, since there's no signal-terminated case to distinguish yet (see this doc's "Unimplemented Syscalls" section's note on `kill`/`signal`). `pu_wait()` and `user/systest.c`'s regression coverage both expect this raw form. Newlib's `wait()`/`waitpid()` (`user/newlib_syscalls.c`) translate it to the Linux-style encoding at the libc boundary — `(code & 0xff) << 8` — purely so newlib's own `<sys/wait.h>` `WIFEXITED`/`WEXITSTATUS` macros (which assume that encoding) work correctly; the kernel ABI itself is unaffected.
 
 ---
 
@@ -445,6 +469,43 @@ There is no dedicated `isatty()` syscall — `pu_isatty(fd)` (`user/libpure.c`) 
 
 ---
 
+## SYS_CHDIR (29) / SYS_GETCWD (30)
+
+Per-task working directory, stored as `task_t.cwd` (`include/pureunix/task.h`) — a child inherits its creator's cwd at `task_create()`/`task_fork()` time, exactly like `uid`/`gid`, and a `SYS_EXEC` in place (replacing the calling task's own image) leaves it untouched, since it's a process property, not something the ELF image carries. There is exactly one task acting as "the shell" (the kernel never spawns a separate task for it — see `docs/scheduler.md`), so `shell/sh.c`'s own `cd` builtin calls `task_set_cwd()` (`kernel/task.c`) after updating its own `shell_context_t.cwd`, keeping the two in sync; that's what makes a program launched from the shell start in the directory the shell was actually in, rather than always `/`.
+
+**SYS_CHDIR** — **Arguments**: `EBX`: pointer to the target path (resolved relative to the caller's current cwd via `vfs_normalize()`, same as every other path-taking syscall). **Returns**: `0` on success, or a negative error code:
+
+| Code | Condition |
+|---|---|
+| `-EINVAL` | null path pointer |
+| `-ENOENT` | no filesystem mounted yet, or the resolved path doesn't exist |
+| `-ENOTDIR` | the resolved path exists but isn't a directory |
+| `-EACCES` | the resolved directory lacks `X_OK` (search permission) for the caller |
+| `-ENAMETOOLONG` | the resolved absolute path doesn't fit in the task's cwd buffer (`PUREUNIX_MAX_PATH`, 256 bytes) |
+
+**SYS_GETCWD** — **Arguments**: `EBX`: buffer pointer. `ECX`: buffer size in bytes. **Returns**: `0` on success (the NUL-terminated absolute cwd is copied into the buffer), or a negative error code:
+
+| Code | Condition |
+|---|---|
+| `-EINVAL` | null buffer pointer, or size `0` |
+| `-ERANGE` | the cwd (plus its NUL terminator) doesn't fit in the caller's buffer |
+
+Unlike POSIX `getcwd(3)`, there is no `buf == NULL` auto-allocating mode — the caller must always supply a real buffer.
+
+---
+
+## SYS_NANOSLEEP (31)
+
+Blocks the calling task for a requested duration, backed directly by the PIT tick counter's busy-halt loop (`arch/i386/pit.c`'s `pit_sleep()`, already used internally since before userspace could reach it) — the same cooperative-scheduling caveat as everything else non-preemptive applies: nothing else runs while this task sleeps.
+
+**Arguments**: `EBX`: pointer to a `struct pureunix_timespec { long tv_sec; long tv_nsec; }` (`include/pureunix/time.h`) requesting the sleep duration. `ECX`: pointer to a `struct pureunix_timespec` to receive the remaining time if the sleep is interrupted early, or `NULL` to discard it — always written as `{0, 0}` here, since PureUNIX has no signal delivery yet to interrupt a sleep early (see "Unimplemented Syscalls" below); a `SYS_NANOSLEEP` call always runs to completion.
+
+**Returns**: `0` on success, or `-EINVAL` if the request pointer is null or its fields are out of range (`tv_sec < 0`, or `tv_nsec` not in `[0, 1000000000)`).
+
+`user/newlib_syscalls.c`'s `nanosleep()` passes `struct timespec` straight through with no translation (layout-compatible: both `{long tv_sec; long tv_nsec;}` on i686). `sleep()` is built on top of it.
+
+---
+
 ## Error Return
 
 Any unrecognized syscall number returns `(uint32_t)-1`.
@@ -481,15 +542,86 @@ Kernel returns `(uint32_t)-CODE`; user receives a negative `int`.
 
 ---
 
+## SYS_GETUID (32) / SYS_GETGID (33)
+
+Read-only credential getters — no arguments, the task's own `uid`/`gid` (`include/pureunix/task.h`) returned directly as the syscall's return value. The write side is still `SYS_DEBUG_SETCRED` (test-only, no privilege check — see above) until a real login/setuid model exists.
+
+There is no separate "effective" uid/gid syscall: PureUNIX has no setuid model, so a real or effective ID never diverges — `geteuid()`/`getegid()` (`user/newlib_syscalls.c`) are simply aliases for `getuid()`/`getgid()`.
+
+---
+
+## SYS_UTIME (34)
+
+Sets a file's atime/mtime directly. Real on EXT2 (`fs/ext2/mount.c`'s `ext2_utime()` mutates the inode's `i_atime`/`i_mtime` and persists it); `-EROFS` on FAT16 (no mutable timestamp storage there at all), same story as `SYS_CHMOD`/`SYS_CHOWN`.
+
+**Arguments**: `EBX`: path pointer. `ECX`: atime (Unix epoch seconds), or `0xFFFFFFFF` to leave it unchanged. `EDX`: mtime, same convention. **Returns**: `0` on success, or a negative error code (`-EINVAL` null path, `-ENOENT` missing path, `-EROFS` unsupported filesystem, `-EPERM` — caller is neither the file's owner, root, nor holds `W_OK` on it, the traditional Unix `utime(2)` rule, checked in `fs/vfs.c`'s `vfs_utime()` before the filesystem-specific call).
+
+`user/newlib_syscalls.c`'s `utimensat()`/`utimes()` both translate down to this — `utimensat()` maps `UTIME_NOW`/`UTIME_OMIT` sentinels to "current time"/"leave unchanged", and ignores `dirfd` (every PureUNIX path syscall already resolves relative to the caller's own cwd — see `SYS_CHDIR` — so there's no other fd-relative base to honor) and `AT_SYMLINK_NOFOLLOW` (no "don't follow the final symlink" variant exists, same simplification `lchown()` makes for `SYS_CHOWN`).
+
+---
+
+## SYS_GETTIMEOFDAY (35)
+
+Wall-clock time as a Unix epoch second count — a thin userspace-visible wrapper around `kernel/time.c`'s `time_now()`, the same clock every write-path timestamp (EXT2 `i_atime`/`i_mtime`/`i_ctime`, `SYS_UTIME` above) already uses internally. No sub-second resolution exists.
+
+**Arguments**: `EBX`: pointer to a `uint32_t` to receive the epoch-seconds value. **Returns**: `0` on success, or `-EINVAL` if the pointer is null.
+
+`user/newlib_syscalls.c`'s `gettimeofday()` always reports `tv_usec = 0` and never fills in the (obsolete, per POSIX's own advice) `timezone` argument; `time()` is built on top of it.
+
+---
+
+## File descriptors are now shared, refcounted open file descriptions
+
+Before `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` existed, each `fd_entry_t` slot in a task's fd table *was* the open file — its data buffer, path, and seek offset lived directly in that slot, and `fork()` deep-copied every open fd into the child (giving the child an independent copy — and an independent seek offset — of everything the parent had open, not real POSIX `fork()` semantics).
+
+That changed: `fd_entry_t` (`include/pureunix/task.h`) is now just `{ used; open_file_t *file; }` — a pointer to a separately refcounted `open_file_t` (a real "open file description" in POSIX's sense) drawn from a fixed system-wide pool (`kernel/task.c`'s `g_open_files[128]`; `open_file_alloc()`/`open_file_ref()`/`open_file_unref()`). `fork()` now *shares* the open_file_t (bumping its refcount) instead of copying it — parent and child genuinely share the seek offset afterward, matching real UNIX. `dup()`/`dup2()` share the same way; `close()` (`SYS_CLOSE`) just drops a reference, and the underlying `open_file_t` (and, for a written `FD_KIND_FILE`, its flush to the VFS) only happens once the last reference is gone.
+
+fds 0/1/2 start with `file == NULL`, meaning "the default console binding" (`SYS_READ`/`SYS_WRITE` special-case a null file on fd 0/1/2 to route straight to the tty/VGA driver); `dup2()`ing something onto one of them installs a real `open_file_t` there instead — exactly like a real UNIX process redirecting its own stdin/stdout/stderr — and `close()` on 0/1/2 now succeeds (reverting to the console binding) rather than the old hardcoded `-EBADF`.
+
+---
+
+## SYS_PIPE (36) / SYS_DUP (37) / SYS_DUP2 (38)
+
+A pipe is a fixed 4096-byte ring buffer (`pipe_buf_t`, `include/pureunix/task.h`) shared by two `open_file_t`s — a read end and a write end — created together by one `SYS_PIPE` call. There is no real blocking/wakeup mechanism in this kernel (strictly cooperative scheduling — see `docs/scheduler.md`), so a read on an empty pipe (with the write end still open) or a write to a full pipe (with the read end still open) spins `task_yield()` in a loop until the condition changes — this only accomplishes anything if some other task (typically a forked child on the other end) actually runs in between yields and moves data.
+
+**SYS_PIPE** — **Arguments**: `EBX`: pointer to an `int[2]` to receive the two fds (`[0]` = read end, `[1]` = write end). **Returns**: `0` on success, or `-EINVAL` (null pointer) / `-EMFILE` (fewer than two free fd slots) / `-ENOSPC` (the open-file-description pool, `MAX_OPEN_FILE_DESCRIPTIONS` = 128 system-wide, is full).
+
+A pipe's read end returns `0` (EOF) once its buffer is empty and every write end referencing that pipe has been closed; a write to a pipe with no read ends left returns the errno `-EPIPE` directly — no actual `SIGPIPE` signal gets sent to the writer (the kernel never automatically signals anything on a broken pipe; see `SYS_KILL` below for what signal delivery *does* exist — a caller has to ask for it explicitly).
+
+**SYS_DUP** — **Arguments**: `EBX`: the fd to duplicate. **Returns**: a new fd (the lowest-numbered free slot) sharing the same `open_file_t` (including its seek offset) as `oldfd`, or a negative error code (`-EBADF` if `oldfd` isn't open, `-EMFILE` if no fd slot is free).
+
+**SYS_DUP2** — **Arguments**: `EBX`: the fd to duplicate. `ECX`: the fd number the caller wants to become a copy of it. **Returns**: `newfd` on success, or a negative error code (`-EBADF` if either fd is out of range or `oldfd` isn't open). If `newfd` was already open, it's closed first (dropping its own reference, exactly like an explicit `SYS_CLOSE`) before being made an alias for `oldfd`'s description. A no-op (just returns `newfd`) if `oldfd == newfd`.
+
+---
+
+## SYS_KILL (39)
+
+Terminates another task with a signal's POSIX **default action** — there is no handler-dispatch mechanism (that would mean injecting a call frame into a running ring-3 task's own stack and trampolining back once the handler returns, a much larger feature this kernel doesn't have), so every nonzero signal just kills the target outright, unconditionally, regardless of what `sigaction()`/`signal()` was (fictitiously) told to do with it (see `user/newlib_syscalls.c` — both remain no-ops). This is enough for `kill`/`killall`-style process termination and for a `wait()`er to correctly distinguish "exited normally" from "killed by a signal", but not for a shell to catch and react to a signal itself, or for job control (`SIGSTOP`/`SIGTSTP`/`SIGCONT` all take this same generic "kill it" action, not the real stop/continue semantics — there's no `TASK_SLEEPING`-style "stopped" state wired up to them).
+
+**Arguments**: `EBX`: target pid. `ECX`: signal number (0 is POSIX's "null signal" — probes whether `pid` exists and is killable without actually sending anything).
+
+**Returns**: `0` on success. If `pid` is the caller's own, a nonzero signal never returns at all — the kernel stops the caller directly (`task_exit(-sig)`, the same mechanism every other process-termination path uses), same as `_exit()`. For any other `pid`:
+
+| Code | Condition |
+|---|---|
+| `-EINVAL` | `pid <= 0` — no process-group support (real `kill(2)` treats `pid <= 0` as "send to a process group", which doesn't exist here) |
+| `-ESRCH` | no task with that id exists (or it already exited and was reaped) |
+
+A signal-terminated task's exit code (read back via `SYS_WAIT`) is `-signal` — always negative, so a `wait()`er can tell it apart from a normal exit's code, which is always `>= 0` (`kernel/task.c`'s `task_kill()`). `user/newlib_syscalls.c`'s `waitpid()`/`wait()` translate this into the Linux-style `WIFSIGNALED`/`WTERMSIG` encoding (the signal number in the low 7 bits) instead of the usual `WIFEXITED`/`WEXITSTATUS` shifted-exit-code encoding.
+
+The interactive kernel shell's own `kill` builtin (`shell/builtins.c`) sends `SIGTERM` — since every signal takes the same default action here, this is cosmetic (matches conventional shell behavior; there's no way to actually observe the difference from `SIGKILL` without real signal handling).
+
+---
+
 ## Unimplemented Syscalls
 
-`fstat`, `mmap`, `munmap`, `brk`, `kill`, `signal`, `pipe`, `dup`, `dup2`, `chdir`, `getcwd`, `setuid`, `setgid`, `getuid`, `getgid`.
+`fstat`, `mmap`, `munmap`, `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
 
-(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above. `ioctl` (just `TIOCGWINSZ`) and `isatty` were added alongside it — see `SYS_IOCTL` above; `isatty` has no syscall of its own, see that section.)
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above; `exec` originally took only a bare path, with `argv`/`envp` added later — see `SYS_EXEC` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above. `ioctl` (just `TIOCGWINSZ`) and `isatty` were added alongside it — see `SYS_IOCTL` above; `isatty` has no syscall of its own, see that section. `chdir`/`getcwd` were added alongside per-task working directories — see `SYS_CHDIR`/`SYS_GETCWD` above. `getuid`/`getgid` were added alongside the BusyBox port — see `SYS_GETUID`/`SYS_GETGID` above; `setuid`/`setgid` remain unimplemented since there's still no login/privilege model to enforce against. `pipe`/`dup`/`dup2` were added alongside the BusyBox port too — see `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` above.)
 
 `ISIG`'s `VINTR`/`VQUIT`/`VSUSP` are recognized by the tty layer (`drivers/tty.c`) but only `VINTR` has an effect (aborting the current read with `-EINTR`) — there is no signal delivery mechanism yet (`kill`/`signal` above are unimplemented stubs), so `VQUIT` and `VSUSP` are accepted but inert, and no process is ever actually killed or stopped by them.
 
-`SYS_CHMOD`/`SYS_CHOWN` exist as syscall numbers but currently always return `-EROFS` — see above.
+`SYS_CHMOD`/`SYS_CHOWN` are real on EXT2 now; still `-EROFS` on FAT16 — see above.
 
 ---
 
@@ -511,11 +643,18 @@ int    pu_readdir(const char *path, struct dirent *entries,
                    int max_entries);                            // SYS_READDIR
 int    pu_debug_setcred(uid_t uid, gid_t gid);                  // SYS_DEBUG_SETCRED — test-only, see above
 int    pu_fork(void);                                           // SYS_FORK
-int    pu_exec(const char *path);                               // SYS_EXEC
+int    pu_exec(const char *path);                               // SYS_EXEC, bare argv/envp
+int    pu_execve(const char *path, char *const argv[],
+                  char *const envp[]);                          // SYS_EXEC, real argv/envp
 int    pu_wait(int pid, int *status);                           // SYS_WAIT
 int    pu_tcgetattr(int fd, struct termios *out);               // SYS_TCGETATTR
 int    pu_tcsetattr(int fd, int actions, const struct termios *in); // SYS_TCSETATTR
 int    pu_ioctl(int fd, int request, void *argp);               // SYS_IOCTL
+int    pu_chdir(const char *path);                              // SYS_CHDIR
+int    pu_getcwd(char *buf, size_t size);                        // SYS_GETCWD
+int    pu_pipe(int fds[2]);                                     // SYS_PIPE
+int    pu_dup(int oldfd);                                       // SYS_DUP
+int    pu_dup2(int oldfd, int newfd);                            // SYS_DUP2
 int    pu_isatty(int fd);           // no syscall — pu_tcgetattr() succeeding
 void   pu_exit(int code);           // int $0x81 directly — see docs/scheduler.md's SYS_EXIT note
 void   pu_puts(const char *s);                                  // SYS_WRITE to fd 1

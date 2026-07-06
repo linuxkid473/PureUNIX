@@ -25,7 +25,7 @@ typedef struct task {
     char          name[32];     // human-readable name
     task_state_t  state;
     uint32_t     *stack_ptr;    // saved ESP; written/read by context_switch
-    uint8_t      *stack_base;   // base of 16 KiB stack allocation
+    uint8_t      *stack_base;   // base of the per-task kernel stack allocation (TASK_STACK_SIZE, kernel/task.c — 64 KiB as of the BusyBox port; this whole doc predates fork/exec, see docs/scheduler.md and docs/syscalls.md for current behavior)
     void        (*entry)(void *); // entry function
     void         *arg;          // passed to entry on first run
     struct task  *next;         // next node in circular list
@@ -64,7 +64,7 @@ Creates the initial `kernel` task from the current execution context. The kernel
 task_t *task_create(const char *name, void (*entry)(void *), void *arg);
 ```
 
-Allocates a `task_t` and a 16 KiB stack. Initializes the stack so that the first context switch to this task begins executing `task_bootstrap(entry, arg)`. Appends the task to the circular ready list. Returns a pointer to the new task, or NULL if allocation fails.
+Allocates a `task_t` and a kernel stack (TASK_STACK_SIZE, kernel/task.c — 64 KiB as of the BusyBox port). Initializes the stack so that the first context switch to this task begins executing `task_bootstrap(entry, arg)`. Appends the task to the circular ready list. Returns a pointer to the new task, or NULL if allocation fails.
 
 ### `task_yield`
 

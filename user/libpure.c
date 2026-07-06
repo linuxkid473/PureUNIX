@@ -126,6 +126,36 @@ int pu_creat(const char *path)
     return pu_open(path, O_WRONLY | O_CREAT | O_TRUNC);
 }
 
+int pu_chdir(const char *path)
+{
+    return syscall3(SYS_CHDIR, (int)path, 0, 0);
+}
+
+int pu_getcwd(char *buf, size_t size)
+{
+    return syscall3(SYS_GETCWD, (int)buf, (int)size, 0);
+}
+
+int pu_pipe(int fds[2])
+{
+    return syscall3(SYS_PIPE, (int)fds, 0, 0);
+}
+
+int pu_dup(int oldfd)
+{
+    return syscall3(SYS_DUP, oldfd, 0, 0);
+}
+
+int pu_dup2(int oldfd, int newfd)
+{
+    return syscall3(SYS_DUP2, oldfd, newfd, 0);
+}
+
+int pu_kill(int pid, int sig)
+{
+    return syscall3(SYS_KILL, pid, sig, 0);
+}
+
 int pu_fork(void)
 {
     return syscall3(SYS_FORK, 0, 0, 0);
@@ -134,6 +164,11 @@ int pu_fork(void)
 int pu_exec(const char *path)
 {
     return syscall3(SYS_EXEC, (int)path, 0, 0);
+}
+
+int pu_execve(const char *path, char *const argv[], char *const envp[])
+{
+    return syscall3(SYS_EXEC, (int)path, (int)argv, (int)envp);
 }
 
 int pu_wait(int pid, int *status)
