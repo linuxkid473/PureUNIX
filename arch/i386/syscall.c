@@ -3,6 +3,7 @@
 #include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
+#include <pureunix/icmp.h>
 #include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
 #include <pureunix/stat.h>
@@ -1046,6 +1047,27 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         *out = time_now();
         return 0;
+    }
+    case SYS_PING: {
+        ip4_addr_t dst = (ip4_addr_t)regs->ebx;
+        uint32_t timeout_ms = regs->ecx;
+        uint32_t *rtt_out = (uint32_t *)regs->edx;
+        static uint16_t ping_seq;
+        uint32_t rtt = 0;
+        uint16_t id = task_current() ? (uint16_t)task_current()->id : 0;
+        /* int $0x80 enters with interrupts masked (isr128, same as any
+         * interrupt gate) and only re-enables them on its own iret --
+         * icmp_ping() blocks on pit_sleep(), which needs the PIT tick
+         * interrupt to actually fire, so without this it hangs exactly
+         * like the RX-interrupt-context deadlock documented in net/ip.c's
+         * ip_send() comment. Same fix drivers/tty.c's tty_read() already
+         * applies before its own keyboard_getkey()-based blocking wait. */
+        arch_enable_interrupts();
+        bool ok = icmp_ping(dst, id, ++ping_seq, NULL, 0, timeout_ms, &rtt);
+        if (rtt_out) {
+            *rtt_out = rtt;
+        }
+        return ok ? 0 : (uint32_t)-ETIMEDOUT;
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

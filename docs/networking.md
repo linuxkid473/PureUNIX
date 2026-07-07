@@ -189,15 +189,61 @@ qemu-system-i386 ... -netdev user,id=net0 -device e1000,netdev=net0 \
 
 Open `capture.pcap` in Wireshark after a clean shutdown (`quit` via the QEMU monitor, or graceful poweroff) to see the actual frames PureUNIX transmitted. For real host-visible traffic (e.g. to confirm another physical/virtual machine can ping or ARP-resolve this one), use a bridged or `tap` netdev instead of `user`.
 
-## Investigation: real network reachability via `-netdev user`
+## Resolved: real network reachability (root cause and fix)
 
-Across every phase's testing in this development sandbox (QEMU 11.0.2), `-netdev user` (SLIRP) has never been observed replying to anything PureUNIX sends it — not the e1000 driver's own ARP probe, not `arp_selftest()`'s gateway resolution, not `icmp_selftest()`'s gateway ping. Given how fundamental "resolve the gateway's MAC via ARP" is to any real guest OS using SLIRP, this was treated as a probable driver/integration bug rather than accepted as an environment quirk, and investigated accordingly (this is also what surfaced the interrupt-context deadlock documented above). The investigation independently proved the following, each ruling out a specific candidate explanation:
+Earlier revisions of this document concluded that "-netdev user" (SLIRP) never replying to PureUNIX was most likely a QEMU/environment characteristic outside the driver's control. **That conclusion was wrong.** It was a real, reproducible bug in this driver — found and fixed by comparing byte-for-byte against a known-good Linux guest under the *identical* QEMU configuration, which is what should have been done from the start rather than accepting the absence of a reply as inconclusive.
 
-- **TX is correct at the hardware level.** `e1000_send()` only returns success once the NIC's own TX descriptor head register (`TDH`) has advanced past the queued frame — a value QEMU's e1000 model manages entirely internally, unrelated to any backend's ability to actually deliver the frame. This has been true since Phase 1.
-- **RX is correct end-to-end, proven with real (non-SLIRP) inbound traffic.** A host-side Python script was built as a second netdev backend (`-netdev socket,udp=127.0.0.1:9998,localaddr=127.0.0.1:9999`, a raw Ethernet-frame-over-UDP tunnel), fully bypassing SLIRP. Injecting real, correctly-addressed ARP requests and ICMP echo requests from this script reliably produced correct guest-side log output (`arp: replying to who-has 10.0.2.15 from 02:00:00:00:00:02`, `icmp: echo request from 192.0.2.200 ...`) — i.e. the driver's descriptor handling, checksum verification, ARP cache, and ICMP echo-reply logic all work correctly against real, externally-supplied frames.
-- **The Python receiver itself was sanity-checked independently** (a plain manual UDP send/receive test, outside QEMU entirely) to rule out a broken test harness.
-- **A sandbox-imposed network restriction was ruled out** by rerunning the same test with this project's own command-sandboxing explicitly disabled — identical results.
-- **Different e1000 device models** (`e1000` / 82540EM, `e1000-82545em`) were tried under `-netdev user` — identical results (both are among the device IDs this driver recognizes and initializes correctly).
-- **Explicit SLIRP configuration** (`ipv6=off`, explicit `net=`/`host=`/`dhcpstart=` matching the driver's hardcoded configuration) was tried — identical results.
+### The decisive comparison
 
-What remains unexplained, and is specific to *this exact QEMU 11.0.2 build in this sandbox*: frames the guest transmits, while proven correct and successfully handed off by the emulated hardware (`TDH` advances, `e1000_send()` returns 0), never produce an externally observable effect on **either** netdev backend tested — no SLIRP reply, and no bytes ever reaching the independent Python receiver either, even though that receiver is proven fully functional and even though the *reverse* direction (host injecting into the guest) works perfectly over the same raw-socket link. This same-symptom-on-two-unrelated-backends pattern, combined with every other candidate (driver TX, driver RX, test harness, sandbox restrictions, device model, SLIRP config) having been individually ruled out, points to a characteristic of this specific QEMU installation's e1000-to-backend frame egress path, not a defect in PureUNIX. `tap`/`bridge`/`vmnet` backends — which would give a cleaner, root-independent-of-QEMU-internals answer — require elevated privileges (`vmnet` failed outright with "not enough privileges"; `tap`/bridge need root on macOS) unavailable in this sandbox, so this could not be fully disambiguated from "QEMU bug in this exact build" vs. "something about outbound UDP delivery in this specific host environment." Retrying with a different QEMU version, or a `tap`/bridge netdev under an environment with the necessary privileges, would be the next step to fully close this out.
+Booting a stock Alpine Linux live ISO (`qemu-system-x86_64 -netdev user,id=net0 -device e1000,netdev=net0`, otherwise identical to PureUNIX's own test invocation) and running `udhcpc`, `arping 10.0.2.2`, and `ping -c3 1.1.1.1` from it succeeded perfectly — DHCP lease obtained, ARP resolved, both the gateway and a real external host (`1.1.1.1`, 0% packet loss) reachable. Repeating the exact same commands with DHCP skipped entirely (a bare static `10.0.2.15/24` assignment, mirroring PureUNIX's own configuration precisely) still worked — ruling out any DHCP-lease prerequisite. **This conclusively proved SLIRP works fine in this environment**, which meant the remaining gap had to be a genuine PureUNIX bug, not an environment limitation.
+
+### Root cause: a compiler memory-ordering bug
+
+A graceful (QEMU-monitor `quit`, not `SIGTERM`) packet capture of PureUNIX's own boot-time self-test traffic showed every single frame recorded with `caplen=0, origlen=0` — QEMU's own networking core genuinely believed PureUNIX was transmitting zero-length packets, even though the NIC's `TDH` register still advanced (the driver's own, and this document's earlier, evidence for "TX is correct"). Disassembling the compiled `e1000_send()` (`i686-elf-objdump -d`) found the actual bug:
+
+```
+mov DWORD PTR [eax+0x3818], ebx    ; reg_write(REG_TDT, tx_cur) -- doorbell: QEMU reads the
+                                    ; descriptor from guest memory RIGHT NOW, synchronously
+...
+mov WORD PTR [ecx+0x8], dx         ; tx_descs[idx].length = len -- STILL HASN'T HAPPENED YET
+```
+
+GCC at `-O2` reordered the plain (non-`volatile`) descriptor field stores (`tx_descs[idx].length = len`, `.cmd = ...`, etc.) to occur *after* the `volatile` MMIO write that rings the transmit doorbell — even though the C source writes them in the opposite order. Nothing in the C standard's `volatile` semantics strictly prevents this (only accesses to *other* volatile objects are guaranteed to stay in program order relative to each other); GCC is conservative about this in most real-world code, but at `-O2`, for a tight sequence of independent non-aliasing stores immediately followed by one volatile write, it reordered them anyway.
+
+The result: QEMU processed the doorbell write and read the descriptor's `length` field while it was still its BSS-zeroed initial value (`0`) — hardware doesn't validate `length > 0` before marking a descriptor `DD` (done), so the driver observed an apparently successful send (`TDH` advances) while a genuine zero-length frame went out. **This affected every single packet this driver ever transmitted, across every prior development phase** — explaining, in hindsight, every "no reply" result ever logged: there was never a real ARP request or ICMP echo on the wire to reply to. The identical bug pattern existed in `e1000_receive()` (the RX descriptor's `status = 0` clear reordered after the `REG_RDT` doorbell write) and in the one-time ring setup in `setup_rx()`/`setup_tx()`.
+
+**The fix** (`drivers/e1000.c`): a `e1000_barrier()` helper — `__asm__ volatile("" ::: "memory")`, a compiler-only memory barrier (x86 doesn't reorder normal stores at the hardware level, so no actual fence instruction is needed) — called after writing descriptor fields and before the doorbell register write, in `e1000_send()`, `e1000_receive()`, `setup_rx()`, and `setup_tx()`.
+
+### A second, related bug: `int $0x80` also masks interrupts
+
+Exposing `icmp_ping()` to userspace via a new `SYS_PING` syscall (see `docs/syscalls.md`) hit the *same class* of bug a third time: `arch/i386/interrupt_stubs.S`'s `isr128` (the `int $0x80` handler) is a 32-bit interrupt gate like any other, so it enters with interrupts masked and only restores them on its own `iret`. `icmp_ping()` blocks on `pit_sleep()`, which needs the PIT tick interrupt to actually fire — calling it directly from the `SYS_PING` handler hung solid, identically to the RX-interrupt-context deadlock documented above for `ip_send()`. The fix (matching `drivers/tty.c`'s `tty_read()`, which already does this before its own `keyboard_getkey()`-based blocking wait): call `arch_enable_interrupts()` at the top of the `SYS_PING` handler, before calling `icmp_ping()`.
+
+### Verified result
+
+After both fixes, every self-test and packet capture confirms real, correct traffic:
+
+```
+arp: self-test resolved 10.0.2.2 -> 52:55:0a:00:02:02
+icmp: self-test ping to gateway OK (0 ms)
+```
+
+`52:55:0a:00:02:02` is the exact same gateway MAC the Linux baseline resolved. A graceful packet capture at this point shows real, correctly-formed ARP request/reply and ICMP echo request/reply pairs (see `docs/drivers.md`'s e1000 section for the byte dump). The new `ping` command (`user/ping.c`, `/bin/ping` via `SYS_PING`) run interactively:
+
+```
+$ ping 10.0.2.2
+PING 10.0.2.2
+64 bytes from 10.0.2.2: seq=0 time=0ms
+...
+4 packets transmitted, 4 received, 0% packet loss
+$ ping 1.1.1.1
+PING 1.1.1.1
+64 bytes from 1.1.1.1: seq=0 time=30ms
+...
+4 packets transmitted, 4 received, 0% packet loss
+```
+
+Both the local gateway and a real external host over the public internet (via SLIRP's own NAT) are reachable, with 0% packet loss, matching the Linux baseline exactly.
+
+### Lesson
+
+"No reply from an external peer" was, for three development phases, wrongly attributed to environment/QEMU behavior because every other piece of evidence available *from inside the guest* (TDH advancing, RX correctly processing externally-injected frames, multiple SLIRP configurations tried) was consistent with that story. The one thing that would have caught it immediately — comparing against a known-good guest under the identical configuration — wasn't done until asked for directly. Bugs that look environment-shaped from the inside are still worth a real baseline comparison before being written off.

@@ -99,6 +99,18 @@ enum {
 
     /* Parent task id — see arch/i386/syscall.c and docs/syscalls.md. */
     SYS_GETPPID = 42,
+
+    /* Sends one ICMP echo request and waits for the matching reply — a
+     * thin wrapper around net/icmp.c's icmp_ping(), exposing the kernel's
+     * already-complete IPv4/ICMP stack to userspace (see user/ping.c).
+     * EBX: destination IPv4 address (ip4_addr_t, host byte order --
+     *      include/pureunix/inet.h's IP4_ADDR() convention).
+     * ECX: timeout in milliseconds.
+     * EDX: optional (may be 0/NULL) pointer to a uint32_t that receives
+     *      the round-trip time in milliseconds on success.
+     * Returns 0 on a received reply, -ETIMEDOUT if none arrived in time.
+     * See arch/i386/syscall.c and docs/syscalls.md. */
+    SYS_PING = 43,
 };
 
 #endif

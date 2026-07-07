@@ -137,6 +137,26 @@ static uint32_t reg_read(uint32_t reg)
     return mmio_base[reg / 4];
 }
 
+/* Compiler-only memory barrier: descriptor rings (rx_descs/tx_descs) are
+ * plain, non-volatile structs, so nothing stops GCC from reordering their
+ * field stores relative to a *later* volatile reg_write() doorbell in the
+ * same function -- and at -O2 it does exactly that. QEMU processes a
+ * doorbell write (RDT/TDT) synchronously, reading descriptor memory at
+ * that exact instant, so if the length/addr/cmd fields haven't actually
+ * been written yet, it reads stale (BSS-zeroed, i.e. length=0) content:
+ * the hardware still marks the descriptor "done" (nothing validates
+ * length > 0 before setting DD), so the driver sees an apparently
+ * successful send/receive, but a real 0-length frame is what actually
+ * went out -- a bug that was silently swallowing every single packet
+ * this driver ever sent, confirmed by disassembling e1000_send() and
+ * finding the length-field store scheduled *after* the REG_TDT write.
+ * x86 doesn't reorder normal stores at the hardware level, so a compiler
+ * barrier (not an actual fence instruction) is sufficient. */
+static inline void e1000_barrier(void)
+{
+    __asm__ volatile("" ::: "memory");
+}
+
 /* Cheap fixed-iteration delay with no dependency on PIT ticks -- e1000_init()
  * runs before arch_enable_interrupts() (see kernel/main.c), same as
  * ata_init(), so pit_sleep() (which needs IRQ0 actually firing) isn't usable
@@ -251,6 +271,7 @@ static void setup_rx(void)
     }
     rx_cur = 0;
 
+    e1000_barrier();
     reg_write(REG_RDBAL, (uint32_t)(uintptr_t)rx_descs);
     reg_write(REG_RDBAH, 0);
     reg_write(REG_RDLEN, sizeof(rx_descs));
@@ -271,6 +292,7 @@ static void setup_tx(void)
     }
     tx_cur = 0;
 
+    e1000_barrier();
     reg_write(REG_TDBAL, (uint32_t)(uintptr_t)tx_descs);
     reg_write(REG_TDBAH, 0);
     reg_write(REG_TDLEN, sizeof(tx_descs));
@@ -381,13 +403,19 @@ void e1000_init(void)
  * the full TX -> wire -> RX descriptor path on real (emulated) hardware.
  * Needs actual wall-clock time (pit_sleep()) to give a reply a fair chance
  * to arrive, so -- unlike e1000_init() itself -- this must run after
- * arch_enable_interrupts() (see kernel/main.c). Purely diagnostic: seeing
- * no reply is logged, not treated as an error, since it depends on the
- * network backend actually being reachable (e.g. QEMU's "-netdev user"
- * SLIRP replying to an unsolicited ARP for its own gateway is not
- * guaranteed by every version/configuration) -- TX itself is confirmed
- * independently of any reply, since e1000_send() only returns 0 once the
- * NIC's own TX descriptor head has moved past the frame. */
+ * arch_enable_interrupts() (see kernel/main.c). Purely diagnostic: this
+ * polls e1000_receive() directly, racing the *interrupt-driven* consumer
+ * (net/eth.c's eth_dispatch(), registered via e1000_set_rx_handler() and
+ * invoked from e1000_irq() whenever RXT0 fires) for the same descriptor --
+ * whichever runs first "wins" it. Once ARP/ICMP replies started arriving
+ * for real (see net/ip.c's ip_send() comment for the bug that used to
+ * prevent that entirely), the interrupt path routinely wins this race and
+ * hands the reply to arp_input()/icmp_input() instead, so seeing no reply
+ * *here* is expected and not a sign anything is broken -- net/arp.c's
+ * arp_selftest() and net/icmp.c's icmp_selftest() are the ones that
+ * actually confirm a real round trip. TX itself is confirmed independently
+ * either way, since e1000_send() only returns 0 once the NIC's own TX
+ * descriptor head has moved past the frame. */
 void e1000_selftest(void)
 {
     if (!present) {
@@ -417,7 +445,9 @@ void e1000_selftest(void)
         }
     }
     if (!got_reply) {
-        printf("e1000: self-test saw no RX reply (depends on network backend reachability)\n");
+        printf("e1000: self-test polling saw no RX reply (normal -- likely consumed by the "
+               "interrupt-driven RX path first; see arp_selftest()/icmp_selftest() for a real "
+               "round-trip check)\n");
     }
     e1000_dump_stats();
 }
@@ -458,6 +488,10 @@ int e1000_send(const void *data, uint16_t len)
     tx_descs[idx].status = 0;
 
     tx_cur = (uint16_t)((idx + 1) % E1000_NUM_TX_DESC);
+    /* Every descriptor field write above must actually land in memory
+     * before QEMU (synchronously, inside this next MMIO write) reads the
+     * descriptor -- see e1000_barrier()'s comment. */
+    e1000_barrier();
     reg_write(REG_TDT, tx_cur);
     ++stat_tx_ok;
     return 0;
@@ -486,6 +520,10 @@ int e1000_receive(void *buf, uint16_t buf_len)
 
     rx_descs[idx].status = 0;
     rx_cur = (uint16_t)((idx + 1) % E1000_NUM_RX_DESC);
+    /* Same reasoning as e1000_send(): the status-clear above must be
+     * visible before the doorbell write that tells hardware this
+     * descriptor is available again. */
+    e1000_barrier();
     reg_write(REG_RDT, idx);
     return result;
 }

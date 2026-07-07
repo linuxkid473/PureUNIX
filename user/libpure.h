@@ -39,6 +39,7 @@
 #define SYS_DUP       37
 #define SYS_DUP2      38
 #define SYS_KILL      39
+#define SYS_PING      43
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -328,5 +329,17 @@ void   pu_puts(const char *s);
 void   pu_puti(int value);
 size_t pu_strlen(const char *s);
 int    pu_atoi(const char *s);
+
+/* -------------------------------------------------------------------- */
+/* Networking                                                              */
+/* -------------------------------------------------------------------- */
+
+/* Sends one ICMP echo request to `dst_ip` (host byte order, e.g.
+ * (1u<<24)|(1u<<16)|(1u<<8)|1 for 1.1.1.1 -- see user/ping.c for a dotted-
+ * quad parser) and waits up to `timeout_ms` for the matching reply.
+ * Returns 0 and fills *rtt_ms (if non-NULL) on success, -ETIMEDOUT if no
+ * reply arrived in time. Thin wrapper around SYS_PING -> net/icmp.c's
+ * icmp_ping(). */
+int    pu_ping(unsigned int dst_ip, unsigned int timeout_ms, unsigned int *rtt_ms);
 
 #endif

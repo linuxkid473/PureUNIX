@@ -10,7 +10,7 @@ PureUNIX supports executing ELF32 binaries loaded from the FAT16 filesystem. Use
 | C runtime | `user/crt0.S` | Entry stub, calls `main` |
 | libpure | `user/libpure.c` | Syscall wrappers and utility functions |
 | User linker script | `user/linker.ld` | Base address 0x400000 |
-| Demo programs | `user/hello.c`, `user/calc.c`, `user/viewer.c`, `user/sh.c`, `user/editor.c` | Stubs and functional examples |
+| Demo programs | `user/hello.c`, `user/calc.c`, `user/viewer.c`, `user/sh.c`, `user/editor.c`, `user/ping.c` | Stubs and functional examples |
 | Test programs | `user/opentest.c`, `user/readtest.c`, `user/ext2test.c`, `user/systest.c`, `user/termiostest.c` | Syscall and filesystem tests |
 | Vendored libc | `third_party/newlib`, `user/newlib_syscalls.c`, `user/newlib_crt0.c` | Real C library (printf, malloc, libm, stdio, ...) for programs that opt in — see "A real C library (newlib)" below |
 
@@ -238,6 +238,10 @@ Demo. Demonstrates `pu_puti`. Uses hardcoded values (prints `12 * 12 = 144`, `14
 ### viewer.c / sh.c / editor.c
 
 Stubs. Print "not yet implemented" messages. The actual shell and editor run as kernel builtins (`vim FILE`, `sh` launches the in-kernel shell, etc.).
+
+### ping.c
+
+Functional. A minimal ICMP echo client — parses a dotted-quad IPv4 address, sends 4 echo requests via `pu_ping()` (`SYS_PING`, a thin wrapper around `net/icmp.c`'s `icmp_ping()` — see `docs/syscalls.md`), and prints per-packet and summary output in a familiar `ping`-like format. Installed as `/bin/ping.elf` with a plain `/bin/ping` symlink (`tools/mkext2.py`'s `add_bin()`, the same "hello -> hello.elf" pattern used elsewhere), so `ping 1.1.1.1` works as an ordinary PATH-searched command. No raw sockets or BSD sockets API involved — this kernel has neither yet; the syscall talks to the kernel's own ICMP client directly.
 
 ### user/vi/ (neatvi)
 

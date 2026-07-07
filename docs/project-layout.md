@@ -91,6 +91,7 @@ PureUNIX/
 │   ├── opentest.c      File syscall test: open, stat, lseek, close — success and error paths
 │   ├── readtest.c      SYS_READ test: reads from VFS-backed fd ≥ 3 via pu_open + pu_read
 │   ├── ext2test.c      EXT2 integration test: 14 cases covering stat, read, seek, indirect blocks
+│   ├── ping.c          Functional: ICMP echo client via pu_ping() (SYS_PING) -- installed as /bin/ping
 │   └── vi/             Vendored Neatvi (vi/ex clone) port — see docs/userland.md's "user/vi/ (neatvi)"
 │       ├── compat/     POSIX-named headers (stdio.h, unistd.h, termios.h, ...) for the vendored source
 │       ├── compat.c    malloc/free, open/read/write, printf family — backed by libpure.h's pu_* calls

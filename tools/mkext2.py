@@ -561,6 +561,13 @@ def add_bin(fs, programs):
     if any(os.path.basename(p).lower() == 'neatvi.elf' for p in programs):
         fs.add_symlink(bin_ino, 'neatvi', 'neatvi.elf')
 
+    # Same idea for ping (user/ping.c, a thin CLI over SYS_PING -- see
+    # docs/networking.md) -- a plain name-without-.elf symlink so it's
+    # reachable as an ordinary PATH command ("ping 1.1.1.1"), not
+    # "ping.elf 1.1.1.1".
+    if any(os.path.basename(p).lower() == 'ping.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'ping', 'ping.elf')
+
     # BusyBox multi-call binary: one ELF, dispatched by argv[0]'s basename
     # (applets/applets.c's find_applet_by_name()) — every applet name is
     # just a symlink to the same busybox.elf, exactly like a real BusyBox

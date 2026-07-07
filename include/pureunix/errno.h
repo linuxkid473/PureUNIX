@@ -27,5 +27,6 @@
 #define EACCES   13  /* permission denied */
 #define ERANGE   34  /* result too large for the caller's buffer (getcwd()) */
 #define EPIPE    32  /* write() on a pipe with no readers left (SYS_WRITE, SYS_PIPE) */
+#define ETIMEDOUT 60 /* SYS_PING got no reply within its timeout */
 
 #endif

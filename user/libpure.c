@@ -252,3 +252,8 @@ int pu_atoi(const char *s)
     }
     return value * sign;
 }
+
+int pu_ping(unsigned int dst_ip, unsigned int timeout_ms, unsigned int *rtt_ms)
+{
+    return syscall3(SYS_PING, (int)dst_ip, (int)timeout_ms, (int)rtt_ms);
+}

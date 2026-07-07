@@ -659,6 +659,26 @@ Returns the calling task's parent's id (`task_t.parent`, set once at fork/creati
 
 ---
 
+## SYS_PING (43)
+
+Sends one ICMP echo request and waits for the matching reply — a thin syscall wrapper around `net/icmp.c`'s `icmp_ping()`, exposing the kernel's own IPv4/ICMP stack (`docs/networking.md`) to userspace without a general BSD-sockets API, which this kernel doesn't have. `user/ping.c` (installed as `/bin/ping`, a symlink to `ping.elf` — see `tools/mkext2.py`) is the only current consumer.
+
+**Arguments**: `EBX`: destination IPv4 address (`ip4_addr_t`, host byte order — `include/pureunix/inet.h`'s `IP4_ADDR()` convention). `ECX`: timeout in milliseconds. `EDX`: optional (`0`/`NULL` to omit) pointer to a `uint32_t` that receives the round-trip time in milliseconds on success.
+
+**Returns**: `0` on a received reply, `-ETIMEDOUT` if none arrived within the timeout.
+
+Calls `arch_enable_interrupts()` before calling `icmp_ping()`, for the same reason `SYS_READ`'s `tty_read()` path does before its own blocking wait (see "Interrupts stay masked across a whole syscall" below): `int $0x80` is a 32-bit interrupt gate like any other, so it enters with interrupts masked and only restores them on its own `iret`. `icmp_ping()` blocks on `pit_sleep()`, which needs the PIT tick interrupt to actually fire — without re-enabling interrupts first, this hangs the whole kernel solid, identically to the RX-interrupt-context deadlock documented in `net/ip.c`'s `ip_send()` (see `docs/networking.md`'s "Resolved: real network reachability" section for the full story). Found and fixed the same day `SYS_PING` was added, before it ever shipped in a working state.
+
+Identifier/sequence numbers are managed internally (a kernel-global auto-incrementing sequence counter, the calling task's own id as the ICMP identifier) — callers don't control them. Only one `SYS_PING` call can be in flight system-wide at a time, the same single-outstanding-ping limitation `icmp_ping()` itself documents.
+
+---
+
+## Interrupts stay masked across a whole syscall
+
+Every syscall's `int $0x80` handler stub (`isr128`, `arch/i386/interrupt_stubs.S`) is an ordinary 32-bit interrupt gate: entering it clears `IF`, and nothing restores it until the stub's own `iret` at the very end. This means **any syscall handler that blocks waiting for an interrupt-driven event must explicitly call `arch_enable_interrupts()` first**, or that event's own interrupt (a PIT tick, a keyboard scancode, a NIC's RX/TX completion) can never fire while nested inside the syscall gate, hanging the task (and, since this kernel is single-core and non-preemptive within an interrupt/syscall, effectively the whole system) forever. `SYS_READ`'s console path (`drivers/tty.c`'s `tty_read()`, before its `keyboard_getkey()` wait) and `SYS_PING` above both do this; any future blocking syscall needs the same treatment.
+
+---
+
 ## Unimplemented Syscalls
 
 `fstat`, `munmap` (accepted but a plain `free()` — see `mmap()`'s own entry below), `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
