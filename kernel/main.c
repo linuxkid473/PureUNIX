@@ -1,16 +1,22 @@
 #include <pureunix/arch.h>
+#include <pureunix/arp.h>
 #include <pureunix/bootsplash.h>
 #include <pureunix/config.h>
 #include <pureunix/crypto.h>
 #include <pureunix/disk.h>
+#include <pureunix/e1000.h>
 #include <pureunix/elf.h>
+#include <pureunix/eth.h>
 #include <pureunix/ext2.h>
 #include <pureunix/fat16.h>
 #include <pureunix/framebuffer.h>
+#include <pureunix/icmp.h>
+#include <pureunix/ip.h>
 #include <pureunix/kernel.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/memory.h>
 #include <pureunix/panic.h>
+#include <pureunix/pci.h>
 #include <pureunix/serial.h>
 #include <pureunix/shell.h>
 #include <pureunix/stdio.h>
@@ -100,6 +106,17 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     keyboard_init();
     tty_init();
     ata_init();
+    pci_scan();
+    e1000_init();
+    eth_init();
+    arp_init();
+    ip_init();
+    icmp_init();
+    /* No DHCP yet (a later phase) -- 10.0.2.15/24 via 10.0.2.2 matches what
+     * QEMU's "-netdev user" (SLIRP) backend hands out by DHCP, so this host
+     * is reachable from (and can reach) that same virtual network without
+     * needing a real DHCP client. */
+    ip_configure(IP4_ADDR(10, 0, 2, 15), IP4_ADDR(255, 255, 255, 0), IP4_ADDR(10, 0, 2, 2));
     vfs_init();
 
     /* FAT16 on primary master (ata0) — compatibility/testing only, mounted at /fat */
@@ -123,6 +140,10 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     arch_enable_interrupts();
+
+    e1000_selftest();
+    arp_selftest();
+    icmp_selftest();
 
     crypto_init();
     if (crypto_ready()) {

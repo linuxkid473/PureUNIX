@@ -157,8 +157,11 @@ All unhandled exceptions call `panic()`, which prints the exception name, error 
 | 0 | 32 | PIT | `pit_irq` — increments `ticks` |
 | 1 | 33 | PS/2 keyboard | `keyboard_irq` — reads scancode, queues key |
 | 14 | 46 | ATA primary | `ata_irq` — reads status register (clears interrupt) |
+| *varies* | 32+line | e1000 NIC | `e1000_irq` — reads `ICR` (clears interrupt); on `RXT0` also calls the registered RX handler (`eth_dispatch()`, see `docs/networking.md`), which drains the RX ring and dispatches each frame all the way up through ARP/IP/ICMP handling — including any automatic reply send — synchronously, before the handler returns |
 
-IRQs 2–13 and 15 are unhandled. If they fire, `isr_dispatch` prints "Unhandled interrupt N" and sends EOI.
+The e1000's IRQ line isn't a fixed number like the others — it's whatever the PCI interrupt-line register (config space offset `0x3C`) reports for that device/slot (typically IRQ 11 under QEMU), read at `e1000_init()` time and used to compute its vector (`32 + interrupt_line`).
+
+IRQs 2–13 and 15 are unhandled unless an e1000 happens to land on one of them. If an unhandled one fires, `isr_dispatch` prints "Unhandled interrupt N" and sends EOI.
 
 ---
 

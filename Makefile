@@ -34,7 +34,7 @@ NEWLIB_DIR := third_party/newlib/i686-elf
 NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include
 NEWLIB_LDFLAGS := $(USER_LDFLAGS) -L$(NEWLIB_DIR)/lib
 
-KERNEL_C_SRCS := $(shell find kernel arch drivers fs libc shell editor -name '*.c' | sort)
+KERNEL_C_SRCS := $(shell find kernel arch drivers fs libc shell editor net -name '*.c' | sort)
 KERNEL_AS_SRCS := $(shell find boot arch -name '*.S' | sort)
 KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 	$(patsubst %.S,$(BUILD)/%.o,$(KERNEL_AS_SRCS))
@@ -164,6 +164,7 @@ run: $(ISO) $(DISK) $(DISK2)
 	$(QEMU) -m 128M -cdrom $(ISO) -boot d \
 		-drive file=$(DISK),format=raw,if=ide,index=0 \
 		-drive file=$(DISK2),format=raw,if=ide,index=1 \
+		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 
 $(ISO): $(KERNEL) boot/grub.cfg

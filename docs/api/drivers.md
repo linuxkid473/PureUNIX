@@ -320,3 +320,54 @@ uint16_t inw(uint16_t port);
 uint32_t inl(uint16_t port);
 void    io_wait(void);   // write to port 0x80 for ~1µs delay
 ```
+
+---
+
+## PCI
+
+**Header**: `<pureunix/pci.h>`
+
+```c
+typedef struct pci_device {
+    uint8_t  bus, slot, func;
+    uint16_t vendor_id, device_id;
+    uint8_t  class_code, subclass, prog_if;
+    uint8_t  header_type;
+    uint8_t  interrupt_line;
+} pci_device_t;
+
+uint32_t pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value);
+uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value);
+uint8_t  pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value);
+
+void pci_scan(void);
+bool pci_find(uint16_t vendor_id, const uint16_t *device_ids, int count, pci_device_t *out);
+void pci_enable_bus_mastering(const pci_device_t *dev);
+
+phys_addr_t pci_bar_address(const pci_device_t *dev, int index);  // 0 for I/O-space BARs
+uint32_t    pci_bar_size(const pci_device_t *dev, int index);
+```
+
+See `docs/drivers.md`'s "PCI Bus" section for the full design writeup.
+
+---
+
+## Intel e1000 NIC
+
+**Header**: `<pureunix/e1000.h>`
+
+```c
+void e1000_init(void);
+bool e1000_present(void);
+void e1000_get_mac(uint8_t mac[6]);
+int  e1000_send(const void *data, uint16_t len);      // 0 on success, -1 on failure
+int  e1000_receive(void *buf, uint16_t buf_len);      // frame length, 0 if none ready, -1 if buf too small
+void e1000_set_rx_handler(void (*handler)(void));     // called from the RX interrupt; see net/eth.c
+void e1000_selftest(void);
+void e1000_dump_stats(void);                          // diagnostic: counters + live register snapshot
+```
+
+See `docs/drivers.md`'s "Intel e1000 NIC Driver" section for the register map, descriptor layout, and design writeup.

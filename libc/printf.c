@@ -30,26 +30,53 @@ static void emit_str(outbuf_t *out, const char *s)
     }
 }
 
-static void emit_number(outbuf_t *out, uint32_t value, uint32_t base, bool sign, bool upper)
+static void emit_number(outbuf_t *out, uint32_t value, uint32_t base, bool sign, bool upper,
+                         int width, bool zero_pad)
 {
     char tmp[32];
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     int i = 0;
-    if (sign && (int32_t)value < 0) {
-        emit(out, '-');
+    bool negative = sign && (int32_t)value < 0;
+    if (negative) {
         value = (uint32_t)(-(int32_t)value);
     }
     if (value == 0) {
-        emit(out, '0');
-        return;
+        tmp[i++] = '0';
+    } else {
+        while (value) {
+            tmp[i++] = digits[value % base];
+            value /= base;
+        }
     }
-    while (value) {
-        tmp[i++] = digits[value % base];
-        value /= base;
+    if (negative) {
+        emit(out, '-');
+    }
+    int pad = width - i - (negative ? 1 : 0);
+    for (int j = 0; j < pad; ++j) {
+        emit(out, zero_pad ? '0' : ' ');
     }
     while (i--) {
         emit(out, tmp[i]);
     }
+}
+
+/* Parses an optional "0" zero-pad flag followed by optional decimal width
+ * digits (e.g. the "02" in "%02x") -- the only two printf() features this
+ * freestanding implementation supports beyond a bare conversion letter. */
+static void parse_width(const char **pp, int *width, bool *zero_pad)
+{
+    const char *p = *pp;
+    *zero_pad = false;
+    *width = 0;
+    if (*p == '0') {
+        *zero_pad = true;
+        ++p;
+    }
+    while (*p >= '0' && *p <= '9') {
+        *width = (*width) * 10 + (*p - '0');
+        ++p;
+    }
+    *pp = p;
 }
 
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
@@ -62,6 +89,9 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
             continue;
         }
         ++p;
+        int width;
+        bool zero_pad;
+        parse_width(&p, &width, &zero_pad);
         bool long_arg = false;
         if (*p == 'l') {
             long_arg = true;
@@ -79,20 +109,20 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
             break;
         case 'd':
         case 'i':
-            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, true, false);
+            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, true, false, width, zero_pad);
             break;
         case 'u':
-            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, false, false);
+            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, false, false, width, zero_pad);
             break;
         case 'x':
-            emit_number(&out, va_arg(args, uint32_t), 16, false, false);
+            emit_number(&out, va_arg(args, uint32_t), 16, false, false, width, zero_pad);
             break;
         case 'X':
-            emit_number(&out, va_arg(args, uint32_t), 16, false, true);
+            emit_number(&out, va_arg(args, uint32_t), 16, false, true, width, zero_pad);
             break;
         case 'p':
             emit_str(&out, "0x");
-            emit_number(&out, (uint32_t)va_arg(args, void *), 16, false, false);
+            emit_number(&out, (uint32_t)va_arg(args, void *), 16, false, false, 0, false);
             break;
         default:
             emit(&out, '%');
@@ -125,6 +155,9 @@ int vprintf(const char *fmt, va_list args)
             continue;
         }
         ++p;
+        int width;
+        bool zero_pad;
+        parse_width(&p, &width, &zero_pad);
         bool long_arg = false;
         if (*p == 'l') {
             long_arg = true;
@@ -142,20 +175,20 @@ int vprintf(const char *fmt, va_list args)
             break;
         case 'd':
         case 'i':
-            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, true, false);
+            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, true, false, width, zero_pad);
             break;
         case 'u':
-            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, false, false);
+            emit_number(&out, long_arg ? va_arg(args, uint32_t) : va_arg(args, uint32_t), 10, false, false, width, zero_pad);
             break;
         case 'x':
-            emit_number(&out, va_arg(args, uint32_t), 16, false, false);
+            emit_number(&out, va_arg(args, uint32_t), 16, false, false, width, zero_pad);
             break;
         case 'X':
-            emit_number(&out, va_arg(args, uint32_t), 16, false, true);
+            emit_number(&out, va_arg(args, uint32_t), 16, false, true, width, zero_pad);
             break;
         case 'p':
             emit_str(&out, "0x");
-            emit_number(&out, (uint32_t)va_arg(args, void *), 16, false, false);
+            emit_number(&out, (uint32_t)va_arg(args, void *), 16, false, false, 0, false);
             break;
         default:
             emit(&out, '%');

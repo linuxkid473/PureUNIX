@@ -307,3 +307,114 @@ typedef struct disk_device {
 - No error recovery; a failed read or write returns `-1` immediately.
 - IRQ14 handler only clears the interrupt; no DRQ-based IRQ-driven I/O (all transfers are polled).
 - No disk cache.
+
+---
+
+## PCI Bus
+
+**Source**: `drivers/pci.c`
+**Header**: `include/pureunix/pci.h`
+
+### Responsibilities
+
+- Reads and writes PCI configuration space via the legacy I/O-port mechanism (`0xCF8`/`0xCFC`), the same mechanism every x86 PC (including QEMU's `i440fx`/`q35` machines) supports without needing ACPI/MCFG.
+- Enumerates every bus (0-255), slot (0-31), and function (0-7 for multi-function devices, detected via header-type bit 7), printing vendor/device/class for each device found.
+- Locates a specific device by vendor/device ID (`pci_find()`), used by `e1000_init()` to find the NIC without hardcoding a bus/slot/function.
+- Reads a BAR's physical base address and size (via the standard "write all-ones, read back, restore" probe), and sets the Bus Master Enable + Memory Space Enable bits in the command register.
+
+### `pci_device_t`
+
+```c
+typedef struct pci_device {
+    uint8_t  bus, slot, func;
+    uint16_t vendor_id, device_id;
+    uint8_t  class_code, subclass, prog_if;
+    uint8_t  header_type;
+    uint8_t  interrupt_line;
+} pci_device_t;
+```
+
+### API
+
+```c
+uint32_t pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value);
+uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value);
+uint8_t  pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value);
+
+void pci_scan(void);   // prints every device found, called from kernel_main()
+bool pci_find(uint16_t vendor_id, const uint16_t *device_ids, int count, pci_device_t *out);
+void pci_enable_bus_mastering(const pci_device_t *dev);
+
+phys_addr_t pci_bar_address(const pci_device_t *dev, int index);  // 0 for I/O-space BARs
+uint32_t    pci_bar_size(const pci_device_t *dev, int index);
+```
+
+### Limitations
+
+- No PCI Express extended configuration space (MCFG/ECAM) support; legacy port I/O only covers the first 256 bytes of each device's config space, which is all any device this kernel drives needs.
+- No support for PCI bridges beyond simply enumerating past them (bus 0-255 are scanned unconditionally rather than following bridge topology).
+
+---
+
+## Intel e1000 NIC Driver
+
+**Source**: `drivers/e1000.c`
+**Header**: `include/pureunix/e1000.h`
+
+### Responsibilities
+
+- Locates an Intel e1000-family Gigabit Ethernet controller on the PCI bus (`pci_find()` against a table of classic e1000 device IDs — 82540/82541/82543-82547; deliberately excludes 82574L/e1000e-family IDs, which use a different register layout).
+- Enables PCI bus mastering and memory space, then maps the device's MMIO BAR0 (typically `0xFEBC0000` on QEMU, 128 KiB) into the identity-mapped address space via `vmm_map_page()` — BAR0 sits far above the 128 MiB range `vmm_init()` maps at boot, so it's mapped lazily here instead.
+- Resets the controller (`CTRL.RST`), reads the MAC address (via the EEPROM if present, otherwise falling back to the pre-populated `RAL0`/`RAH0` registers — QEMU always populates these even without an emulated EEPROM), and programs the primary receive-address filter with it.
+- Allocates fixed-size RX/TX descriptor rings and packet buffers as static (kernel-image, BSS) arrays — the same trick `kernel/vmm.c`'s `page_directory`/`identity_tables` use — so each ring is one guaranteed-contiguous, naturally-aligned physical block, and (being inside the identity-mapped low 128 MiB) each buffer's own address doubles as the physical address the NIC's DMA engine needs.
+- Enables transmit and receive (`TCTL`/`RCTL`), registers an IRQ handler on the PCI-assigned interrupt line that acknowledges the interrupt cause register (mirroring `ata_irq()`'s role for the ATA driver), and enables the RX-timer and link-status-change interrupt sources.
+- Runs a boot-time self-test: sends a broadcast ARP probe for QEMU's SLIRP gateway address (`10.0.2.2`) and polls briefly for a reply, exercising the real TX and RX datapath. A missing reply is logged, not treated as an error — it depends on the network backend being reachable, whereas the TX side is already confirmed independently (`e1000_send()` only returns success once the NIC's own descriptor head has advanced past the frame).
+
+### Register Map (byte offsets into MMIO BAR0)
+
+| Register | Offset | Purpose |
+|---|---|---|
+| `CTRL` | `0x0000` | Device control (reset, link-up, speed/duplex) |
+| `STATUS` | `0x0008` | Link status, speed, duplex |
+| `EEPROM` (EERD) | `0x0014` | EEPROM read register |
+| `ICR` / `IMS` / `IMC` | `0x00C0`/`0xD0`/`0xD8` | Interrupt cause / mask set / mask clear |
+| `RCTL` | `0x0100` | Receive control |
+| `TCTL` / `TIPG` | `0x0400`/`0x0410` | Transmit control / inter-packet gap |
+| `RDBAL`/`RDBAH`/`RDLEN`/`RDH`/`RDT` | `0x2800`-`0x2818` | RX ring base/length/head/tail |
+| `TDBAL`/`TDBAH`/`TDLEN`/`TDH`/`TDT` | `0x3800`-`0x3818` | TX ring base/length/head/tail |
+| `MTA` | `0x5200` (128 entries) | Multicast table array |
+| `RAL0`/`RAH0` | `0x5400`/`0x5404` | Primary receive address (our MAC) |
+
+### Descriptor Rings
+
+32 RX descriptors and 8 TX descriptors, each with a dedicated 2048-byte packet buffer — plenty for a standard 1518-byte Ethernet frame. Both rings use the classic 16-byte legacy descriptor format (`e1000_rx_desc_t`/`e1000_tx_desc_t`), matching the register layout above.
+
+### API
+
+```c
+void e1000_init(void);                              // called from kernel_main(), before vfs_init()
+bool e1000_present(void);
+void e1000_get_mac(uint8_t mac[6]);
+int  e1000_send(const void *data, uint16_t len);     // 0 on success, -1 on failure/timeout
+int  e1000_receive(void *buf, uint16_t buf_len);     // frame length, 0 if none ready, -1 if buf too small
+void e1000_set_rx_handler(void (*handler)(void));    // called from the RX interrupt; see net/eth.c
+void e1000_selftest(void);                           // called from kernel_main(), after arch_enable_interrupts()
+void e1000_dump_stats(void);                         // diagnostic: counters + live register snapshot
+```
+
+`e1000_send()` busy-polls the chosen TX descriptor's own completion (`DD`) bit before reusing it, so back-to-back sends never overwrite a frame still in flight. `e1000_receive()` is non-blocking: it checks the next RX descriptor's `DD` bit, and if set, copies the frame out and immediately recycles the descriptor back to the NIC by advancing `RDT`.
+
+`e1000_init()` also programs the PCI Cache Line Size register (config offset `0x0C`) to `0x10` (16 dwords = 64 bytes, the standard x86 cache line size) — real hardware uses this to pick efficient DMA burst lengths for descriptor writeback; QEMU's e1000 model doesn't appear to condition behavior on it, but it's correct to set regardless of emulation.
+
+`e1000_dump_stats()` prints running counters (`tx_ok`, `tx_timeout`, `rx_ok`, `rx_dropped_size`, `irq_count`, `irq_rxt0_count` — maintained by `e1000_send()`/`e1000_receive()`/`e1000_irq()`) plus a live snapshot of `RDH`/`RDT`/`TDH`/`TDT`/`ICR`/`IMS`/`STATUS`; `e1000_selftest()` calls it automatically at the end of its run. Reading `ICR` here clears its pending cause bits, same side effect as `e1000_irq()` itself — diagnostic-only.
+
+### Limitations
+
+- Single device only (first Intel e1000-family NIC found); no multi-NIC support.
+- Classic e1000 register layout only (82540/82541/82543-82547); e1000e-family devices (82574L, 0x10D3, and newer) are not matched, since they use a different register set.
+- No jumbo frame support (`RCTL.LPE` unset; frames are capped by the 2048-byte buffer size).
+- No checksum offload; `CTRL.RXCSUM`/TX checksum context descriptors are not used.
+- No link-layer (ARP/IP) stack above the raw `e1000_send()`/`e1000_receive()` frame interface — callers must build their own Ethernet headers.

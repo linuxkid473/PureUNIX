@@ -34,7 +34,15 @@ PureUNIX/
 │   ├── keyboard.c      PS/2 IRQ1 driver; scan set 1; 128-entry ring buffer; shift/caps
 │   ├── serial.c        COM1 38400 baud; mirrors VGA output; ANSI cursor sequences
 │   ├── tty.c           Console termios: one shared struct termios; canonical/raw SYS_READ(fd 0)
-│   └── ata.c           ATA PIO; primary master + slave; LBA28; IDENTIFY; sector read/write
+│   ├── ata.c           ATA PIO; primary master + slave; LBA28; IDENTIFY; sector read/write
+│   ├── pci.c           PCI config-space I/O (0xCF8/0xCFC); bus/slot/function enumeration; BAR probing
+│   └── e1000.c         Intel e1000-family NIC; MMIO BAR mapping; RX/TX descriptor rings; IRQ-driven RX
+│
+├── net/
+│   ├── eth.c           Ethernet II frame layer: ethertype dispatch table, eth_send()/eth_get_mac()
+│   ├── arp.c           ARP cache, request/reply, arp_resolve() (registers with net/eth.c for ETH_TYPE_ARP)
+│   ├── ip.c            IPv4 parse/build, checksum, routing, fragment rejection, loopback interface
+│   └── icmp.c          ICMP echo request/reply, icmp_ping() (registers with net/ip.c for IP_PROTO_ICMP)
 │
 ├── fs/
 │   ├── ext2/
