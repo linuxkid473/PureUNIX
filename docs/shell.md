@@ -2,7 +2,9 @@
 
 ## Overview
 
-The PureUnix shell runs entirely inside the kernel. It is implemented across four files in `shell/`:
+**BusyBox ash (`/bin/sh`/`/bin/ash`) is the default login/interactive shell as of 2026-07.** `kernel/main.c`'s `run_login_shell()` execs the user's configured shell (`/etc/passwd`'s shell field, seeded `/bin/sh`) as a real ring-3 process via `elf_exec_argv()` right after a successful login, and blocks until it exits — exiting the shell (`exit`, Ctrl-D) returns you to a fresh login prompt, real-getty style. If the configured shell can't be exec'd at all, it falls back to `/bin/puresh` (not yet built as a real ELF — see "Login Shell Exec" below), then as an absolute last resort to the legacy in-kernel shell described in the rest of this document, so the system is never unusable.
+
+The kernel-resident shell below (`shell/`) is what BusyBox ash *replaced* as the default — it's still fully built and functional, just no longer what a normal login session runs. It remains reachable only via `kernel_main()`'s last-resort fallback path, not as an ordinary command. It is implemented across four files in `shell/`:
 
 | File | Purpose |
 |---|---|
@@ -73,7 +75,21 @@ typedef struct shell_context {
 
 ## Main Loop
 
-`shell_run()` displays a prompt (format: `cwd $ `) and calls `shell_readline` to read a line. It then calls `shell_execute_line` and loops forever.
+`shell_run()` displays a prompt (format: `cwd $ `) and calls `shell_readline` to read a line. It then calls `shell_execute_line` and loops forever. As of the BusyBox-ash migration this only runs at all as `kernel_main()`'s absolute-last-resort fallback (see "Login Shell Exec" below) — it never returns either way, matching the fallback's need for *something* to keep the system usable if every real shell is missing.
+
+---
+
+## Login Shell Exec
+
+`kernel/main.c`'s `run_login_shell()`/`try_login_shell()` (not part of `shell/` — this runs before/instead of the in-kernel shell) is the real entry point for an interactive session:
+
+1. Reads `$SHELL` (set by `kernel/users.c`'s `users_login()` from `/etc/passwd`'s shell field, seeded `/bin/sh`).
+2. `try_login_shell(path)`: `vfs_stat()`s `path` first — only if it actually exists does it call `elf_exec_argv(path, 1, argv, shell_build_envp())` and report "launched" back to the caller. This existence gate is what distinguishes "couldn't start this shell at all" from "started fine and exited" — `elf_exec_argv()`'s own return value is the *child's raw exit code* (including negative "killed by signal N" codes, see `SYS_KILL`'s doc in `docs/syscalls.md`), which is ambiguous with a launch failure if inspected directly.
+3. If the configured shell couldn't be launched, tries `/bin/puresh` next (a real userspace port of the shell below this section — **not yet built**; the try silently fails today, exactly like any other missing file, and falls through to step 4). Porting the in-kernel shell's parser/builtins/line-editor to a real syscall-based ELF (rather than the direct kernel-internal `vfs_*`/`task_*` calls it uses today) is tracked as follow-up work — see project memory.
+4. If that also fails, prints a warning and calls the legacy `shell_run()` (this file's "Main Loop" above) as an absolute last resort.
+5. Either way, once the launched shell process exits, `kernel_main()`'s own loop calls `users_login()` again — exiting your shell logs you out back to a login prompt, matching real getty behavior. (The one exception is the `shell_run()` fallback branch, which never returns at all, matching its own pre-existing infinite-loop design.)
+
+`shell_build_envp()` (`shell/builtins.c`, declared in the public `include/pureunix/shell.h`) supplies the new process's `envp` — the same "KEY=VALUE" dump of the kernel's env table used by any other program the in-kernel shell launches, so the login shell starts with the just-logged-in user's `USER`/`HOME`/`SHELL`/`PATH`.
 
 ---
 

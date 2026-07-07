@@ -8,6 +8,14 @@ The dispatch function is `syscall_dispatch` in `arch/i386/syscall.c`. It is call
 
 ---
 
+## Path Resolution
+
+Every syscall that takes a path (`SYS_OPEN`, `SYS_STAT`, `SYS_ACCESS`, `SYS_LSTAT`, `SYS_READLINK`, `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`'s second argument, `SYS_CHMOD`, `SYS_CHOWN`, `SYS_UTIME`, `SYS_READDIR`, and the path `SYS_EXEC`/`elf_exec_argv()`/`elf_exec_current()` load) resolves a relative path against the *calling task's own* current working directory (`task_current_cwd()`, `include/pureunix/task.h`) via `vfs_normalize()` (`fs/vfs.c`) before doing anything else — `arch/i386/syscall.c`'s `resolve_path()` helper. An absolute path (starting with `/`) is unaffected (`vfs_normalize()` just canonicalizes `.`/`..` components in it).
+
+This wasn't always true: originally every one of these syscalls handed its raw path straight to `vfs_*()`, which happened to work only because every caller either always used absolute paths (every regression test) or pre-resolved relative ones itself before calling anything (the in-kernel shell's builtins, `shell/sh.c`, via their own `ctx->cwd` and `vfs_normalize()` call). Real, independent multi-process programs — BusyBox's coreutils, ash — make raw relative-path syscalls directly (a bare `stat(".")`, `open("foo")`), which surfaced the gap as a real, user-visible bug (`ls` with no arguments failing "No such file or directory", since `.` was being treated as relative to the filesystem root rather than the caller's cwd). Fixed by generalizing `SYS_CHDIR`'s own (always-correct) resolution pattern to every other path-taking syscall.
+
+---
+
 ## Calling Convention
 
 | Register | Role |
@@ -75,6 +83,10 @@ static int syscall3(int n, int a, int b, int c)
 | 36 | `SYS_PIPE` | pointer to `int[2]` output | — | — | 0 or negative error |
 | 37 | `SYS_DUP` | fd to duplicate | — | — | new fd or negative error |
 | 38 | `SYS_DUP2` | fd to duplicate | fd to become a copy of it | — | newfd or negative error |
+| 39 | `SYS_KILL` | pid | signal number (0 = null signal) | — | 0, or negative error (never returns for `pid == self` with a nonzero signal) |
+| 40 | `SYS_FCNTL` | fd | cmd (`F_DUPFD`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`) | arg | cmd-dependent or negative error |
+| 41 | `SYS_FTRUNCATE` | fd | new length | — | 0 or negative error |
+| 42 | `SYS_GETPPID` | — | — | — | parent task ID (0 if none) |
 
 ---
 
@@ -136,7 +148,7 @@ Calls `task_yield()`, which finds the next ready task in the circular list and p
 Opens a file and allocates a file descriptor — read-only or writable, depending on flags.
 
 **Arguments**:
-- `EBX`: pointer to null-terminated absolute path string
+- `EBX`: pointer to null-terminated path string (relative paths are resolved against the caller's cwd — see "Path Resolution" above)
 - `ECX`: flags — `O_RDONLY` (0), or `O_WRONLY` (0x001) combined with any of `O_CREAT` (0x100) / `O_TRUNC` (0x200) / `O_APPEND` (0x400)
 
 **Returns**: file descriptor (≥ 3) on success, or a negative error code:
@@ -216,7 +228,7 @@ Seeking past the end of the file is allowed. Seeking before byte 0 returns `-EIN
 Retrieves metadata for a file or directory by path.
 
 **Arguments**:
-- `EBX`: pointer to null-terminated absolute path string
+- `EBX`: pointer to null-terminated path string (relative paths are resolved against the caller's cwd — see "Path Resolution" above)
 - `ECX`: pointer to a `struct stat` buffer to fill
 
 **Returns**: `0` on success, or a negative error code:
@@ -258,7 +270,7 @@ struct stat {
 Checks whether the calling task's credentials would permit the requested access to `path`, mirroring POSIX `access(2)`.
 
 **Arguments**:
-- `EBX`: pointer to null-terminated absolute path string
+- `EBX`: pointer to null-terminated path string (relative paths are resolved against the caller's cwd — see "Path Resolution" above)
 - `ECX`: mode — `F_OK` (0), or an OR of `R_OK` (4) / `W_OK` (2) / `X_OK` (1)
 
 **Returns**: `0` if access would be permitted, or a negative error code:
@@ -297,7 +309,7 @@ Permission checks happen in `fs/vfs.c`'s `vfs_chmod()`/`vfs_chown()`, before the
 Enumerates a directory's entries into a flat, caller-supplied buffer — no cursor/offset semantics; the whole directory (up to the buffer's capacity) is returned in one call.
 
 **Arguments**:
-- `EBX`: pointer to null-terminated absolute path string
+- `EBX`: pointer to null-terminated path string (relative paths are resolved against the caller's cwd — see "Path Resolution" above)
 - `ECX`: pointer to an array of `struct dirent`
 - `EDX`: capacity of that array (max entries to write)
 
@@ -613,11 +625,47 @@ The interactive kernel shell's own `kill` builtin (`shell/builtins.c`) sends `SI
 
 ---
 
+## SYS_FCNTL (40)
+
+Minimal `fcntl()` — just the operations BusyBox's `dd`/ash actually need. There is no close-on-exec model in this kernel at all (`exec()` always inherits every fd — see `task_create_user()`/`task_fork()`), so `F_GETFD`/`F_SETFD` are honest no-ops rather than real bookkeeping.
+
+**Arguments**: `EBX`: fd. `ECX`: command. `EDX`: command-dependent argument.
+
+| Command | Behavior |
+|---|---|
+| `F_GETFD` | Always returns `0` (no close-on-exec flag exists to report) |
+| `F_SETFD` | Always returns `0` (accepted, does nothing) |
+| `F_GETFL` | Returns the fd's `open()` flags (`O_WRONLY`/`O_APPEND`/`O_CREAT`/`O_TRUNC` — `include/pureunix/fcntl.h`'s bit layout; `user/newlib_syscalls.c`'s `fcntl()` translates to/from newlib's own layout, same as `open()` does) |
+| `F_SETFL` | Overwrites the fd's flags with `EDX` |
+| `F_DUPFD` | Duplicates the fd (shares the same `open_file_t`, exactly like `SYS_DUP`) into the lowest free fd number that is `>= EDX` |
+
+**Returns**: command-dependent value above, or `-EBADF` if `fd` isn't open, `-EMFILE` if `F_DUPFD` finds no free slot, `-EINVAL` for an unrecognized command.
+
+---
+
+## SYS_FTRUNCATE (41)
+
+Truncates (or zero-extends) an already-open fd's in-memory file contents. Since every `FD_KIND_FILE` open file description holds its *entire* contents in memory (`open_file_t.data`/`.size`, flushed to the VFS in one shot on close — see "File descriptors are now shared, refcounted open file descriptions" above), this just reallocates that buffer to the new size, copying over whatever original bytes still fit and zero-filling any newly-added region — no different in effect from a real `ftruncate(2)`, just implemented against this kernel's whole-file-buffered model rather than a block-level one.
+
+**Arguments**: `EBX`: fd. `ECX`: new length (bytes).
+
+**Returns**: `0` on success, or `-EBADF` (fd not open), `-EINVAL` (negative length), `-ENOSPC` (allocation failure). `-EINVAL` also if the fd is a pipe (`FD_KIND_PIPE`) — pipes aren't seekable or truncatable, same restriction `SYS_LSEEK` already enforces.
+
+---
+
+## SYS_GETPPID (42)
+
+Returns the calling task's parent's id (`task_t.parent`, set once at fork/creation time and never updated), or `0` if the task has no parent (the very first task, or the kernel's own bootstrap context).
+
+---
+
 ## Unimplemented Syscalls
 
-`fstat`, `mmap`, `munmap`, `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
+`fstat`, `munmap` (accepted but a plain `free()` — see `mmap()`'s own entry below), `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
 
-(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above; `exec` originally took only a bare path, with `argv`/`envp` added later — see `SYS_EXEC` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above. `ioctl` (just `TIOCGWINSZ`) and `isatty` were added alongside it — see `SYS_IOCTL` above; `isatty` has no syscall of its own, see that section. `chdir`/`getcwd` were added alongside per-task working directories — see `SYS_CHDIR`/`SYS_GETCWD` above. `getuid`/`getgid` were added alongside the BusyBox port — see `SYS_GETUID`/`SYS_GETGID` above; `setuid`/`setgid` remain unimplemented since there's still no login/privilege model to enforce against. `pipe`/`dup`/`dup2` were added alongside the BusyBox port too — see `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` above.)
+`mmap()`/`munmap()` (`user/newlib_syscalls.c`) are real but deliberately narrow: only `MAP_ANON|MAP_PRIVATE` with `fd == -1` (an anonymous private scratch buffer — the one case BusyBox's `dd` applet actually needs) is supported, implemented as a thin `malloc()`/`free()` wrapper rather than a real page mapping, since this kernel still has no virtual-memory-mapping syscall of its own; anything else (a real fd, `MAP_SHARED`, ...) fails with `-ENODEV`.
+
+(`mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, and `readlink` were added in Stage 4 — see `SYS_MKDIR`, `SYS_UNLINK`, `SYS_RMDIR`, `SYS_RENAME`, `SYS_LINK`, `SYS_SYMLINK`, and `SYS_READLINK` above. `fork`, `exec`, and `wait`/`waitpid` were added alongside per-process address spaces — see `SYS_FORK`, `SYS_EXEC`, and `SYS_WAIT` above; `exec` originally took only a bare path, with `argv`/`envp` added later — see `SYS_EXEC` above. `tcgetattr`/`tcsetattr` were added alongside the console termios layer — see `SYS_TCGETATTR`/`SYS_TCSETATTR` above. `ioctl` (just `TIOCGWINSZ`) and `isatty` were added alongside it — see `SYS_IOCTL` above; `isatty` has no syscall of its own, see that section. `chdir`/`getcwd` were added alongside per-task working directories — see `SYS_CHDIR`/`SYS_GETCWD` above. `getuid`/`getgid` were added alongside the BusyBox port — see `SYS_GETUID`/`SYS_GETGID` above; `setuid`/`setgid` remain unimplemented since there's still no login/privilege model to enforce against. `pipe`/`dup`/`dup2` were added alongside the BusyBox port too — see `SYS_PIPE`/`SYS_DUP`/`SYS_DUP2` above. `fcntl`/`ftruncate`/`getppid` and real relative-path resolution — see "Path Resolution" above — were added when BusyBox ash became the default shell, surfacing the first real independent multi-process programs making raw syscalls with relative paths and POSIX assumptions the in-kernel shell/test suites never exercised.)
 
 `ISIG`'s `VINTR`/`VQUIT`/`VSUSP` are recognized by the tty layer (`drivers/tty.c`) but only `VINTR` has an effect (aborting the current read with `-EINTR`) — there is no signal delivery mechanism yet (`kill`/`signal` above are unimplemented stubs), so `VQUIT` and `VSUSP` are accepted but inert, and no process is ever actually killed or stopped by them.
 

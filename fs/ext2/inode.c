@@ -89,6 +89,54 @@ int ext2_iter_blocks(const ext2_inode_t *inode, uint32_t nbytes,
         if (r != 0) return r;
     }
 
+    if (remaining == 0 || inode->i_block[13] == 0) return 0;
+
+    /* --- Doubly-indirect block [13] ---
+     *
+     * i_block[13] points to a block of pointers to *singly-indirect*
+     * blocks, each of which points to up to ptrs_per_block direct data
+     * blocks — the same "copy the pointer table locally before calling any
+     * callback" reasoning as the singly-indirect case above applies at
+     * both levels, since either one could evict the other from the block
+     * cache. Only needed once a file's real block count exceeds 12 +
+     * ptrs_per_block (268 for 1 KB blocks) — see docs/developer-guide.md's
+     * discussion of this cap and tools/mkext2.py's matching write-side
+     * support.
+     */
+    const uint8_t *dind_data = ext2_read_block(inode->i_block[13]);
+    if (!dind_data) return -1;
+
+    uint32_t dind_ptrs[256];
+    memcpy(dind_ptrs, dind_data, ptrs_per_block * sizeof(uint32_t));
+    /* dind_data is no longer referenced after this point. */
+
+    for (uint32_t d = 0; d < ptrs_per_block && remaining > 0; d++) {
+        if (dind_ptrs[d] == 0) {
+            /* A sparse hole at the singly-indirect level: skip a full
+             * indirect block's worth of data blocks. */
+            uint32_t skip = ptrs_per_block;
+            while (skip > 0 && remaining > 0) {
+                remaining -= (remaining < fs->block_size) ? remaining : fs->block_size;
+                int r = cb(0, ctx);
+                if (r != 0) return r;
+                skip--;
+            }
+            continue;
+        }
+
+        const uint8_t *ind2_data = ext2_read_block(dind_ptrs[d]);
+        if (!ind2_data) return -1;
+        uint32_t ind2_ptrs[256];
+        memcpy(ind2_ptrs, ind2_data, ptrs_per_block * sizeof(uint32_t));
+
+        for (uint32_t p = 0; p < ptrs_per_block && remaining > 0; p++) {
+            uint32_t blk = ind2_ptrs[p];
+            remaining -= (remaining < fs->block_size) ? remaining : fs->block_size;
+            int r = cb(blk, ctx);
+            if (r != 0) return r;
+        }
+    }
+
     return 0;
 }
 
@@ -134,7 +182,11 @@ int ext2_inode_add_block(ext2_inode_t *inode, uint32_t logical_index, uint32_t n
     if (ind_index >= ptrs_per_block) {
         printf("[ext2] inode: logical block %u exceeds singly-indirect range\n",
                (unsigned)logical_index);
-        return -1; /* doubly-indirect is not supported (matches read side) */
+        return -1; /* runtime growth past singly-indirect isn't supported —
+                     * unlike the read side (ext2_iter_blocks() above) and
+                     * tools/mkext2.py's image-builder writer, both of which
+                     * do support doubly-indirect blocks; see
+                     * docs/developer-guide.md's "File Size Cap" section. */
     }
 
     if (inode->i_block[12] == 0) {
@@ -177,6 +229,30 @@ void ext2_inode_free_all_blocks(ext2_inode_t *inode)
         }
         ext2_free_block(inode->i_block[12]);
         inode->i_block[12] = 0;
+    }
+
+    if (inode->i_block[13]) {
+        ext2_fs_t *fs = ext2_get_fs();
+        uint32_t ptrs_per_block = fs->block_size / sizeof(uint32_t);
+        const uint8_t *ro = ext2_read_block(inode->i_block[13]);
+        if (ro) {
+            uint32_t dind_ptrs[EXT2_INODE_MAX_BLOCK / sizeof(uint32_t)];
+            memcpy(dind_ptrs, ro, ptrs_per_block * sizeof(uint32_t));
+            for (uint32_t d = 0; d < ptrs_per_block; d++) {
+                if (!dind_ptrs[d]) continue;
+                const uint8_t *ro2 = ext2_read_block(dind_ptrs[d]);
+                if (ro2) {
+                    uint32_t ind2_ptrs[EXT2_INODE_MAX_BLOCK / sizeof(uint32_t)];
+                    memcpy(ind2_ptrs, ro2, ptrs_per_block * sizeof(uint32_t));
+                    for (uint32_t p = 0; p < ptrs_per_block; p++) {
+                        if (ind2_ptrs[p]) ext2_free_block(ind2_ptrs[p]);
+                    }
+                }
+                ext2_free_block(dind_ptrs[d]);
+            }
+        }
+        ext2_free_block(inode->i_block[13]);
+        inode->i_block[13] = 0;
     }
 
     inode->i_blocks = 0;

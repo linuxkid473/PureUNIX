@@ -1,10 +1,13 @@
 /* Override for glibc's <sys/mman.h>, which newlib doesn't have (see
- * user/newlib_compat/byteswap.h's header comment) — PureUNIX has no
- * mmap()/munmap() syscall yet (only a static-array sbrk() — see
- * user/newlib_syscalls.c). Declarations only, so code that doesn't
- * actually call mmap() (true of every applet currently enabled in
- * .config) still compiles; anything that does call it will fail to link,
- * same as any other syscall PureUNIX doesn't have yet.
+ * user/newlib_compat/byteswap.h's header comment) — PureUNIX has no real
+ * virtual-memory mapping syscall (no mmap/munmap/brk — see
+ * docs/syscalls.md's "Unimplemented Syscalls"; only a static-array sbrk()
+ * backs malloc(), see user/newlib_syscalls.c). mmap()/munmap() themselves
+ * (also in newlib_syscalls.c) only support the one case BusyBox's dd applet
+ * actually needs — MAP_ANON|MAP_PRIVATE with fd == -1, i.e. "just give me a
+ * private scratch buffer" — implemented as a thin malloc()/free() wrapper
+ * rather than a real page mapping; any other flags/a real fd fail with
+ * ENODEV, same as any other syscall PureUNIX doesn't have yet.
  */
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_MMAN_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_MMAN_H

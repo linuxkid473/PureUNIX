@@ -1,4 +1,5 @@
 #include <pureunix/elf.h>
+#include <pureunix/errno.h>
 #include <pureunix/memory.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
@@ -176,9 +177,19 @@ static int build_argv_stack(phys_addr_t top_frame, uint32_t top_page_va, int arg
  * leaves pd_phys untouched by the caller's perspective (any pages already
  * mapped into it are the caller's responsibility to free via
  * vmm_free_user_directory()). */
-static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *const argv[],
+static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char *const argv[],
                           char *const envp[], uint32_t *out_entry, uint32_t *out_stack)
 {
+    /* raw_path may be relative (a real user process's execve("./foo", ...)
+     * or a bare/relative name from a fork()+exec() shell — the in-kernel
+     * shell's own callers (shell/sh.c) already pass an absolute path, so
+     * this is a no-op for them; resolving here too (rather than only in
+     * arch/i386/syscall.c's SYS_EXEC case) covers both elf_exec_argv() and
+     * elf_exec_current() callers in one place). */
+    char path_buf[PUREUNIX_MAX_PATH];
+    vfs_normalize(path_buf, task_current_cwd(), raw_path);
+    const char *path = path_buf;
+
     /* Executing requires X_OK on the file itself — distinct from, and
      * checked in addition to, the R_OK that vfs_read_file() below enforces
      * to actually load the bytes off disk (this kernel has no separate
@@ -186,25 +197,27 @@ static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *con
      * running a program still needs both bits set, as every ELF in /bin
      * in the test image does: rwxr-xr-x). */
     vfs_stat_t st;
-    if (vfs_stat(path, &st) != 0) {
+    int src = vfs_stat(path, &st);
+    if (src != 0) {
         printf("%s: not found\n", path);
-        return -1;
+        return src;
     }
     if (!vfs_access(&st, current_uid(), current_gid(), X_OK)) {
         printf("%s: permission denied\n", path);
-        return -1;
+        return -EACCES;
     }
 
     uint8_t *image = NULL;
     size_t size = 0;
-    if (vfs_read_file(path, &image, &size) != 0) {
+    int rrc = vfs_read_file(path, &image, &size);
+    if (rrc != 0) {
         printf("%s: not found\n", path);
-        return -1;
+        return rrc;
     }
     if (!elf_is_valid(image, size)) {
         printf("%s: not an i386 ELF executable\n", path);
         kfree(image);
-        return -1;
+        return -ENOEXEC;
     }
 
     elf32_ehdr_t *eh = (elf32_ehdr_t *)image;
@@ -217,7 +230,7 @@ static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *con
             ph->p_vaddr + ph->p_memsz > ELF_CODE_LIMIT) {
             printf("%s: invalid segment\n", path);
             kfree(image);
-            return -1;
+            return -ENOEXEC;
         }
 
         uint32_t seg_start = ALIGN_DOWN(ph->p_vaddr, PUREUNIX_PAGE_SIZE);
@@ -227,7 +240,7 @@ static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *con
             if (!frame) {
                 printf("%s: out of memory\n", path);
                 kfree(image);
-                return -1;
+                return -ENOMEM;
             }
             memset((void *)frame, 0, PUREUNIX_PAGE_SIZE);
 
@@ -259,7 +272,7 @@ static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *con
         phys_addr_t frame = pmm_alloc_frame();
         if (!frame) {
             printf("%s: out of memory\n", path);
-            return -1;
+            return -ENOMEM;
         }
         memset((void *)frame, 0, PUREUNIX_PAGE_SIZE);
         vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
@@ -271,7 +284,7 @@ static int elf_load_into(const char *path, uint32_t pd_phys, int argc, char *con
     uint32_t stack_top = USER_WINDOW_END;
     if (build_argv_stack(top_frame, top_page_va, argc, argv, envp, &stack_top) != 0) {
         printf("%s: argument list too long\n", path);
-        return -1;
+        return -E2BIG;
     }
 
     *out_entry = entry;
@@ -284,7 +297,7 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
     uint32_t pd_phys = vmm_create_user_directory();
     if (!pd_phys) {
         printf("%s: out of memory\n", path);
-        return -1;
+        return -ENOMEM;
     }
 
     uint32_t entry, stack_top;
@@ -298,7 +311,7 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
     if (!child) {
         vmm_free_user_directory(pd_phys);
         printf("%s: failed to create process\n", path);
-        return -1;
+        return -ENOMEM;
     }
     return task_join(child);
 }
@@ -314,12 +327,12 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
 {
     task_t *t = task_current();
     if (!t || !t->is_user) {
-        return -1;
+        return -EINVAL;
     }
 
     uint32_t new_pd = vmm_create_user_directory();
     if (!new_pd) {
-        return -1;
+        return -ENOMEM;
     }
 
     uint32_t entry, stack_top;

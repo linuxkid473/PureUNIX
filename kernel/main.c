@@ -3,6 +3,7 @@
 #include <pureunix/config.h>
 #include <pureunix/crypto.h>
 #include <pureunix/disk.h>
+#include <pureunix/elf.h>
 #include <pureunix/ext2.h>
 #include <pureunix/fat16.h>
 #include <pureunix/framebuffer.h>
@@ -13,12 +14,66 @@
 #include <pureunix/serial.h>
 #include <pureunix/shell.h>
 #include <pureunix/stdio.h>
+#include <pureunix/string.h>
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
 #include <pureunix/tty.h>
 #include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
+
+/* The real login shell for an interactive session — BusyBox ash by default
+ * (/etc/passwd's shell field, seeded "/bin/sh" — see kernel/users.c),
+ * launched as a genuine ring-3 process via elf_exec_argv() exactly the way
+ * the (now-secondary) in-kernel shell launches any other external program
+ * (shell/sh.c's exec_external()); kernel_main() itself is "current" here
+ * (tasking_init()'s main_task, not a user task) — see task_create_user()'s
+ * fd/uid/gid/cwd inheritance, which works the same regardless. Blocks
+ * (elf_exec_argv() only returns once its child has exited — see
+ * kernel/elf.c) until the login shell itself exits, then kernel_main()'s
+ * own for(;;) loop calls users_login() again, i.e. exiting the shell logs
+ * you out back to a fresh login prompt, real-getty style.
+ *
+ * If the configured shell can't be exec'd at all (a stripped-down disk
+ * image, or /etc/passwd pointing somewhere that no longer exists), falls
+ * back to /bin/puresh (see docs/shell.md), then as an absolute last resort
+ * to the legacy in-kernel shell_run() so the system is never unusable. */
+/* Launches `path` as the login shell if it actually exists, treating any
+ * exit code it returns (elf_exec_argv() propagates the child's own raw
+ * exit code — including negative "killed by signal" codes, see SYS_KILL's
+ * doc in docs/syscalls.md) as a normal, successful session rather than a
+ * launch failure — the vfs_stat() gate is what actually distinguishes
+ * "couldn't start this shell at all" from "started fine, ran, exited"
+ * (elf_exec_argv()'s own negative return range would otherwise be
+ * ambiguous between the two). Returns true if the shell was launched at
+ * all (regardless of how it exited). */
+static bool try_login_shell(const char *path)
+{
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) {
+        return false;
+    }
+    char *const argv[] = { (char *)path, NULL };
+    elf_exec_argv(path, 1, argv, shell_build_envp());
+    return true;
+}
+
+static void run_login_shell(void)
+{
+    const char *shell_path = shell_getenv("SHELL");
+    if (!shell_path || !shell_path[0]) {
+        shell_path = "/bin/sh";
+    }
+    if (try_login_shell(shell_path)) {
+        return;
+    }
+    if (strcmp(shell_path, "/bin/puresh") != 0 && try_login_shell("/bin/puresh")) {
+        return;
+    }
+    printf("warning: could not start a login shell (%s) — falling back to the built-in recovery shell\n",
+           shell_path);
+    shell_run();
+}
 
 void kernel_main(uint32_t magic, uint32_t mbi_addr)
 {
@@ -82,11 +137,9 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     if (users_first_boot()) {
         users_first_boot_setup();
     }
-    users_login();
-
-    shell_run();
 
     for (;;) {
-        arch_halt();
+        users_login();
+        run_login_shell();
     }
 }

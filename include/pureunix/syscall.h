@@ -88,6 +88,17 @@ enum {
     /* Terminates another task with a signal's POSIX default action — see
      * kernel/task.c's task_kill() and docs/syscalls.md. */
     SYS_KILL = 39,
+
+    /* Minimal fcntl(): F_GETFL/F_SETFL/F_DUPFD/F_GETFD/F_SETFD only — see
+     * arch/i386/syscall.c and docs/syscalls.md. */
+    SYS_FCNTL = 40,
+
+    /* Truncate an already-open fd to a given length — see arch/i386/syscall.c
+     * and docs/syscalls.md. */
+    SYS_FTRUNCATE = 41,
+
+    /* Parent task id — see arch/i386/syscall.c and docs/syscalls.md. */
+    SYS_GETPPID = 42,
 };
 
 #endif

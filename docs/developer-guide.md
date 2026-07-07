@@ -91,8 +91,16 @@ The INT 0x80 gate is already installed with DPL=3; no IDT changes are required f
 The EXT2 block cache returns non-owning pointers. These rules must be followed:
 
 1. **Never call `kfree` on a pointer returned by `ext2_read_block`.** The cache owns the buffer.
-2. **Copy data before calling `ext2_read_block` again.** Any `ext2_read_block` call can evict the slot holding your pointer. In `ext2_iter_blocks`, the singly-indirect block pointer table is copied into a `uint32_t local_ptrs[256]` array for exactly this reason.
+2. **Copy data before calling `ext2_read_block` again.** Any `ext2_read_block` call can evict the slot holding your pointer. In `ext2_iter_blocks`, the singly-indirect *and* doubly-indirect block pointer tables are each copied into their own local `uint32_t [256]` array for exactly this reason — the doubly-indirect level reads two nested indirect blocks per outer pointer, either of which can evict the other from the cache.
 3. **`ext2_block_cache_flush()`** is called at mount and unmount. Do not call it during normal driver operation.
+
+### File Size Cap (Direct + Singly + Doubly Indirect)
+
+With 1 KB blocks, `i_block[0..11]` addresses 12 direct blocks, `i_block[12]` (singly-indirect) addresses 256 more (256 four-byte pointers per 1 KB block), and `i_block[13]` (doubly-indirect) addresses up to 256 × 256 = 65536 more via a block of pointers to further singly-indirect blocks. `fs/ext2/inode.c`'s `ext2_iter_blocks()` (read) and `ext2_inode_free_all_blocks()` (freeing a deleted file's blocks) both support all three levels; `tools/mkext2.py`'s `_pack_inode()` mirrors the same three-level split when building a file's `i_block[]` directly, for images built at the same time as the kernel binary rather than grown by it at runtime. `i_block[14]` (triply-indirect) is not implemented on either side.
+
+**`ext2_inode_add_block()` — the kernel's own runtime file-*growth* path (a running program writing past a file's current block count) — deliberately still only supports direct + singly-indirect (≤268 blocks, ~268 KB) and returns an error past that**, rather than growing further. Read-only loading of a large pre-built file (an EXT2 image's own inode table already has real `i_block[13]` pointers baked in) and writing/growing a file large enough to need doubly-indirect blocks *at runtime* are two different code paths — only the former was needed (see below) and implemented; the latter remains a known, deliberate scope boundary, not an oversight.
+
+This limit used to be much tighter (12 + 256 = 268 blocks, ~268 KB, on *both* the read and the image-builder write side) before doubly-indirect read support existed — `tools/mkext2.py`'s inode packer used to crash outright with a `struct.pack_into` buffer-overflow error trying to write a 257th indirect pointer into a single 1 KB block, and the kernel's own `ext2_iter_blocks()` would have silently truncated a file that big even if the image builder could somehow produce one. This surfaced for real once BusyBox's vendored `busybox.elf` grew past 268 KB from enabling more applets (see `docs/userland.md`'s "BusyBox" section) — fixed by implementing doubly-indirect *reading* on both the kernel side and the Python image-builder's *writing* side, rather than continuing to trim applets to fit under the old cap indefinitely.
 
 ---
 

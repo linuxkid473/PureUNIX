@@ -185,46 +185,68 @@ class Ext2Builder:
     # ------------------------------------------------------------------
     # Serialise a directory's entries into one or more data blocks
     # ------------------------------------------------------------------
-    def _build_dir_block(self, entries_with_dots: list) -> bytes:
+    def _build_dir_blocks(self, entries_with_dots: list) -> list:
         """
-        Pack directory entries into exactly one block.  The last entry's
-        rec_len is extended to fill the remainder of the block.
-        Each entry: (name_str, inode_no, file_type)
+        Pack directory entries across as many BLOCK_SIZE blocks as needed
+        (real EXT2 directories grow this way once entries stop fitting in
+        one block — same reason kernel/fs/ext2/dir.c's ext2_dir_insert()
+        grows a directory at runtime, see docs/developer-guide.md's "Stack
+        Overflow in Tasks" story for how that path was found/fixed). The
+        last entry actually placed in each block has its rec_len stretched
+        to fill that block, exactly matching a real EXT2 directory's
+        on-disk layout — not just the final block.
         """
-        buf  = bytearray(BLOCK_SIZE)
-        off  = 0
-        entries = list(entries_with_dots)  # copy so we can mutate
-        for idx, (name, ino, ft) in enumerate(entries):
-            name_bytes = name.encode('ascii')
-            name_len   = len(name_bytes)
-            # rec_len must be 4-byte aligned
-            base_len   = 8 + name_len
-            rec_len    = (base_len + 3) & ~3
-            if idx == len(entries) - 1:
-                # Last entry: stretch to end of block
-                rec_len = BLOCK_SIZE - off
-            struct.pack_into('<IHBBs', buf, off,
-                             ino, rec_len, name_len, ft,
-                             b'\x00')   # dummy placeholder for name
-            # Write name bytes after the header
-            buf[off + 8 : off + 8 + name_len] = name_bytes
-            off += rec_len
-        return bytes(buf)
+        remaining = list(entries_with_dots)
+        blocks = []
+        while remaining:
+            buf = bytearray(BLOCK_SIZE)
+            off = 0
+            packed_total = 0
+            while remaining:
+                name, ino, ft = remaining[0]
+                name_bytes = name.encode('ascii')
+                rec_len = (8 + len(name_bytes) + 3) & ~3
+                if off + rec_len > BLOCK_SIZE:
+                    break
+                struct.pack_into('<IHBBs', buf, off,
+                                 ino, rec_len, len(name_bytes), ft, b'\x00')
+                buf[off + 8 : off + 8 + len(name_bytes)] = name_bytes
+                off += rec_len
+                packed_total += 1
+                remaining.pop(0)
+            if packed_total == 0:
+                raise ValueError(f"directory entry name too long to fit in a {BLOCK_SIZE}-byte block")
+            # Stretch the last entry actually placed in this block to fill it.
+            last_off = off
+            # Walk back to find the last entry's header offset.
+            prev_off = 0
+            it = 0
+            walk = 0
+            while walk < off:
+                rec_len = struct.unpack_from('<H', buf, walk + 4)[0]
+                prev_off = walk
+                walk += rec_len
+                it += 1
+            struct.pack_into('<H', buf, prev_off + 4, BLOCK_SIZE - prev_off)
+            blocks.append(bytes(buf))
+        return blocks
 
     def _finalise_dirs(self):
         """Allocate data blocks for all directories and write their entries."""
         for ino, entries in self._dirs.items():
             # Build the canonical entry list: "." and ".." come first
-            # For simplicity every directory fits in one block
             dot_entries = [
                 ('.',  ino, FT_DIR),
                 ('..', self._parent.get(ino, ROOT_INO), FT_DIR),
             ] + entries
-            blk = self._alloc_block()
-            block_data = self._build_dir_block(dot_entries)
-            self._write_block(blk, block_data)
-            self._inodes[ino]['blocks'] = [blk]
-            self._inodes[ino]['size']   = BLOCK_SIZE
+            block_datas = self._build_dir_blocks(dot_entries)
+            blks = []
+            for block_data in block_datas:
+                blk = self._alloc_block()
+                self._write_block(blk, block_data)
+                blks.append(blk)
+            self._inodes[ino]['blocks'] = blks
+            self._inodes[ino]['size']   = BLOCK_SIZE * len(blks)
 
     # ------------------------------------------------------------------
     # Inode table serialisation
@@ -247,24 +269,59 @@ class Ext2Builder:
             padded = inline_target.ljust(60, b'\x00')
             i_block = list(struct.unpack('<15I', padded))
         else:
-            # Build i_block[15]: direct[0..11], indirect[12..14]
-            direct        = blks[:12]
-            indirect_data = blks[12:]
+            # Build i_block[15]: direct[0..11], singly-indirect[12],
+            # doubly-indirect[13]. PTRS_PER_BLOCK block pointers (4 bytes
+            # each) fit in one BLOCK_SIZE block; direct + singly-indirect
+            # addresses 12 + PTRS_PER_BLOCK blocks (268 for 1 KB blocks —
+            # see docs/developer-guide.md). Anything beyond that needs
+            # doubly-indirect: i_block[13] points to a block of pointers to
+            # further singly-indirect blocks, mirroring the kernel's own
+            # read-side support in fs/ext2/inode.c's ext2_iter_blocks().
+            PTRS_PER_BLOCK = BLOCK_SIZE // 4
+
+            direct    = blks[:12]
+            rest      = blks[12:]
+            singly    = rest[:PTRS_PER_BLOCK]
+            doubly    = rest[PTRS_PER_BLOCK:]
 
             for idx, b in enumerate(direct):
                 i_block[idx] = b
 
-            # If more than 12 blocks, allocate a singly-indirect block
-            if indirect_data:
+            meta_blocks = 0
+
+            if singly:
                 ind_blk_no = self._alloc_block()
                 ind_buf    = bytearray(BLOCK_SIZE)
-                for idx, b in enumerate(indirect_data):
+                for idx, b in enumerate(singly):
                     struct.pack_into('<I', ind_buf, idx * 4, b)
                 self._write_block(ind_blk_no, bytes(ind_buf))
                 i_block[12] = ind_blk_no
+                meta_blocks += 1
 
-            # i_blocks: 512-byte units of all allocated blocks (data + indirect)
-            total_disk_blocks = len(blks) + (1 if indirect_data else 0)
+            if doubly:
+                if len(doubly) > PTRS_PER_BLOCK * PTRS_PER_BLOCK:
+                    raise ValueError(
+                        f"file needs {len(blks)} blocks, exceeding this "
+                        f"builder's doubly-indirect capacity "
+                        f"({12 + PTRS_PER_BLOCK + PTRS_PER_BLOCK * PTRS_PER_BLOCK} blocks)")
+                dind_buf = bytearray(BLOCK_SIZE)
+                for chunk_idx in range(0, len(doubly), PTRS_PER_BLOCK):
+                    chunk = doubly[chunk_idx : chunk_idx + PTRS_PER_BLOCK]
+                    ind2_blk_no = self._alloc_block()
+                    ind2_buf = bytearray(BLOCK_SIZE)
+                    for idx, b in enumerate(chunk):
+                        struct.pack_into('<I', ind2_buf, idx * 4, b)
+                    self._write_block(ind2_blk_no, bytes(ind2_buf))
+                    struct.pack_into('<I', dind_buf, (chunk_idx // PTRS_PER_BLOCK) * 4, ind2_blk_no)
+                    meta_blocks += 1
+                dind_blk_no = self._alloc_block()
+                self._write_block(dind_blk_no, bytes(dind_buf))
+                i_block[13] = dind_blk_no
+                meta_blocks += 1
+
+            # i_blocks: 512-byte units of all allocated blocks (data blocks
+            # plus every indirect/doubly-indirect metadata block).
+            total_disk_blocks = len(blks) + meta_blocks
             i_blocks_field    = total_disk_blocks * SECTORS_PER_BLOCK
 
         fmt = '<HHIIIIIHHIII' + 'I' * 15 + 'IIII12s'
@@ -421,9 +478,11 @@ class Ext2Builder:
 # applet table from Python without running it). See docs/userland.md's
 # "BusyBox" section and tools/build-busybox.sh.
 BUSYBOX_APPLETS = [
-    "basename", "cat", "cp", "dirname", "echo", "false", "ln", "ls",
-    "mkdir", "mv", "pwd", "rm", "rmdir", "sleep", "test", "touch", "true",
-    "wc", "yes",
+    "ash", "sh", "basename", "cat", "chmod", "chown", "clear", "cp", "dd",
+    "dirname", "echo", "env", "false", "find", "head", "kill", "less",
+    "ln", "ls", "mkdir", "mv", "printf", "pwd", "rm", "rmdir", "sleep",
+    "sort", "tail", "tee", "test", "touch", "true", "wc", "which", "xargs",
+    "yes",
 ]
 
 DOC_ALIASES = {
@@ -495,6 +554,12 @@ def add_bin(fs, programs):
     # elf_exec()'s X_OK check runs against hello.elf's own resolved mode.
     if any(os.path.basename(p).lower() == 'hello.elf' for p in programs):
         fs.add_symlink(bin_ino, 'hello', 'hello.elf')
+
+    # Same idea for neatvi — a real standalone ELF (not a BusyBox applet),
+    # so it just needs a plain name-without-.elf symlink to be reachable as
+    # an ordinary PATH command ("neatvi"), same as any real installed editor.
+    if any(os.path.basename(p).lower() == 'neatvi.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'neatvi', 'neatvi.elf')
 
     # BusyBox multi-call binary: one ELF, dispatched by argv[0]'s basename
     # (applets/applets.c's find_applet_by_name()) — every applet name is

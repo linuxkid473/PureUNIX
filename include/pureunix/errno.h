@@ -7,7 +7,10 @@
 #define ESRCH    3   /* no such process (SYS_KILL on a nonexistent pid) */
 #define EINTR    4   /* interrupted (VINTR fired mid-read; see drivers/tty.c) */
 #define EIO      5   /* I/O error */
+#define E2BIG    7   /* argument list too long (SYS_EXEC) */
+#define ENOEXEC  8   /* not a valid ELF executable (SYS_EXEC) */
 #define EBADF    9   /* bad file descriptor */
+#define ENOMEM   12  /* out of memory */
 #define ENOTTY   25  /* not a tty (tcgetattr()/tcsetattr() on a non-console fd) */
 #define EEXIST   17  /* file already exists */
 #define ENOTDIR  20  /* not a directory */

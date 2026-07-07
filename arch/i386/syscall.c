@@ -16,6 +16,36 @@
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 
+/* fcntl() commands — same numbering as newlib's <sys/_default_fcntl.h> (and
+ * Linux), so user/newlib_syscalls.c's fcntl() can pass cmd straight through
+ * unmodified; only the O_* flag bits themselves need translating (same as
+ * open(), see that file). */
+enum {
+    PU_F_DUPFD = 0,
+    PU_F_GETFD = 1,
+    PU_F_SETFD = 2,
+    PU_F_GETFL = 3,
+    PU_F_SETFL = 4,
+};
+
+/* Every path-taking syscall below used to hand its raw path straight to
+ * vfs_*() — fine as long as the only callers were the in-kernel shell
+ * (which always pre-resolves against its own ctx->cwd via vfs_normalize()
+ * before calling anything, see shell/sh.c) or test suites that only ever
+ * used absolute paths. Once real, independent multi-process programs
+ * (BusyBox's coreutils, ash) started making raw relative-path syscalls
+ * directly — plain `stat(".")`, `open("foo")`, etc. — that gap became a
+ * real bug (a relative path was always treated as relative to the
+ * filesystem root, since nothing here consulted the calling task's own
+ * cwd). This resolves every path against task_current_cwd() (SYS_CHDIR's
+ * handler already did this correctly; this generalizes the same pattern to
+ * every other syscall that takes a path). Safe for already-absolute paths
+ * too — vfs_normalize() with an absolute `path` just canonicalizes it. */
+static void resolve_path(char *out, const char *path)
+{
+    vfs_normalize(out, task_current_cwd(), path);
+}
+
 /* Collects vfs_readdir() callback entries into the caller's SYS_READDIR
  * output buffer, capped at the caller-supplied capacity. */
 typedef struct readdir_collect_ctx {
@@ -272,15 +302,18 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         task_yield();
         return 0;
     case SYS_OPEN: {
-        const char *path  = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         int         flags = (int)regs->ecx;
 
-        if (!path) {
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        const char *path = path_buf;
 
         bool want_write  = (flags & O_WRONLY) != 0;
         bool want_creat  = (flags & O_CREAT) != 0;
@@ -540,17 +573,99 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         return 0;
     }
+    case SYS_FCNTL: {
+        /* Minimal fcntl(): only the operations BusyBox's dd/ash actually
+         * need. No close-on-exec model exists in this kernel (exec() always
+         * inherits every fd — see task_create_user()/task_fork()), so
+         * F_GETFD/F_SETFD are honest no-ops rather than real bookkeeping. */
+        int fd  = (int)regs->ebx;
+        int cmd = (int)regs->ecx;
+        int arg = (int)regs->edx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        switch (cmd) {
+        case PU_F_GETFD:
+            return 0;
+        case PU_F_SETFD:
+            return 0;
+        case PU_F_GETFL:
+            return t->fds[fd].file ? (uint32_t)t->fds[fd].file->flags : 0;
+        case PU_F_SETFL:
+            if (t->fds[fd].file) {
+                t->fds[fd].file->flags = arg;
+            }
+            return 0;
+        case PU_F_DUPFD: {
+            if (!t->fds[fd].file) {
+                return (uint32_t)-EBADF;
+            }
+            int lo = arg < 0 ? 0 : arg;
+            for (int i = lo; i < MAX_OPEN_FILES; ++i) {
+                if (!t->fds[i].used) {
+                    t->fds[i].used = true;
+                    t->fds[i].file = t->fds[fd].file;
+                    open_file_ref(t->fds[i].file);
+                    return (uint32_t)i;
+                }
+            }
+            return (uint32_t)-EMFILE;
+        }
+        default:
+            return (uint32_t)-EINVAL;
+        }
+    }
+    case SYS_FTRUNCATE: {
+        int fd = (int)regs->ebx;
+        int length = (int)regs->ecx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file) {
+            return (uint32_t)-EBADF;
+        }
+        if (length < 0) {
+            return (uint32_t)-EINVAL;
+        }
+        open_file_t *f = t->fds[fd].file;
+        if (f->kind != FD_KIND_FILE) {
+            return (uint32_t)-EINVAL;
+        }
+        size_t new_size = (size_t)length;
+        uint8_t *new_data = kmalloc(new_size ? new_size : 1);
+        if (!new_data) {
+            return (uint32_t)-ENOSPC;
+        }
+        size_t keep = f->size < new_size ? f->size : new_size;
+        if (f->data && keep) {
+            memcpy(new_data, f->data, keep);
+        }
+        if (new_size > keep) {
+            memset(new_data + keep, 0, new_size - keep);
+        }
+        if (f->data) {
+            kfree(f->data);
+        }
+        f->data = new_data;
+        f->size = new_size;
+        return 0;
+    }
+    case SYS_GETPPID: {
+        task_t *t = task_current();
+        return t && t->parent ? t->parent->id : 0;
+    }
     case SYS_STAT: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
-        if (!path || !st) {
+        if (!raw_path || !st) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
         vfs_stat_t vst;
-        int src = vfs_stat(path, &vst);
+        int src = vfs_stat(path_buf, &vst);
         if (src != 0) {
             return (uint32_t)src;
         }
@@ -570,17 +685,19 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         return 0;
     }
     case SYS_ACCESS: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         int mode = (int)regs->ecx;
 
-        if (!path) {
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
         vfs_stat_t st;
-        int sra = vfs_stat(path, &st);
+        int sra = vfs_stat(path_buf, &st);
         if (sra != 0) {
             return (uint32_t)sra;
         }
@@ -590,16 +707,18 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         return 0;
     }
     case SYS_LSTAT: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
-        if (!path || !st) {
+        if (!raw_path || !st) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
         vfs_stat_t vst;
-        int rc = vfs_lstat(path, &vst);
+        int rc = vfs_lstat(path_buf, &vst);
         if (rc != 0) {
             return (uint32_t)rc;
         }
@@ -619,116 +738,142 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         return 0;
     }
     case SYS_READLINK: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         char *buf = (char *)regs->ecx;
         size_t bufsize = (size_t)regs->edx;
-        if (!path || !buf) {
+        if (!raw_path || !buf) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_readlink(path, buf, bufsize);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_readlink(path_buf, buf, bufsize);
     }
     case SYS_MKDIR: {
-        const char *path = (const char *)regs->ebx;
-        if (!path) {
+        const char *raw_path = (const char *)regs->ebx;
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_mkdir(path);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_mkdir(path_buf);
     }
     case SYS_UNLINK: {
-        const char *path = (const char *)regs->ebx;
-        if (!path) {
+        const char *raw_path = (const char *)regs->ebx;
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_unlink(path);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_unlink(path_buf);
     }
     case SYS_RMDIR: {
-        const char *path = (const char *)regs->ebx;
-        if (!path) {
+        const char *raw_path = (const char *)regs->ebx;
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_rmdir(path);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_rmdir(path_buf);
     }
     case SYS_RENAME: {
-        const char *old_path = (const char *)regs->ebx;
-        const char *new_path = (const char *)regs->ecx;
-        if (!old_path || !new_path) {
+        const char *raw_old = (const char *)regs->ebx;
+        const char *raw_new = (const char *)regs->ecx;
+        if (!raw_old || !raw_new) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_rename(old_path, new_path);
+        char old_buf[PUREUNIX_MAX_PATH], new_buf[PUREUNIX_MAX_PATH];
+        resolve_path(old_buf, raw_old);
+        resolve_path(new_buf, raw_new);
+        return (uint32_t)vfs_rename(old_buf, new_buf);
     }
     case SYS_LINK: {
-        const char *old_path = (const char *)regs->ebx;
-        const char *new_path = (const char *)regs->ecx;
-        if (!old_path || !new_path) {
+        const char *raw_old = (const char *)regs->ebx;
+        const char *raw_new = (const char *)regs->ecx;
+        if (!raw_old || !raw_new) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_link(old_path, new_path);
+        char old_buf[PUREUNIX_MAX_PATH], new_buf[PUREUNIX_MAX_PATH];
+        resolve_path(old_buf, raw_old);
+        resolve_path(new_buf, raw_new);
+        return (uint32_t)vfs_link(old_buf, new_buf);
     }
     case SYS_SYMLINK: {
+        /* target is a symlink's stored contents, an arbitrary string the
+         * kernel never resolves itself (only the second argument, where
+         * the symlink itself is created, is a real path) — left
+         * unresolved on purpose, matching real symlink(2) semantics. */
         const char *target = (const char *)regs->ebx;
-        const char *path = (const char *)regs->ecx;
-        if (!target || !path) {
+        const char *raw_path = (const char *)regs->ecx;
+        if (!target || !raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_symlink(target, path);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_symlink(target, path_buf);
     }
     case SYS_CHMOD: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         mode_t mode = (mode_t)regs->ecx;
-        if (!path) {
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_chmod(path, mode);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_chmod(path_buf, mode);
     }
     case SYS_CHOWN: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         uid_t uid = (uid_t)regs->ecx;
         gid_t gid = (gid_t)regs->edx;
-        if (!path) {
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_chown(path, uid, gid);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_chown(path_buf, uid, gid);
     }
     case SYS_READDIR: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         struct pureunix_dirent *out = (struct pureunix_dirent *)regs->ecx;
         int max = (int)regs->edx;
 
-        if (!path || !out || max <= 0) {
+        if (!raw_path || !out || max <= 0) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
         readdir_collect_ctx_t ctx = { .out = out, .max = max, .count = 0 };
-        int drc = vfs_readdir(path, readdir_collect_cb, &ctx);
+        int drc = vfs_readdir(path_buf, readdir_collect_cb, &ctx);
         if (drc < 0) {
             return (uint32_t)drc;
         }
@@ -881,16 +1026,18 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     case SYS_GETGID:
         return (uint32_t)current_gid();
     case SYS_UTIME: {
-        const char *path = (const char *)regs->ebx;
+        const char *raw_path = (const char *)regs->ebx;
         uint32_t atime = regs->ecx;
         uint32_t mtime = regs->edx;
-        if (!path) {
+        if (!raw_path) {
             return (uint32_t)-EINVAL;
         }
         if (!vfs_mounted()) {
             return (uint32_t)-ENOENT;
         }
-        return (uint32_t)vfs_utime(path, atime, mtime);
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_utime(path_buf, atime, mtime);
     }
     case SYS_GETTIMEOFDAY: {
         uint32_t *out = (uint32_t *)regs->ebx;
