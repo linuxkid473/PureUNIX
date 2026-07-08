@@ -69,6 +69,24 @@ DEPS += $(VI_OBJS:.o=.d)
 NEWLIB_PROGRAMS := libctest exectest dirtest
 NEWLIB_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(NEWLIB_PROGRAMS)))
 
+# regcomp/regexec/regerror/regfree (see third_party/regex/README.md) — the
+# POSIX regex engine newlib's own <regex.h> declares but never implements
+# for this bare target. Vendored as source (small enough, unlike BusyBox)
+# and built here so tools/build-busybox.sh can link the resulting objects
+# straight into busybox.elf, giving grep/egrep/fgrep real regex matching.
+# engine.c is deliberately NOT in this list: regexec.c #includes it directly
+# (three times, with different macros each time — see regexec.c) rather
+# than linking it as its own translation unit, exactly like upstream.
+REGEX_SRCS := third_party/regex/regcomp.c third_party/regex/regexec.c \
+	third_party/regex/regerror.c third_party/regex/regfree.c
+REGEX_OBJS := $(patsubst third_party/regex/%.c,$(BUILD)/user/regex/%.o,$(REGEX_SRCS))
+
+$(BUILD)/user/regex/%.o: third_party/regex/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(REGEX_OBJS:.o=.d)
+
 # BusyBox: vendored as a prebuilt ELF (third_party/busybox/busybox.elf,
 # built by tools/build-busybox.sh against the same newlib_crt0/
 # newlib_syscalls glue as NEWLIB_ELFS above) rather than compiled from
@@ -78,7 +96,7 @@ NEWLIB_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(NEWLIB_PROGRAMS)))
 # tools/mkext2.py), and FAT16 has no symlinks to hang those off of.
 BUSYBOX_ELF := $(BUILD)/user/busybox.elf
 
-$(BUSYBOX_ELF): third_party/busybox/busybox.elf
+$(BUSYBOX_ELF): third_party/busybox/busybox.elf $(REGEX_OBJS)
 	@mkdir -p $(dir $@)
 	cp $< $@
 

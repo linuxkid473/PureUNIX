@@ -474,15 +474,6 @@ static void test_open_close(void)
     check_eq("close() on a freshly opened fd returns 0", 0, pu_close(fd));
     check_eq("close() on an already-closed fd returns EBADF", EBADF, pu_close(fd));
     check_eq("close() on an out-of-range fd returns EBADF", EBADF, pu_close(99));
-    /* close() on fd 0/1/2 now succeeds — it reverts that slot to the
-       default console binding rather than returning EBADF (the old,
-       pre-SYS_PIPE/SYS_DUP2 behavior — see include/pureunix/task.h's
-       fd_entry_t comment). This is what makes stdout redirection work at
-       all: dup2()ing something onto fd 1, using it, then dup2()ing a saved
-       copy of the original console binding back requires fd 1 to be a
-       normal, closeable/rebindable descriptor like any other. */
-    check_eq("close() on a reserved fd (stdout) succeeds now (reverts to console)", 0, pu_close(1));
-    check_true("write(stdout) still reaches the console after close() reverted it", pu_write(1, "", 0) >= 0);
 
     check_eq("open() on a missing path returns ENOENT", ENOENT, pu_open("/no/such/file.txt", O_RDONLY));
     check_eq("open() on a directory returns EISDIR", EISDIR, pu_open("/etc", O_RDONLY));
@@ -1419,6 +1410,33 @@ static void test_elf_exec_preconditions(void)
 
 /* ==================================================================== */
 
+/* Deliberately run *last*, after every other test: close()ing fd 0/1/2
+ * reverts that slot to the default console binding rather than returning
+ * EBADF (the old, pre-SYS_PIPE/SYS_DUP2 behavior — see
+ * include/pureunix/task.h's fd_entry_t comment) — this is what makes
+ * stdout redirection work at all (dup2()ing something onto fd 1, using it,
+ * then dup2()ing a saved copy of the original console binding back
+ * requires fd 1 to be a normal, closeable/rebindable descriptor like any
+ * other). But a reverted-to-console 0/1/2 is also, correctly per real
+ * POSIX "lowest available fd" semantics, fair game for the *next*
+ * open()/dup()/pipe()/fcntl(F_DUPFD) call to reclaim (see
+ * arch/i386/syscall.c's find_free_fd() — this is what makes BusyBox's
+ * `close(0); open(file)` idiom in `uniq FILE` etc. work). This test's own
+ * later checks all assume their own pu_open()/pu_creat() calls return
+ * fd >= 3, same as any real program not expecting to have just closed its
+ * own stdio — so this one deliberately runs after every one of them, not
+ * back where the parallel SYS_CLOSE checks live in test_open_close(), to
+ * avoid being the thing that hands some *later* unrelated open() call a
+ * surprise fd 1/2 and silently redirects this program's own remaining
+ * test-result output into a file instead of the console. */
+static void test_fd_close_reclaims_console_slot(void)
+{
+    section("fd 0/1/2 close()/reopen (run last — see comment above)");
+
+    check_eq("close() on a reserved fd (stdout) succeeds (reverts to console)", 0, pu_close(1));
+    check_true("write(stdout) still reaches the console after close() reverted it", pu_write(1, "", 0) >= 0);
+}
+
 int main(void)
 {
     pu_puts("=== PureUNIX System Test ===\n");
@@ -1448,6 +1466,7 @@ int main(void)
     test_ext2_specifics();
     test_fat16();
     test_elf_exec_preconditions();
+    test_fd_close_reclaims_console_slot();
 
     pu_puts("\n====================================\n");
     pu_puts("PureUNIX System Test Complete\n");

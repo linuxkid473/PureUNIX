@@ -84,7 +84,7 @@ static int syscall3(int n, int a, int b, int c)
 | 37 | `SYS_DUP` | fd to duplicate | — | — | new fd or negative error |
 | 38 | `SYS_DUP2` | fd to duplicate | fd to become a copy of it | — | newfd or negative error |
 | 39 | `SYS_KILL` | pid | signal number (0 = null signal) | — | 0, or negative error (never returns for `pid == self` with a nonzero signal) |
-| 40 | `SYS_FCNTL` | fd | cmd (`F_DUPFD`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`) | arg | cmd-dependent or negative error |
+| 40 | `SYS_FCNTL` | fd | cmd (`F_DUPFD`/`F_DUPFD_CLOEXEC`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`) | arg | cmd-dependent or negative error |
 | 41 | `SYS_FTRUNCATE` | fd | new length | — | 0 or negative error |
 | 42 | `SYS_GETPPID` | — | — | — | parent task ID (0 if none) |
 | 43 | `SYS_PING` | destination IPv4 (host order) | timeout (ms) | `uint32_t *` RTT out, or 0 | 0 on reply, `-ETIMEDOUT` otherwise |
@@ -153,7 +153,7 @@ Opens a file and allocates a file descriptor — read-only or writable, dependin
 - `EBX`: pointer to null-terminated path string (relative paths are resolved against the caller's cwd — see "Path Resolution" above)
 - `ECX`: flags — `O_RDONLY` (0), or `O_WRONLY` (0x001) combined with any of `O_CREAT` (0x100) / `O_TRUNC` (0x200) / `O_APPEND` (0x400)
 
-**Returns**: file descriptor (≥ 3) on success, or a negative error code:
+**Returns**: file descriptor on success, or a negative error code:
 
 | Code | Value | Meaning |
 |---|---|---|
@@ -162,7 +162,7 @@ Opens a file and allocates a file descriptor — read-only or writable, dependin
 | `-EISDIR` | -21 | path refers to a directory |
 | `-EACCES` | -13 | missing `R_OK` (read open) or `W_OK` (write open), or missing `X_OK` on an ancestor directory during resolution |
 | `-ELOOP` | -40 | path resolution followed more than 40 symlinks (see `docs/api/vfs.md`'s Loop detection) |
-| `-EMFILE` | -24 | all fd slots (3–15) are in use |
+| `-EMFILE` | -24 | no fd slot (0–15) is free — see "Descriptor allocation" below |
 | *(create failure)* | | any negative errno `vfs_create()` returns, if `O_CREAT` was needed and failed for a reason other than the file already existing |
 
 Both the initial `vfs_stat()`/`vfs_create()` check and the subsequent `vfs_read_file()` load return whatever negative errno pathname resolution actually produced — `SYS_OPEN` never collapses a resolution failure like `-ELOOP` or an ancestor's `-EACCES` down to a generic `-ENOENT`; only a genuinely missing path is reported as `-ENOENT`.
@@ -171,7 +171,7 @@ Both the initial `vfs_stat()`/`vfs_create()` check and the subsequent `vfs_read_
 
 **Write opens** (Stage 4, `flags & O_WRONLY`): if the path doesn't exist and `O_CREAT` is set, `vfs_create()` runs first (a harmless `-EEXIST` from a race is ignored — POSIX `creat()`/`open(O_CREAT)` without `O_EXCL` never errors just because the file already exists). The descriptor then starts with an **empty** in-memory buffer (`O_APPEND` instead pre-loads the existing content and seeks to its end) that `SYS_WRITE` grows as data is written; nothing reaches the filesystem until `SYS_CLOSE`. `pu_creat(path)` is `pu_open(path, O_WRONLY|O_CREAT|O_TRUNC)` — this kernel's equivalent of POSIX `creat()`.
 
-**Descriptor allocation**: the lowest available index in the range 3–`MAX_OPEN_FILES-1` (16) is used. Indices 0, 1, 2 are permanently reserved for stdin, stdout, and stderr.
+**Descriptor allocation**: `arch/i386/syscall.c`'s `find_free_fd()` — the lowest available index in `[0, MAX_OPEN_FILES)` (16), real POSIX "lowest available fd" semantics. Indices 3–15 are available whenever unused. Indices 0/1/2 (stdin/stdout/stderr) are available **only if they were explicitly `SYS_CLOSE`'d** (`fd_entry_t.closed_explicitly`, `include/pureunix/task.h`) — never touched, or console-bound again after a `SYS_DUP2`-based redirect-then-restore cycle, are both *not* eligible, even though both also read as `used == true, file == NULL`. This distinction (added alongside the BusyBox port, see `docs/userland.md`'s "Platform Work This Needed") is what makes the standard `close(0); open(path)` idiom (BusyBox's `uniq FILE` and other coreutils' optional-`FILE`-argument handling) actually hand back fd 0, while *not* letting an unrelated `open()` steal a shell's own stdout out from under a redirect it's mid-restore on.
 
 **Limitations**: path pointer is accepted without bounds-checking (no user/kernel memory separation); there is no `O_RDWR` (read-modify-write of an existing file requires read, then a separate truncating write).
 
@@ -193,7 +193,7 @@ Closes an open file descriptor, flushing buffered writes first, then frees its k
 
 This drops one reference to the fd's underlying open file description (`open_file_unref()`, `kernel/task.c`) — see "File descriptors are now shared, refcounted open file descriptions" below. Only once the *last* reference is gone does an `O_WRONLY` `FD_KIND_FILE`'s entire in-memory write buffer actually get flushed to the filesystem via one `vfs_write_file()` call (the fd's whole write lifetime is "accumulate in memory, commit once on the last close," mirroring the read side's "load whole file into memory on open"); a `FD_KIND_PIPE` end similarly only retires once every fd referencing that same end (across every task that reached it via `dup()`/`dup2()`/`fork()`) has been closed.
 
-Descriptors 0, 1, and 2 *can* now be closed (unlike before `SYS_DUP2` existed) — doing so reverts that slot to the default console binding rather than leaving it genuinely unusable. Fd slots ≥ 3 become fully free (available for a future `SYS_OPEN`/`SYS_PIPE`/`SYS_DUP`) after a successful close.
+Descriptors 0, 1, and 2 *can* now be closed (unlike before `SYS_DUP2` existed) — doing so reverts that slot to the default console binding (`file = NULL`) rather than leaving it genuinely unusable, and sets `fd_entry_t.closed_explicitly = true`, which is what makes it (and only it, not the console binding a never-touched or dup2()-restored 0/1/2 slot also has) eligible for the next `SYS_OPEN`/`SYS_PIPE`/`SYS_DUP`/`SYS_FCNTL`(`F_DUPFD`) allocation to reclaim — see `SYS_OPEN`'s "Descriptor allocation" above. Fd slots ≥ 3 become fully free the same way they always did (`used = false`).
 
 ---
 
@@ -602,7 +602,7 @@ A pipe is a fixed 4096-byte ring buffer (`pipe_buf_t`, `include/pureunix/task.h`
 
 A pipe's read end returns `0` (EOF) once its buffer is empty and every write end referencing that pipe has been closed; a write to a pipe with no read ends left returns the errno `-EPIPE` directly — no actual `SIGPIPE` signal gets sent to the writer (the kernel never automatically signals anything on a broken pipe; see `SYS_KILL` below for what signal delivery *does* exist — a caller has to ask for it explicitly).
 
-**SYS_DUP** — **Arguments**: `EBX`: the fd to duplicate. **Returns**: a new fd (the lowest-numbered free slot) sharing the same `open_file_t` (including its seek offset) as `oldfd`, or a negative error code (`-EBADF` if `oldfd` isn't open, `-EMFILE` if no fd slot is free).
+**SYS_DUP** — **Arguments**: `EBX`: the fd to duplicate. **Returns**: a new fd (the lowest-numbered free slot — see `SYS_OPEN`'s "Descriptor allocation" for what "free" means for 0/1/2 specifically) sharing the same `open_file_t` (including its seek offset) as `oldfd`, or a negative error code (`-EBADF` if `oldfd` isn't open, `-EMFILE` if no fd slot is free).
 
 **SYS_DUP2** — **Arguments**: `EBX`: the fd to duplicate. `ECX`: the fd number the caller wants to become a copy of it. **Returns**: `newfd` on success, or a negative error code (`-EBADF` if either fd is out of range or `oldfd` isn't open). If `newfd` was already open, it's closed first (dropping its own reference, exactly like an explicit `SYS_CLOSE`) before being made an alias for `oldfd`'s description. A no-op (just returns `newfd`) if `oldfd == newfd`.
 
@@ -639,9 +639,10 @@ Minimal `fcntl()` — just the operations BusyBox's `dd`/ash actually need. Ther
 | `F_SETFD` | Always returns `0` (accepted, does nothing) |
 | `F_GETFL` | Returns the fd's `open()` flags (`O_WRONLY`/`O_APPEND`/`O_CREAT`/`O_TRUNC` — `include/pureunix/fcntl.h`'s bit layout; `user/newlib_syscalls.c`'s `fcntl()` translates to/from newlib's own layout, same as `open()` does) |
 | `F_SETFL` | Overwrites the fd's flags with `EDX` |
-| `F_DUPFD` | Duplicates the fd (shares the same `open_file_t`, exactly like `SYS_DUP`) into the lowest free fd number that is `>= EDX` |
+| `F_DUPFD` | Duplicates the fd (shares the same `open_file_t`, exactly like `SYS_DUP`) into the lowest free fd number that is `>= EDX` — see `SYS_OPEN`'s "Descriptor allocation" for what "free" means for 0/1/2 specifically |
+| `F_DUPFD_CLOEXEC` | Identical to `F_DUPFD` — no close-on-exec model exists here, so there's no behavior to add. **Not just an alias in newlib**: `<fcntl.h>` assigns it a distinct numeric value (14, vs. `F_DUPFD`'s 0), so it has to be recognized as its own command, not merely documented as equivalent — this command going unrecognized (falling through to `-EINVAL`) used to be fatal to BusyBox ash's *entire interactive session* the first time it ran any `>`-redirected command, since ash's `savefd()` calls exactly this on every fd it's about to redirect and treats any `fcntl()` failure other than `EBADF` as fatal to the whole interpreter |
 
-**Returns**: command-dependent value above, or `-EBADF` if `fd` isn't open, `-EMFILE` if `F_DUPFD` finds no free slot, `-EINVAL` for an unrecognized command.
+**Returns**: command-dependent value above, or `-EBADF` if `fd` isn't open, `-EMFILE` if `F_DUPFD`/`F_DUPFD_CLOEXEC` finds no free slot, `-EINVAL` for an unrecognized command.
 
 ---
 

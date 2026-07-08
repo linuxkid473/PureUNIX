@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <grp.h>
+#include <limits.h>
 #include <poll.h>
 #include <pwd.h>
 #include <sched.h>
@@ -585,6 +586,147 @@ char *dirname(char *path)
     }
     *last_slash = '\0';
     return path;
+}
+
+/* realpath(): standard POSIX canonicalization (resolve "." / ".." / repeated
+ * slashes / symlinks against an absolute base). newlib declares the
+ * prototype (stdlib.h) but this vendored libc.a has no implementation, the
+ * same gap dirname() above already had. Requires every component *including
+ * the last* to exist, matching glibc's own realpath() — BusyBox's own
+ * libbb wrapper (xreadlink.c's xmalloc_realpath_coreutils, unmodified
+ * upstream) already implements the GNU/coreutils "last component need not
+ * exist" leniency itself by retrying against the parent directory when this
+ * returns ENOENT, so this function doesn't need to duplicate that. */
+#define REALPATH_MAX_SYMLINKS 32
+
+char *realpath(const char *restrict path, char *restrict resolved)
+{
+    if (!path || !*path) {
+        errno = ENOENT;
+        return NULL;
+    }
+
+    char result[PATH_MAX];
+    size_t result_len;
+
+    if (path[0] == '/') {
+        result[0] = '/';
+        result_len = 1;
+        path++;
+    } else {
+        if (!getcwd(result, sizeof(result))) {
+            return NULL; /* errno already set by getcwd() */
+        }
+        result_len = strlen(result);
+    }
+
+    /* `remaining` holds every path component not yet folded into `result`,
+     * slash-separated with no leading slash. Symlink targets are spliced in
+     * here (in front of whatever was left) so they get resolved in the
+     * right order without recursion. */
+    char remaining[PATH_MAX];
+    if (strlen(path) >= sizeof(remaining)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    strcpy(remaining, path);
+
+    int symlink_count = 0;
+    char *rp = remaining;
+
+    while (*rp) {
+        char *slash = strchr(rp, '/');
+        size_t complen = slash ? (size_t)(slash - rp) : strlen(rp);
+        char *next = slash ? slash + 1 : rp + complen;
+
+        if (complen == 0 || (complen == 1 && rp[0] == '.')) {
+            /* empty (repeated slash) or "." - nothing to do */
+        } else if (complen == 2 && rp[0] == '.' && rp[1] == '.') {
+            if (result_len > 1) {
+                while (result_len > 1 && result[result_len - 1] != '/') {
+                    result_len--;
+                }
+                if (result_len > 1) {
+                    result_len--; /* drop the '/' too, unless it's root */
+                }
+            }
+        } else {
+            if (result_len + 1 + complen >= sizeof(result)) {
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
+            char candidate[PATH_MAX];
+            memcpy(candidate, result, result_len);
+            size_t clen = result_len;
+            if (clen == 0 || candidate[clen - 1] != '/') {
+                candidate[clen++] = '/';
+            }
+            memcpy(candidate + clen, rp, complen);
+            clen += complen;
+            candidate[clen] = '\0';
+
+            struct stat st;
+            if (lstat(candidate, &st) < 0) {
+                return NULL; /* errno already set by lstat() */
+            }
+
+            if (S_ISLNK(st.st_mode)) {
+                if (++symlink_count > REALPATH_MAX_SYMLINKS) {
+                    errno = ELOOP;
+                    return NULL;
+                }
+                char target[PATH_MAX];
+                long tlen = readlink(candidate, target, sizeof(target) - 1);
+                if (tlen < 0) {
+                    return NULL;
+                }
+                target[tlen] = '\0';
+
+                size_t rest_len = strlen(next);
+                size_t target_len = (size_t)tlen;
+                if (target_len + 1 + rest_len >= sizeof(remaining)) {
+                    errno = ENAMETOOLONG;
+                    return NULL;
+                }
+                char newremaining[PATH_MAX];
+                memcpy(newremaining, target, target_len);
+                if (rest_len > 0) {
+                    newremaining[target_len] = '/';
+                    memcpy(newremaining + target_len + 1, next, rest_len + 1);
+                } else {
+                    newremaining[target_len] = '\0';
+                }
+                memcpy(remaining, newremaining, target_len + 1 + rest_len + 1);
+
+                if (target[0] == '/') {
+                    result[0] = '/';
+                    result_len = 1;
+                }
+                rp = remaining;
+                continue;
+            }
+
+            memcpy(result + result_len, candidate + result_len,
+                   clen - result_len + 1);
+            result_len = clen;
+        }
+
+        rp = next;
+    }
+
+    if (result_len == 0) {
+        result[0] = '/';
+        result_len = 1;
+    }
+    result[result_len] = '\0';
+
+    char *out = resolved ? resolved : malloc(PATH_MAX);
+    if (!out) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(out, result, result_len + 1);
+    return out;
 }
 
 /* sleep(): the classic whole-seconds convenience wrapper over nanosleep().

@@ -62,11 +62,33 @@ typedef struct open_file {
  * installs a real open_file_t there instead, exactly like redirecting a
  * real UNIX process's stdin/stdout/stderr. Explicitly close()ing 0/1/2
  * reverts to the console binding rather than leaving the slot truly
- * closed — deliberately simpler than real UNIX (where it would become a
- * genuinely invalid fd available for reuse), since nothing in this
- * project's userland relies on that distinction. */
+ * closed (`used` stays true) — deliberately simpler than real UNIX, where
+ * it would become a genuinely invalid fd.
+ *
+ * That still has to be told apart from a slot that's console-bound for any
+ * *other* reason — never touched at all (the task-creation-time default),
+ * or actively holding a deliberate console binding again after a
+ * dup2()-based redirect-then-restore cycle (real shells, including
+ * BusyBox ash, do exactly this around every redirected builtin: save fd 1
+ * with dup()/fcntl(F_DUPFD), dup2() the redirect target onto fd 1, run the
+ * command, dup2() the saved copy back onto fd 1). All three end up
+ * `used == true, file == NULL` and *none* of the other two should be
+ * handed out by a fresh open()/dup()/pipe()/fcntl(F_DUPFD) allocation —
+ * only a slot that was actually close()'d should be. Real programs rely on
+ * that specific case: BusyBox's `uniq FILE` (and several other coreutils'
+ * optional-FILE-argument handling) does `close(0); open(path)` specifically
+ * to make the opened file *become* fd 0, the standard POSIX "lowest
+ * available fd" idiom. `closed_explicitly` is the bit that resolves the
+ * ambiguity: false from task creation, set true only by an actual close()
+ * of 0/1/2 (see SYS_CLOSE), and cleared back to false by *any* allocation
+ * into the slot — including a dup2()-based restore, which is a deliberate,
+ * exclusive claim on the slot, not an abandonment of it, even though the
+ * thing being dup2()'d back in happens to be another NULL/console binding.
+ * Meaningless for fd >= 3, where `used` alone already fully describes
+ * availability (close() there really does clear it). */
 typedef struct fd_entry {
     bool used;
+    bool closed_explicitly;
     open_file_t *file;
 } fd_entry_t;
 

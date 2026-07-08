@@ -485,11 +485,12 @@ class Ext2Builder:
 # applet table from Python without running it). See docs/userland.md's
 # "BusyBox" section and tools/build-busybox.sh.
 BUSYBOX_APPLETS = [
-    "ash", "sh", "basename", "cat", "chmod", "chown", "clear", "cp", "dd",
-    "dirname", "echo", "env", "false", "find", "head", "kill", "less",
-    "ln", "ls", "mkdir", "mv", "printf", "pwd", "rm", "rmdir", "sleep",
-    "sort", "tail", "tee", "test", "touch", "true", "wc", "which", "xargs",
-    "yes",
+    "ash", "sh", "basename", "cat", "chmod", "chown", "clear", "cmp", "cp",
+    "cut", "dd", "diff", "dirname", "echo", "egrep", "env", "false", "fgrep",
+    "find", "grep", "head", "hexdump", "kill", "less", "ln", "ls", "mkdir",
+    "mv", "od", "paste", "printenv", "printf", "pwd", "realpath", "rm",
+    "rmdir", "seq", "sleep", "sort", "strings", "tail", "tee", "test",
+    "touch", "tr", "true", "uniq", "wc", "which", "xargs", "yes",
 ]
 
 DOC_ALIASES = {

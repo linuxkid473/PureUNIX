@@ -32,7 +32,8 @@ BUILD_USER_DIR="${REPO_ROOT}/build/user"
 
 echo "==> Working in ${WORK_DIR}"
 command -v i686-elf-gcc >/dev/null || { echo "i686-elf-gcc not found on PATH" >&2; exit 1; }
-for obj in newlib_crt0_asm.o newlib_crt0.o newlib_syscalls.o; do
+for obj in newlib_crt0_asm.o newlib_crt0.o newlib_syscalls.o \
+  regex/regcomp.o regex/regexec.o regex/regerror.o regex/regfree.o; do
   [ -f "${BUILD_USER_DIR}/${obj}" ] || {
     echo "missing ${BUILD_USER_DIR}/${obj} — run 'make' in the repo root first" >&2
     exit 1
@@ -90,6 +91,8 @@ done < <(find . -maxdepth 3 \( -name 'built-in.o' -o -name 'lib.a' \) | sort)
 
 i686-elf-gcc -T "${REPO_ROOT}/user/linker.ld" -ffreestanding -nostdlib -Wl,--build-id=none -Wl,--gc-sections \
   "${BUILD_USER_DIR}/newlib_crt0_asm.o" "${BUILD_USER_DIR}/newlib_crt0.o" "${BUILD_USER_DIR}/newlib_syscalls.o" \
+  "${BUILD_USER_DIR}/regex/regcomp.o" "${BUILD_USER_DIR}/regex/regexec.o" \
+  "${BUILD_USER_DIR}/regex/regerror.o" "${BUILD_USER_DIR}/regex/regfree.o" \
   -Wl,--start-group "${LINK_OBJS[@]}" -Wl,--end-group \
   -L"${NEWLIB_DIR}/lib" -Wl,--start-group -lc -lm -Wl,--end-group -lgcc \
   -o busybox.elf

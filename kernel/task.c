@@ -46,9 +46,10 @@ static void task_bootstrap(void)
 static void reserve_stdio(task_t *task)
 {
     /* fds 0/1/2 are stdin/stdout/stderr; handled by SYS_READ/SYS_WRITE.
-     * task is kcalloc'd, so fds[0..2].file already starts NULL — the
-     * default console binding (see include/pureunix/task.h's fd_entry_t
-     * comment) — with nothing further to set up here. */
+     * task is kcalloc'd, so fds[0..2].file/.closed_explicitly already start
+     * NULL/false — the default console binding, not (yet) reclaimable by a
+     * fresh allocation (see include/pureunix/task.h's fd_entry_t comment)
+     * — with nothing further to set up here. */
     task->fds[0].used = true;
     task->fds[1].used = true;
     task->fds[2].used = true;
@@ -214,6 +215,7 @@ task_t *task_create_user(const char *name, uint32_t entry, uint32_t user_stack_t
                 continue;
             }
             task->fds[i].used = true;
+            task->fds[i].closed_explicitly = current->fds[i].closed_explicitly;
             task->fds[i].file = current->fds[i].file;
             open_file_ref(task->fds[i].file);
         }
@@ -275,6 +277,7 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
             continue;
         }
         child->fds[i].used = true;
+        child->fds[i].closed_explicitly = current->fds[i].closed_explicitly;
         child->fds[i].file = current->fds[i].file;
         open_file_ref(child->fds[i].file);
     }

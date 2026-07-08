@@ -27,6 +27,7 @@ enum {
     PU_F_SETFD = 2,
     PU_F_GETFL = 3,
     PU_F_SETFL = 4,
+    PU_F_DUPFD_CLOEXEC = 14,
 };
 
 /* Every path-taking syscall below used to hand its raw path straight to
@@ -90,6 +91,45 @@ static int tty_fd_check(int fd)
         return 0;
     }
     return t->fds[fd].file ? -ENOTTY : -EBADF;
+}
+
+/* Finds the lowest fd >= start that's free for a *new* allocation
+ * (open()/pipe()/dup()/fcntl(F_DUPFD)) — real POSIX "lowest available fd"
+ * semantics. A slot is free if it's simply unused, OR it's fd 0/1/2
+ * specifically that was *explicitly* close()'d back to their console-bound
+ * state (used == true, file == NULL, closed_explicitly == true — see
+ * include/pureunix/task.h's fd_entry_t comment for the full reasoning).
+ * Two other cases also end up `used == true, file == NULL` on 0/1/2 and
+ * must NOT be treated as free: never touched at all (the task-creation-time
+ * default), and actively holding a deliberate console binding again after
+ * a dup2()-based redirect-then-restore cycle (what every real shell,
+ * including BusyBox ash, does around a redirected builtin) — `used` alone
+ * can't tell any of the three apart, hence `closed_explicitly`.
+ *
+ * Real programs rely on the explicitly-closed case: BusyBox's `uniq FILE`
+ * (and several other coreutils' optional-FILE-argument handling) does
+ * `close(0); open(path)` specifically to make the opened file *become* fd
+ * 0 — every allocator here used to start the search at index 3
+ * specifically to dodge 0/1/2 altogether, which defeated that idiom and
+ * left it blocked reading the console instead of the file it thought it
+ * just opened.
+ *
+ * The exception is deliberately restricted to i < 3: for fd >= 3, close()
+ * actually marks the slot `used = false` when it's freed (see SYS_CLOSE),
+ * so `!used` alone is already the right, sufficient test there. Returns -1
+ * if none is free. */
+static int find_free_fd(task_t *t, int start)
+{
+    if (start < 0) {
+        start = 0;
+    }
+    for (int i = start; i < MAX_OPEN_FILES; i++) {
+        bool console_reclaimable = i < 3 && !t->fds[i].file && t->fds[i].closed_explicitly;
+        if (!t->fds[i].used || console_reclaimable) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* ---- Pipes (SYS_PIPE/SYS_DUP/SYS_DUP2) --------------------------------
@@ -321,13 +361,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         bool want_append = (flags & O_APPEND) != 0;
 
         task_t *t = task_current();
-        int fd = -1;
-        for (int i = 3; i < MAX_OPEN_FILES; i++) {
-            if (!t->fds[i].used) {
-                fd = i;
-                break;
-            }
-        }
+        int fd = find_free_fd(t, 0);
         if (fd < 0) {
             return (uint32_t)-EMFILE;
         }
@@ -364,6 +398,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             }
 
             t->fds[fd].used = true;
+            t->fds[fd].closed_explicitly = false;
             t->fds[fd].file = f;
             return (uint32_t)fd;
         }
@@ -411,6 +446,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         f->offset = want_append ? f->size : 0;
 
         t->fds[fd].used = true;
+        t->fds[fd].closed_explicitly = false;
         t->fds[fd].file = f;
         return (uint32_t)fd;
     }
@@ -424,10 +460,18 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         t->fds[fd].file = NULL;
         if (fd >= 3) {
             t->fds[fd].used = false;
+        } else {
+            /* fd 0/1/2: left `used = true`, `file = NULL` — reverts to the
+             * default console binding rather than becoming truly closed
+             * (see include/pureunix/task.h's fd_entry_t comment). Setting
+             * `closed_explicitly` here is what makes this state
+             * distinguishable from the other two ways a slot ends up
+             * `file == NULL` (never touched; or a dup2()-based
+             * redirect-then-restore cycle put a console binding back
+             * deliberately) — only *this*, a real close(), is fair game
+             * for the next open()/dup()/pipe()/fcntl(F_DUPFD) to reclaim. */
+            t->fds[fd].closed_explicitly = true;
         }
-        /* fd 0/1/2: left `used = true`, `file = NULL` — reverts to the
-         * default console binding rather than becoming truly closed (see
-         * include/pureunix/task.h's fd_entry_t comment). */
         return (uint32_t)rc;
     }
     case SYS_LSEEK: {
@@ -469,8 +513,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         task_t *t = task_current();
         int read_fd = -1, write_fd = -1;
-        for (int i = 3; i < MAX_OPEN_FILES; i++) {
-            if (!t->fds[i].used) {
+        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+            bool console_reclaimable = i < 3 && !t->fds[i].file && t->fds[i].closed_explicitly;
+            if (!t->fds[i].used || console_reclaimable) {
                 if (read_fd < 0) {
                     read_fd = i;
                 } else {
@@ -501,8 +546,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         wf->flags = O_WRONLY;
 
         t->fds[read_fd].used = true;
+        t->fds[read_fd].closed_explicitly = false;
         t->fds[read_fd].file = rf;
         t->fds[write_fd].used = true;
+        t->fds[write_fd].closed_explicitly = false;
         t->fds[write_fd].file = wf;
 
         fds_out[0] = read_fd;
@@ -515,17 +562,12 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || !t->fds[oldfd].used) {
             return (uint32_t)-EBADF;
         }
-        int newfd = -1;
-        for (int i = 0; i < MAX_OPEN_FILES; i++) {
-            if (!t->fds[i].used) {
-                newfd = i;
-                break;
-            }
-        }
+        int newfd = find_free_fd(t, 0);
         if (newfd < 0) {
             return (uint32_t)-EMFILE;
         }
         t->fds[newfd].used = true;
+        t->fds[newfd].closed_explicitly = false;
         t->fds[newfd].file = t->fds[oldfd].file;
         open_file_ref(t->fds[newfd].file);
         return (uint32_t)newfd;
@@ -547,6 +589,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             open_file_unref(t->fds[newfd].file);
         }
         t->fds[newfd].used = true;
+        t->fds[newfd].closed_explicitly = false;
         t->fds[newfd].file = t->fds[oldfd].file;
         open_file_ref(t->fds[newfd].file);
         return (uint32_t)newfd;
@@ -598,20 +641,34 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                 t->fds[fd].file->flags = arg;
             }
             return 0;
-        case PU_F_DUPFD: {
-            if (!t->fds[fd].file) {
-                return (uint32_t)-EBADF;
+        case PU_F_DUPFD:
+        case PU_F_DUPFD_CLOEXEC: {
+            /* No close-on-exec model exists (see comment above), so
+             * F_DUPFD_CLOEXEC is handled identically to F_DUPFD. This
+             * mattered more than it looks: ash's savefd() — called on every
+             * fd it's about to redirect, including a plain interactive
+             * shell's own still-untouched stdout the first time it ever
+             * runs `cmd > file` — unconditionally uses F_DUPFD_CLOEXEC
+             * (newlib defines it as 14, a distinct value from F_DUPFD's 0,
+             * not an alias), and treats any fcntl() failure other than
+             * EBADF as fatal to the whole interpreter. Not recognizing this
+             * command at all used to fall through to -EINVAL below, which
+             * savefd() raises as fatal — killing the shell outright on its
+             * first redirection.
+             *
+             * Also, like SYS_DUP/SYS_DUP2, this must duplicate a NULL file
+             * (fd 0/1/2 start out "used" but console-bound, file == NULL —
+             * see include/pureunix/task.h's fd_entry_t comment) rather than
+             * reject it — open_file_ref(NULL) is already a safe no-op. */
+            int newfd = find_free_fd(t, arg < 0 ? 0 : arg);
+            if (newfd < 0) {
+                return (uint32_t)-EMFILE;
             }
-            int lo = arg < 0 ? 0 : arg;
-            for (int i = lo; i < MAX_OPEN_FILES; ++i) {
-                if (!t->fds[i].used) {
-                    t->fds[i].used = true;
-                    t->fds[i].file = t->fds[fd].file;
-                    open_file_ref(t->fds[i].file);
-                    return (uint32_t)i;
-                }
-            }
-            return (uint32_t)-EMFILE;
+            t->fds[newfd].used = true;
+            t->fds[newfd].closed_explicitly = false;
+            t->fds[newfd].file = t->fds[fd].file;
+            open_file_ref(t->fds[newfd].file);
+            return (uint32_t)newfd;
         }
         default:
             return (uint32_t)-EINVAL;
