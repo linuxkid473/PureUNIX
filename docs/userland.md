@@ -225,6 +225,16 @@ The Makefile just copies the vendored ELF into `$(BUILD)/user/busybox.elf` (`$(B
 
 ---
 
+## TinyCC
+
+**Source**: `third_party/tcc/tcc-0.9.27` (vendored source, unlike newlib/BusyBox's prebuilt binaries — see that directory's `README.md`), built directly by the top-level Makefile against the same newlib + `newlib_syscalls.o` + `newlib_crt0` glue every `NEWLIB_PROGRAMS` entry uses.
+
+[TinyCC](https://bellard.org/tcc/) runs natively as `/bin/tcc` — a real PureUNIX process that itself compiles and links C source into further PureUNIX ELF executables (`tcc hello.c && ./a.out`), not a cross-compiler invoked from the host. See `docs/tcc-port.md` for the full architecture (the two-translation-unit build, the sysroot layout at `/lib/tcc` and `/usr/{include,lib}`, and every platform incompatibility found and fixed while bringing it up — a fixed-size allocator pool exceeding this port's newlib heap, `libtcc1.a`'s path-resolution convention, and `open(O_CREAT, mode)`'s mode argument being silently dropped by the raw syscall ABI, among others) and `docs/libc.md` for the newlib layer TinyCC-compiled programs depend on at runtime, same as any other newlib-linked program.
+
+`/tcctests/` on the EXT2 image holds small permanent regression fixtures (`hello.c`, a `cat`-equivalent, a substring-`grep`-equivalent, and a multi-file program) for smoke-testing `tcc` after any kernel/libc change — see `docs/tcc-port.md`'s "Testing" section.
+
+---
+
 ## Programs
 
 ### hello.c

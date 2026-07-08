@@ -32,7 +32,14 @@ EXT2_MAGIC        = 0xEF53
 INODE_SIZE        = 128
 INODES_PER_GROUP  = 1024
 BLOCKS_PER_GROUP  = 8192          # max for 1 KB blocks (1 bitmap block = 8192 bits)
-TOTAL_BLOCKS      = 4096          # 4 MB image
+TOTAL_BLOCKS      = 8192          # 8 MB image — bumped from 4 MB (still the
+                                   # max a single block group supports at
+                                   # this 1 KB block size, see BLOCKS_PER_GROUP
+                                   # above) to fit the TinyCC port's sysroot
+                                   # (crt objects, libtcc1.a, a merged libc.a,
+                                   # and newlib's ~140-header tree — see
+                                   # docs/tcc-port.md) alongside everything
+                                   # already installed.
 FIRST_DATA_BLOCK  = 1             # for 1 KB blocks the SB lives in block 1
 
 # Block layout for group 0
@@ -538,9 +545,9 @@ def add_docs(fs, docs_dir):
 EXEC_MODE = S_IFREG | 0o755   # rwxr-xr-x — programs need X_OK to run (Stage 3A)
 
 
-def add_bin(fs, programs):
+def add_bin(fs, programs, dir_cache: dict):
     """Add the ELF program store to /bin on the EXT2 image."""
-    bin_ino = fs.mkdir(ROOT_INO, 'bin')
+    bin_ino = ensure_dir(fs, dir_cache, '/bin')
     for program in programs:
         name = os.path.basename(program).lower()
         with open(program, 'rb') as f:
@@ -577,26 +584,107 @@ def add_bin(fs, programs):
             fs.add_symlink(bin_ino, applet, 'busybox.elf')
 
 
+def ensure_dir(fs, dir_cache: dict, path: str) -> int:
+    """Return the inode for an absolute directory path, creating any
+    missing components along the way (like `mkdir -p`) and caching every
+    inode created so a later call for a path sharing a prefix (e.g. both
+    /lib/tcc/include and /lib/tcc/lib under /lib/tcc) reuses it instead of
+    creating the same directory twice."""
+    path = path.strip('/')
+    if not path:
+        return ROOT_INO
+    if path in dir_cache:
+        return dir_cache[path]
+    parent_path, _, name = path.rpartition('/')
+    parent_ino = ensure_dir(fs, dir_cache, parent_path) if parent_path else ROOT_INO
+    ino = fs.mkdir(parent_ino, name)
+    dir_cache[path] = ino
+    return ino
+
+
+def add_tree(fs, dir_cache: dict, dest_path: str, host_dir: str):
+    """Recursively install a host directory tree onto the image at
+    dest_path (an absolute path), preserving its directory structure —
+    used for the TinyCC sysroot's include/ trees (docs/tcc-port.md), which
+    unlike every other install helper here (add_docs/add_bin, both flat)
+    are nested and too large to enumerate by hand."""
+    dest_ino = ensure_dir(fs, dir_cache, dest_path)
+    for entry in sorted(os.listdir(host_dir)):
+        host_path = os.path.join(host_dir, entry)
+        if entry == '.stamp':
+            continue
+        if os.path.isdir(host_path):
+            add_tree(fs, dir_cache, dest_path + '/' + entry, host_path)
+        else:
+            with open(host_path, 'rb') as f:
+                fs.add_file(dest_ino, entry, f.read())
+
+
+def add_tcc(fs, dir_cache: dict, tcc_elf: str, tcc_sysroot: str):
+    """Install the TinyCC compiler and its target sysroot (docs/tcc-port.md):
+    /bin/tcc, TCC's own compiler-intrinsic headers at /lib/tcc/include,
+    PureUNIX's newlib shadow headers at /usr/include/pureunix-compat,
+    newlib's own headers at /usr/include, crt1.o/crti.o/crtn.o at
+    /lib/tcc/lib (CONFIG_TCC_CRTPREFIX), libc.a/libm.a at /usr/lib, and
+    libtcc1.a directly at /lib/tcc/libtcc1.a -- *not* under lib/, because
+    TCC's own TCC_LIBTCC1 default (tcc.h) is the bare filename "libtcc1.a"
+    resolved straight against CONFIG_TCCDIR ("/lib/tcc"), a different
+    convention than CONFIG_TCC_CRTPREFIX/CONFIG_TCC_LIBPATHS use for
+    everything else. Matches the paths baked into the Makefile's
+    CONFIG_TCC_* -D flags, so a bare `tcc hello.c` finds everything with no
+    extra configuration."""
+    bin_ino = ensure_dir(fs, dir_cache, '/bin')
+    with open(tcc_elf, 'rb') as f:
+        fs.add_file(bin_ino, 'tcc', f.read(), mode=EXEC_MODE)
+
+    add_tree(fs, dir_cache, '/lib/tcc/include', os.path.join(tcc_sysroot, 'include'))
+    add_tree(fs, dir_cache, '/usr/include/pureunix-compat', os.path.join(tcc_sysroot, 'compat-include'))
+    add_tree(fs, dir_cache, '/usr/include', os.path.join(tcc_sysroot, 'usr-include'))
+
+    lib_dir = os.path.join(tcc_sysroot, 'lib')
+    tcc_dir_ino = ensure_dir(fs, dir_cache, '/lib/tcc')
+    tcc_lib_ino = ensure_dir(fs, dir_cache, '/lib/tcc/lib')
+    usr_lib_ino = ensure_dir(fs, dir_cache, '/usr/lib')
+    with open(os.path.join(lib_dir, 'libtcc1.a'), 'rb') as f:
+        fs.add_file(tcc_dir_ino, 'libtcc1.a', f.read())
+    for name in ('crt1.o', 'crti.o', 'crtn.o'):
+        with open(os.path.join(lib_dir, name), 'rb') as f:
+            fs.add_file(tcc_lib_ino, name, f.read())
+    for name in ('libc.a', 'libm.a'):
+        with open(os.path.join(lib_dir, name), 'rb') as f:
+            fs.add_file(usr_lib_ino, name, f.read())
+
+
 def main(argv):
     if len(argv) < 2:
-        print("usage: mkext2.py OUT.img [--docs DIR] [program.elf ...]", file=sys.stderr)
+        print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] [program.elf ...]", file=sys.stderr)
         return 2
 
     out = argv[1]
     rest = argv[2:]
 
     docs_dir = None
+    tcc_elf = None
+    tcc_sysroot = None
     programs = []
     i = 0
     while i < len(rest):
         if rest[i] == '--docs' and i + 1 < len(rest):
             docs_dir = rest[i + 1]
             i += 2
+        elif rest[i] == '--tcc-elf' and i + 1 < len(rest):
+            tcc_elf = rest[i + 1]
+            i += 2
+        elif rest[i] == '--tcc-sysroot' and i + 1 < len(rest):
+            tcc_sysroot = rest[i + 1]
+            i += 2
         else:
             programs.append(rest[i])
             i += 1
 
     fs  = Ext2Builder()
+    dir_cache = {}   # absolute path -> inode, shared by ensure_dir() callers
+                      # (add_bin/add_tcc) so e.g. /bin is only created once
 
     # ------------------------------------------------------------------ root
     fs.add_file(ROOT_INO, 'README.TXT',
@@ -634,7 +722,11 @@ def main(argv):
 
     # ------------------------------------------------------------------ /bin
     if programs:
-        add_bin(fs, programs)
+        add_bin(fs, programs, dir_cache)
+
+    # ------------------------------------------------------------- TinyCC
+    if tcc_elf and tcc_sysroot:
+        add_tcc(fs, dir_cache, tcc_elf, tcc_sysroot)
 
     # ------------------------------------------------------------------ /docs
     if docs_dir and os.path.isdir(docs_dir):
@@ -710,6 +802,78 @@ def main(argv):
     # The file inside is unreachable by design; its content is never checked.
     noxdir_ino = fs.mkdir(perm_ino, 'noxdir', mode=S_IFDIR | 0o600)
     fs.add_file(noxdir_ino, 'hidden.txt', b'unreachable\n', mode=S_IFREG | 0o644, uid=0, gid=0)
+
+    # ------------------------------------------------------------ /tcctests
+    # TinyCC port regression fixtures (docs/tcc-port.md) -- small C sources
+    # exercising the "hello world", multi-file link, and syscall-using-program
+    # rungs of the self-compilation ladder, permanently on the image the same
+    # way bigfile.bin/hugefile.bin/perm/ are: so `tcc` can be smoke-tested
+    # after any kernel/libc change (bare `tcc hello.c && ./a.out` on a real
+    # source tree, not just a typed-in one-liner) without needing network
+    # access or typing C source through the emulated keyboard by hand.
+    if tcc_elf and tcc_sysroot:
+        tcctests_ino = fs.mkdir(ROOT_INO, 'tcctests')
+
+        fs.add_file(tcctests_ino, 'hello.c',
+            b'#include <stdio.h>\n'
+            b'int main(void) {\n'
+            b'    printf("hello from tcc\\n");\n'
+            b'    return 0;\n'
+            b'}\n')
+
+        fs.add_file(tcctests_ino, 'cat.c',
+            b'#include <stdio.h>\n'
+            b'#include <fcntl.h>\n'
+            b'#include <unistd.h>\n'
+            b'int main(int argc, char *argv[]) {\n'
+            b'    if (argc < 2) { return 1; }\n'
+            b'    int fd = open(argv[1], O_RDONLY);\n'
+            b'    if (fd < 0) { return 2; }\n'
+            b'    char buf[128];\n'
+            b'    int n;\n'
+            b'    while ((n = read(fd, buf, sizeof(buf))) > 0) {\n'
+            b'        write(1, buf, n);\n'
+            b'    }\n'
+            b'    close(fd);\n'
+            b'    return 0;\n'
+            b'}\n')
+
+        fs.add_file(tcctests_ino, 'grep.c',
+            b'#include <stdio.h>\n'
+            b'#include <string.h>\n'
+            b'int main(int argc, char *argv[]) {\n'
+            b'    if (argc < 3) { return 1; }\n'
+            b'    FILE *f = fopen(argv[2], "r");\n'
+            b'    if (!f) { return 2; }\n'
+            b'    char line[256];\n'
+            b'    while (fgets(line, sizeof(line), f)) {\n'
+            b'        if (strstr(line, argv[1])) { fputs(line, stdout); }\n'
+            b'    }\n'
+            b'    fclose(f);\n'
+            b'    return 0;\n'
+            b'}\n')
+
+        fs.add_file(tcctests_ino, 'helper.h',
+            b'int add_numbers(int a, int b);\n')
+
+        fs.add_file(tcctests_ino, 'helper.c',
+            b'#include "helper.h"\n'
+            b'int add_numbers(int a, int b) {\n'
+            b'    return a + b;\n'
+            b'}\n')
+
+        fs.add_file(tcctests_ino, 'mainc.c',
+            b'#include <stdio.h>\n'
+            b'#include "helper.h"\n'
+            b'int main(void) {\n'
+            b'    printf("sum is %d\\n", add_numbers(19, 23));\n'
+            b'    return 0;\n'
+            b'}\n')
+
+        fs.add_file(tcctests_ino, 'greeting.txt',
+            b'first line here\n'
+            b'needle line has target text\n'
+            b'last line here\n')
 
     # ------------------------------------------------------------------ build
     fs.build(out)

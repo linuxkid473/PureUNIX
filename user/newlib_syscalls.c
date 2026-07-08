@@ -97,6 +97,7 @@ enum {
     PU_SYS_FORK   = 23,
     PU_SYS_EXEC   = 24,
     PU_SYS_WAIT   = 25,
+    PU_SYS_FSTAT  = 44,
 };
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
@@ -188,6 +189,9 @@ static int fail(int pu_ret)
 /* File descriptor I/O                                                   */
 /* -------------------------------------------------------------------- */
 
+int chmod(const char *path, mode_t mode);
+int access(const char *path, int mode);
+
 int open(const char *path, int flags, ...)
 {
     /* Translate newlib's O_* bit layout to PureUNIX's — the two encodings
@@ -200,7 +204,42 @@ int open(const char *path, int flags, ...)
     if (flags & 0x0200) pu_flags |= PU_O_CREAT;  /* newlib O_CREAT  */
     if (flags & 0x0400) pu_flags |= PU_O_TRUNC;  /* newlib O_TRUNC  */
 
+    /* PureUNIX's raw SYS_OPEN has no mode argument at all (docs/syscalls.md
+     * -- just path + flags), unlike POSIX open(path, O_CREAT, mode): every
+     * file vfs_create() makes gets a fixed default mode regardless of what
+     * a caller asked for. That's a real, user-visible gap -- e.g. TCC
+     * (third_party/tcc/) creates its output executable via exactly
+     * open(path, O_CREAT|O_TRUNC|O_WRONLY, 0777) and relies on that mode
+     * actually taking effect, or the ELF it just wrote can't be exec()'d
+     * (elf_exec() requires X_OK -- see kernel/elf.c). Rather than extend
+     * the syscall ABI (a 4th register/argument on every SYS_OPEN caller,
+     * including every existing one that never needed it), reuse the
+     * already-real SYS_CHMOD right after a successful create -- slightly
+     * non-atomic (the file briefly exists with vfs_create()'s own default
+     * mode) but PureUNIX has no concurrent-access model where that
+     * distinction is observable, and every other narrow libc translation
+     * in this file (mmap, mprotect, ...) makes the same kind of
+     * best-effort-instead-of-a-kernel-change call.
+     *
+     * Only applied when the file didn't already exist -- POSIX only
+     * honors `mode` for an open() call that actually creates the file;
+     * O_CREAT on an existing file (no O_EXCL support here either) must
+     * leave its permissions untouched, or e.g. `touch` on an existing
+     * 0600 file would silently reset it to 0666. */
+    mode_t mode = 0;
+    int existed_before = 1;
+    if (pu_flags & PU_O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        existed_before = (access(path, 0 /* F_OK */) == 0);
+    }
+
     int r = raw_syscall(PU_SYS_OPEN, (int)path, pu_flags, 0);
+    if (r >= 0 && (pu_flags & PU_O_CREAT) && !existed_before) {
+        chmod(path, mode);
+    }
     return r < 0 ? fail(r) : r;
 }
 
@@ -284,10 +323,19 @@ off_t lseek(int fd, off_t offset, int whence)
 }
 
 /* PureUNIX has no fstat(2) — SYS_STAT only takes a path, not an fd (see
- * docs/syscalls.md's "Unimplemented Syscalls"). Descriptors 0-2 report as
- * a character device (matching isatty() below); anything else reports as
- * a plausible-looking regular file so newlib's stdio buffer sizing
- * (__smakebuf, which calls fstat on first write) doesn't fail. */
+ * docs/syscalls.md — SYS_FSTAT). Descriptors 0-2 report as a character
+ * device (matching isatty() below); any other fd is a real kernel query
+ * (SYS_FSTAT) against that fd's open file description, returning its
+ * *live* size — not a fabricated st_size=0.
+ *
+ * This used to be a pure-userspace stub that always reported st_size=0
+ * for every non-console fd, with no kernel round-trip at all. That broke
+ * any caller that sizes a read buffer from fstat() before reading — e.g.
+ * BusyBox ash's own script-file interpreter (`sh script.sh`) treated
+ * every script as a 0-byte file and mis-parsed it (observed as a bogus
+ * "sh: 3: m" parse error immediately after a successful, correctly-sized
+ * open() -- see docs/tcc-port.md's neighboring incompatibility writeups
+ * for the same style of "narrow libc stub breaks a real caller" bug). */
 int fstat(int fd, struct stat *st)
 {
     if (!st) {
@@ -295,9 +343,28 @@ int fstat(int fd, struct stat *st)
         return -1;
     }
     memset(st, 0, sizeof(*st));
-    st->st_mode = (fd >= 0 && fd <= 2) ? (S_IFCHR | 0666) : (S_IFREG | 0644);
-    st->st_blksize = 1024;
-    st->st_nlink = 1;
+    if (fd >= 0 && fd <= 2) {
+        st->st_mode = S_IFCHR | 0666;
+        st->st_blksize = 1024;
+        st->st_nlink = 1;
+        return 0;
+    }
+    struct pu_raw_stat raw;
+    int r = raw_syscall(PU_SYS_FSTAT, fd, (int)&raw, 0);
+    if (r < 0) {
+        return fail(r);
+    }
+    st->st_size = raw.st_size;
+    st->st_mode = raw.st_mode;
+    st->st_uid = raw.st_uid;
+    st->st_gid = raw.st_gid;
+    st->st_nlink = raw.st_nlink ? raw.st_nlink : 1;
+    st->st_ino = raw.st_ino;
+    st->st_blocks = raw.st_blocks;
+    st->st_blksize = raw.st_blksize ? raw.st_blksize : 1024;
+    st->st_atim.tv_sec = raw.raw_atime;
+    st->st_mtim.tv_sec = raw.raw_mtime;
+    st->st_ctim.tv_sec = raw.raw_ctime;
     return 0;
 }
 
@@ -1327,6 +1394,24 @@ int munmap(void *addr, size_t length)
 {
     (void)length;
     free(addr);
+    return 0;
+}
+
+/* PureUNIX's VMM never sets a page non-writable or non-executable for user
+ * code (kernel/elf.c maps every user page PAGE_USER|PAGE_WRITE, with no
+ * NX-bit/execute-disable support at all — see docs/memory.md) — so every
+ * byte a process can address is already simultaneously readable, writable,
+ * and executable, unconditionally. A real mprotect() would need per-page
+ * protection bits this kernel doesn't track; returning success without
+ * doing anything is not a shortcut here, it's an accurate description of
+ * this kernel's actual (weak) memory-protection model. Needed by TinyCC's
+ * tccrun.c (see third_party/tcc/README.md) for `-run`'s set_pages_executable().
+ */
+int mprotect(void *addr, size_t length, int prot)
+{
+    (void)addr;
+    (void)length;
+    (void)prot;
     return 0;
 }
 

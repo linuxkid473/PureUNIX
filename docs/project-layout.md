@@ -92,12 +92,21 @@ PureUNIX/
 │   ├── readtest.c      SYS_READ test: reads from VFS-backed fd ≥ 3 via pu_open + pu_read
 │   ├── ext2test.c      EXT2 integration test: 14 cases covering stat, read, seek, indirect blocks
 │   ├── ping.c          Functional: ICMP echo client via pu_ping() (SYS_PING) -- installed as /bin/ping
+│   ├── newlib_crt0.S/.c newlib-linked program entry stub — see docs/userland.md's "A real C library (newlib)"
+│   ├── newlib_syscalls.c newlib's POSIX syscall names, translated to int $0x80 — see docs/libc.md
+│   ├── newlib_compat/  Shadow headers for gaps in newlib's own (sys/mman.h, dirent.h, ...) — see docs/libc.md
+│   ├── tcc_crti.S, tcc_crtn.S  Trivial crti.o/crtn.o for TinyCC-compiled programs — see docs/tcc-port.md
 │   └── vi/             Vendored Neatvi (vi/ex clone) port — see docs/userland.md's "user/vi/ (neatvi)"
 │       ├── compat/     POSIX-named headers (stdio.h, unistd.h, termios.h, ...) for the vendored source
 │       ├── compat.c    malloc/free, open/read/write, printf family — backed by libpure.h's pu_* calls
 │       ├── term.c      Platform glue: raw-mode console via tcgetattr/tcsetattr, 25x80 fixed size
 │       ├── cmd.c       Platform glue: :!cmd/fork+exec stubs (PureUNIX has no pipe()/fork()+execvp())
 │       └── vi.c, ex.c, lbuf.c, regex.c, uc.c, ...   Unmodified upstream Neatvi source
+│
+├── third_party/
+│   ├── newlib/          Vendored prebuilt newlib libc — see docs/libc.md, third_party/newlib/README.md
+│   ├── busybox/         Vendored prebuilt BusyBox — see docs/userland.md's "BusyBox", third_party/busybox/README.md
+│   └── tcc/             Vendored TinyCC *source* (built by the top-level Makefile) — see docs/tcc-port.md, third_party/tcc/README.md
 │
 ├── include/
 │   └── pureunix/
@@ -143,7 +152,9 @@ PureUNIX/
 │   ├── drivers.md      VGA, Serial, PS/2 Keyboard, ATA PIO (master + slave)
 │   ├── shell.md        Parser, pipeline execution, line editor, builtins, environment
 │   ├── users.md        Accounts, first-boot setup wizard, login prompt, adduser/passwd
-│   ├── userland.md     ELF loader, crt0, libpure, user programs
+│   ├── userland.md     ELF loader, crt0, libpure, user programs, newlib, BusyBox, TinyCC
+│   ├── libc.md         The newlib C library layer: newlib itself, newlib_syscalls.c, newlib_compat/
+│   ├── tcc-port.md     TinyCC port: architecture, sysroot layout, incompatibilities found and fixed
 │   ├── developer-guide.md  Adding drivers/syscalls/builtins/programs, debugging, pitfalls
 │   ├── project-layout.md   This file
 │   └── api/            Per-subsystem API reference

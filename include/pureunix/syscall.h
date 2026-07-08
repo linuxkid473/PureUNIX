@@ -111,6 +111,15 @@ enum {
      * Returns 0 on a received reply, -ETIMEDOUT if none arrived in time.
      * See arch/i386/syscall.c and docs/syscalls.md. */
     SYS_PING = 43,
+
+    /* fstat(2): metadata for an already-open fd, without needing (or
+     * re-resolving) a path. EBX: fd. ECX: struct pureunix_stat *.
+     * st_size reflects the open file description's *live* in-memory size
+     * (f->size), not a possibly-stale on-disk value, matching real
+     * fstat() semantics for a writable fd whose data hasn't been flushed
+     * yet. Returns 0 or a negative error. See arch/i386/syscall.c and
+     * docs/syscalls.md. */
+    SYS_FSTAT = 44,
 };
 
 #endif

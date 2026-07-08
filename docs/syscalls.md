@@ -87,6 +87,8 @@ static int syscall3(int n, int a, int b, int c)
 | 40 | `SYS_FCNTL` | fd | cmd (`F_DUPFD`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`) | arg | cmd-dependent or negative error |
 | 41 | `SYS_FTRUNCATE` | fd | new length | — | 0 or negative error |
 | 42 | `SYS_GETPPID` | — | — | — | parent task ID (0 if none) |
+| 43 | `SYS_PING` | destination IPv4 (host order) | timeout (ms) | `uint32_t *` RTT out, or 0 | 0 on reply, `-ETIMEDOUT` otherwise |
+| 44 | `SYS_FSTAT` | fd | `struct stat *` | — | 0 or negative error |
 
 ---
 
@@ -673,6 +675,25 @@ Identifier/sequence numbers are managed internally (a kernel-global auto-increme
 
 ---
 
+## SYS_FSTAT (44)
+
+Metadata for an already-open file descriptor, without needing (or re-resolving) a path — the `fstat(2)` counterpart to `SYS_STAT`.
+
+**Arguments**: `EBX`: fd. `ECX`: pointer to a `struct stat` buffer to fill (same layout `SYS_STAT` uses).
+
+**Returns**: `0` on success, or a negative error code:
+
+| Code | Condition |
+|---|---|
+| `-EINVAL` | null `struct stat *` |
+| `-EBADF` | fd outside `[0, MAX_OPEN_FILES)`, not currently open, or (fd ≥ 3) open but with no backing `open_file_t` |
+
+fd 0/1/2 still holding their default console binding report as a character device (`S_IFCHR`), matching `isatty()`. A `FD_KIND_PIPE` fd reports `S_IFIFO`. A `FD_KIND_FILE` fd re-resolves its stored path (`open_file_t.path`, set at `SYS_OPEN` time) for full Unix metadata (uid/gid/nlink/ino/timestamps/blocks), but **`st_size` always comes from the open file description's live in-memory size** (`open_file_t.size`), not a fresh on-disk stat — the correct thing for a writable fd whose buffered writes haven't been flushed to the VFS yet (see `SYS_CLOSE`), and for a read-only fd this already equals the on-disk size loaded at open time.
+
+Added after a real caller broke on `user/newlib_syscalls.c`'s previous `fstat()`, which was a pure-userspace stub that fabricated `st_size=0` for every non-console fd with no kernel query at all. BusyBox ash's own non-interactive script interpreter (`sh script.sh`) sizes its script-reading buffer from an `fstat()` call on the freshly-opened script fd; seeing `st_size=0` for a real, non-empty script made it treat the file as empty and misparse it — observed as an immediate, deterministic `sh: 3: m` (exit code 2) on `sh repro.sh` for *any* non-trivial script, confirmed via kernel-side instrumentation showing the file's actual on-disk bytes were being served correctly and no read() past the initial open() ever even occurred before the error. See `user/newlib_syscalls.c`'s `fstat()` for the fix.
+
+---
+
 ## Interrupts stay masked across a whole syscall
 
 Every syscall's `int $0x80` handler stub (`isr128`, `arch/i386/interrupt_stubs.S`) is an ordinary 32-bit interrupt gate: entering it clears `IF`, and nothing restores it until the stub's own `iret` at the very end. This means **any syscall handler that blocks waiting for an interrupt-driven event must explicitly call `arch_enable_interrupts()` first**, or that event's own interrupt (a PIT tick, a keyboard scancode, a NIC's RX/TX completion) can never fire while nested inside the syscall gate, hanging the task (and, since this kernel is single-core and non-preemptive within an interrupt/syscall, effectively the whole system) forever. `SYS_READ`'s console path (`drivers/tty.c`'s `tty_read()`, before its `keyboard_getkey()` wait) and `SYS_PING` above both do this; any future blocking syscall needs the same treatment.
@@ -681,7 +702,9 @@ Every syscall's `int $0x80` handler stub (`isr128`, `arch/i386/interrupt_stubs.S
 
 ## Unimplemented Syscalls
 
-`fstat`, `munmap` (accepted but a plain `free()` — see `mmap()`'s own entry below), `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
+`munmap` (accepted but a plain `free()` — see `mmap()`'s own entry below), `brk`, `signal` (accepted, always a no-op — see `SYS_KILL` above for what *does* work), `setuid`, `setgid`.
+
+(`fstat` was added as `SYS_FSTAT` — see that section above — after a real caller broke on the userspace-only stub that used to stand in for it: BusyBox ash's `sh script.sh` fabricated `st_size=0` for every fd fstat()'d regardless of the real file size, which made ash treat every script file as empty and mis-parse it.)
 
 `mmap()`/`munmap()` (`user/newlib_syscalls.c`) are real but deliberately narrow: only `MAP_ANON|MAP_PRIVATE` with `fd == -1` (an anonymous private scratch buffer — the one case BusyBox's `dd` applet actually needs) is supported, implemented as a thin `malloc()`/`free()` wrapper rather than a real page mapping, since this kernel still has no virtual-memory-mapping syscall of its own; anything else (a real fd, `MAP_SHARED`, ...) fails with `-ENODEV`.
 

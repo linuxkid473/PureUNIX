@@ -685,6 +685,81 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         st->st_blksize = vst.st_blksize;
         return 0;
     }
+    case SYS_FSTAT: {
+        int fd = (int)regs->ebx;
+        struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
+        if (!st) {
+            return (uint32_t)-EINVAL;
+        }
+        if (fd < 0 || fd >= MAX_OPEN_FILES) {
+            return (uint32_t)-EBADF;
+        }
+        task_t *t = task_current();
+        if (!t || !t->fds[fd].used) {
+            return (uint32_t)-EBADF;
+        }
+        open_file_t *f = t->fds[fd].file;
+        memset(st, 0, sizeof(*st));
+
+        if ((fd == 0 || fd == 1 || fd == 2) && !f) {
+            /* Default console binding, not a real open_file_t (see
+             * include/pureunix/task.h's fd_entry_t comment) — report it
+             * as the character device it is. */
+            st->st_type = 1;
+            st->st_mode = S_IFCHR | 0666;
+            st->st_nlink = 1;
+            st->st_blksize = 1024;
+            return 0;
+        }
+        if (!f) {
+            return (uint32_t)-EBADF;
+        }
+        if (f->kind == FD_KIND_PIPE) {
+            st->st_type = 1;
+            st->st_mode = S_IFIFO | 0600;
+            st->st_nlink = 1;
+            st->st_blksize = 4096;
+            return 0;
+        }
+
+        /* FD_KIND_FILE: re-stat the underlying path for full Unix metadata
+         * (uid/gid/nlink/ino/timestamps/blocks), then override st_size
+         * with the open file description's *live* in-memory size — for a
+         * writable fd, f->size (not yet flushed to the VFS) is the
+         * correct current size; for a read-only fd it already matches
+         * on-disk size. This is what user/newlib_syscalls.c's fstat()
+         * was missing entirely (it fabricated st_size=0 unconditionally,
+         * with no kernel query at all — see docs/tcc-port.md-adjacent
+         * bug writeup / commit message for the "sh: 3: m" investigation
+         * this fixed: BusyBox ash sizes its script read buffer from
+         * fstat(), so a bogus 0 made it treat every script as empty). */
+        vfs_stat_t vst;
+        int src = vfs_stat(f->path, &vst);
+        if (src == 0) {
+            st->st_type = (uint32_t)vst.type;
+            st->st_attr = vst.mode;
+            st->st_mode = vst.st_mode;
+            st->st_uid = vst.st_uid;
+            st->st_gid = vst.st_gid;
+            st->st_nlink = vst.st_nlink;
+            st->st_ino = vst.st_ino;
+            st->st_atime = vst.st_atime;
+            st->st_mtime = vst.st_mtime;
+            st->st_ctime = vst.st_ctime;
+            st->st_blocks = vst.st_blocks;
+            st->st_blksize = vst.st_blksize;
+        } else {
+            /* Path no longer resolvable (e.g. unlinked while open) — still
+             * report a plausible regular-file mode so callers relying on
+             * S_ISREG()/st_size (the actual live data) keep working. */
+            st->st_type = 1;
+            st->st_mode = S_IFREG | 0644;
+            st->st_nlink = 1;
+            st->st_blksize = 1024;
+        }
+        st->st_size = (uint32_t)f->size;
+        return 0;
+    }
     case SYS_ACCESS: {
         const char *raw_path = (const char *)regs->ebx;
         int mode = (int)regs->ecx;
