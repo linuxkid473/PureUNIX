@@ -7,3 +7,9 @@ build/
 # rule above.
 !third_party/busybox/busybox.elf
 graphify-out/
+
+# macOS
+.DS_Store
+
+# Claude Buddy
+claude-buddy/
