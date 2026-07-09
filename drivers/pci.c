@@ -159,11 +159,61 @@ bool pci_find(uint16_t vendor_id, const uint16_t *device_ids, int count, pci_dev
     return pci_walk(pci_match_one, &ctx);
 }
 
+typedef struct pci_find_class_ctx {
+    uint8_t class_code;
+    uint8_t subclass;
+    uint8_t prog_if;
+    pci_device_t *out;
+} pci_find_class_ctx_t;
+
+static bool pci_match_class_one(const pci_device_t *dev, void *ctx_ptr)
+{
+    pci_find_class_ctx_t *ctx = (pci_find_class_ctx_t *)ctx_ptr;
+    if (dev->class_code == ctx->class_code && dev->subclass == ctx->subclass
+        && dev->prog_if == ctx->prog_if) {
+        *ctx->out = *dev;
+        return true;
+    }
+    return false;
+}
+
+bool pci_find_by_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if, pci_device_t *out)
+{
+    pci_find_class_ctx_t ctx = { class_code, subclass, prog_if, out };
+    return pci_walk(pci_match_class_one, &ctx);
+}
+
 void pci_enable_bus_mastering(const pci_device_t *dev)
 {
     uint16_t command = pci_config_read16(dev->bus, dev->slot, dev->func, 0x04);
     command |= 0x0004U /* Bus Master Enable */ | 0x0002U /* Memory Space Enable */;
     pci_config_write16(dev->bus, dev->slot, dev->func, 0x04, command);
+}
+
+void pci_enable_legacy_interrupts(const pci_device_t *dev)
+{
+    uint16_t command = pci_config_read16(dev->bus, dev->slot, dev->func, 0x04);
+    command &= ~0x0400U /* Interrupt Disable, bit 10 */;
+    pci_config_write16(dev->bus, dev->slot, dev->func, 0x04, command);
+}
+
+/* BAR memory-type field (bits 2:1 of a memory-space BAR dword): 0b00 means
+ * 32-bit, 0b10 means 64-bit (the next BAR slot holds the high dword). 0b01
+ * ("reserved" pre-PCI 2.1 below-1MiB type) never appears on real hardware
+ * this kernel targets and is treated the same as 32-bit. */
+static bool bar_is_64bit_dword(uint32_t bar)
+{
+    return !(bar & 0x1U) && ((bar >> 1) & 0x3U) == 0x2U;
+}
+
+bool pci_bar_is_64bit(const pci_device_t *dev, int index)
+{
+    if (index < 0 || index > 5) {
+        return false;
+    }
+    uint8_t offset = (uint8_t)(0x10 + index * 4);
+    uint32_t bar = pci_config_read32(dev->bus, dev->slot, dev->func, offset);
+    return bar_is_64bit_dword(bar);
 }
 
 phys_addr_t pci_bar_address(const pci_device_t *dev, int index)
@@ -175,6 +225,16 @@ phys_addr_t pci_bar_address(const pci_device_t *dev, int index)
     uint32_t bar = pci_config_read32(dev->bus, dev->slot, dev->func, offset);
     if (bar & 0x1U) {
         return 0; /* I/O-space BAR, not memory-mapped */
+    }
+    if (bar_is_64bit_dword(bar) && index < 5) {
+        uint32_t high = pci_config_read32(dev->bus, dev->slot, dev->func, (uint8_t)(offset + 4));
+        if (high != 0) {
+            /* Genuinely above 4GB -- this kernel is 32-bit/non-PAE and has
+             * no way to map or address such a region. */
+            printf("pci: BAR%d at %02x:%02x.%u is a 64-bit BAR above 4GB (high=%x); unusable\n",
+                   index, dev->bus, dev->slot, dev->func, high);
+            return 0;
+        }
     }
     return bar & ~0xFU;
 }

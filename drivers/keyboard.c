@@ -1,14 +1,11 @@
 #include <pureunix/arch.h>
+#include <pureunix/input.h>
 #include <pureunix/io.h>
 #include <pureunix/keyboard.h>
 
 #define KBD_DATA 0x60
 #define KBD_STATUS 0x64
-#define KEYBUF_SIZE 128
 
-static int keybuf[KEYBUF_SIZE];
-static volatile uint32_t key_head;
-static volatile uint32_t key_tail;
 static bool shift_down;
 static bool ctrl_down;
 static bool alt_down;
@@ -45,15 +42,6 @@ static const char shift_map[128] = {
     [0x35] = '?', [0x39] = ' ', [0x01] = KEY_ESCAPE,
 };
 
-static void push_key(int key)
-{
-    uint32_t next = (key_head + 1) % KEYBUF_SIZE;
-    if (next != key_tail) {
-        keybuf[key_head] = key;
-        key_head = next;
-    }
-}
-
 static int extended_key(uint8_t scancode)
 {
     switch (scancode) {
@@ -83,7 +71,7 @@ static void keyboard_irq(interrupt_regs_t *regs)
 
     if (extended) {
         if (!released) {
-            push_key(extended_key(sc));
+            input_push_key(extended_key(sc));
         }
         extended = false;
         return;
@@ -123,7 +111,7 @@ static void keyboard_irq(interrupt_regs_t *regs)
         else if (ch == 'c' || ch == 'C') ch = KEY_CTRL_C;
     }
     if (ch) {
-        push_key(ch);
+        input_push_key(ch);
     }
 }
 
@@ -136,23 +124,19 @@ void keyboard_init(void)
     irq_enable(1);
 }
 
+/* keyboard_getkey()/keyboard_try_getkey() are kept as the public API for
+ * backward compatibility with every existing caller (drivers/tty.c, the
+ * built-in shell, etc.) but now just forward to the shared input.c queue --
+ * see include/pureunix/input.h -- which is also fed by drivers/hid.c's USB
+ * keyboard driver, so callers here see both keyboard types identically. */
 int keyboard_try_getkey(void)
 {
-    if (key_head == key_tail) {
-        return KEY_NONE;
-    }
-    int key = keybuf[key_tail];
-    key_tail = (key_tail + 1) % KEYBUF_SIZE;
-    return key;
+    return input_try_getkey();
 }
 
 int keyboard_getkey(void)
 {
-    int key;
-    while ((key = keyboard_try_getkey()) == KEY_NONE) {
-        arch_halt();
-    }
-    return key;
+    return input_getkey();
 }
 
 bool keyboard_ctrl_down(void)

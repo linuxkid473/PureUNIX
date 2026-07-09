@@ -319,15 +319,22 @@ disk: $(DISK) $(DISK2)
 
 # Boots through real GRUB (not QEMU's built-in -kernel multiboot1 loader,
 # which never sets up a graphics mode) so the multiboot2 framebuffer request
-# in boot/multiboot2.S actually takes effect.
-run: $(ISO) $(DISK) $(DISK2)
+# in boot/multiboot2.S actually takes effect. $(ISO) is a fully standalone
+# boot image (kernel + both disk images travel inside it as GRUB modules —
+# see boot/grub.cfg and kernel_main's ramdisk_attach() calls), so -cdrom is
+# the entire boot media; no separate -drive flags needed here, and this is
+# the same ISO a real machine or VirtualBox/VMware would boot from a USB
+# stick or CD.
+run: $(ISO)
 	$(QEMU) -m 128M -cdrom $(ISO) -boot d \
-		-drive file=$(DISK),format=raw,if=ide,index=0 \
-		-drive file=$(DISK2),format=raw,if=ide,index=1 \
 		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 
-$(ISO): $(KERNEL) boot/grub.cfg
+# Self-contained: fat.img/root.img are embedded as GRUB modules (see
+# boot/grub.cfg's `module2` lines) rather than passed to QEMU as separate
+# -drive files, so the resulting ISO boots into the identical environment
+# on its own — in QEMU, VirtualBox/VMware, or dd'd to a real USB stick.
+$(ISO): $(KERNEL) $(DISK) $(DISK2) boot/grub.cfg
 	@command -v $(GRUB_MKRESCUE) >/dev/null 2>&1 || { \
 		echo "$(GRUB_MKRESCUE) is required for make iso/run. Install GRUB tools (e.g. 'brew install i686-elf-grub') and retry."; \
 		exit 1; \
@@ -335,6 +342,8 @@ $(ISO): $(KERNEL) boot/grub.cfg
 	@rm -rf $(BUILD)/iso
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/pureunix.elf
+	cp $(DISK) $(BUILD)/iso/boot/fat.img
+	cp $(DISK2) $(BUILD)/iso/boot/root.img
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(BUILD)/iso
 

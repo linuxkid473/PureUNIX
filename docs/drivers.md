@@ -171,7 +171,7 @@ These are used by the VGA driver to keep the terminal emulator in sync with the 
 5. Translates the scancode using either `normal_map` or `shift_map` (128-entry arrays indexed by scancode).
 6. Applies Caps Lock to alphabetic keys.
 7. If Ctrl is held: maps `s`→`KEY_CTRL_S`, `q`→`KEY_CTRL_Q`, `f`→`KEY_CTRL_F`, `c`→`KEY_CTRL_C`.
-8. Pushes the key code to the ring buffer via `push_key`.
+8. Pushes the key code to the shared input queue via `input_push_key()` (`drivers/input.c`, `include/pureunix/input.h`) — the same queue a USB HID Boot Protocol keyboard feeds too (`drivers/hid.c`, see `docs/usb.md`), so both keyboard types produce identical events to everything above this layer.
 
 Extended scancodes map to:
 
@@ -219,12 +219,12 @@ int  keyboard_try_getkey(void);   // non-blocking: returns KEY_NONE if buffer em
 bool keyboard_ctrl_down(void);    // returns current Ctrl state
 ```
 
-`keyboard_getkey` loops calling `arch_halt()` until a key is available. This is the primary mechanism by which the kernel waits for user input.
+`keyboard_getkey`/`keyboard_try_getkey` are now thin wrappers forwarding to `input_getkey()`/`input_try_getkey()` (`drivers/input.c`) — kept as the public API for backward compatibility with every existing caller (`drivers/tty.c`, the shell), so none of them needed to change when USB HID keyboard support was added. `keyboard_getkey` (via `input_getkey`) loops calling `arch_halt()` until a key is available from *either* keyboard type. This is the primary mechanism by which the kernel waits for user input.
 
 ### Limitations
 
 - No support for numeric keypad separate keys.
-- No key auto-repeat handling at the driver level (the PS/2 controller handles typematic repeat, but no rate is configured).
+- No key auto-repeat handling at the driver level (the PS/2 controller handles typematic repeat, but no rate is configured) — matches the USB HID keyboard driver's own no-repeat behavior, see `docs/usb.md`.
 - IRQ-based only; no polling mode.
 
 ---
@@ -310,6 +310,33 @@ typedef struct disk_device {
 
 ---
 
+## RAM Disk Driver
+
+**Source**: `drivers/ramdisk.c`
+**Header**: `include/pureunix/ramdisk.h`
+
+### Responsibilities
+
+Wraps an already-in-memory image — a GRUB Multiboot2 boot module, see `docs/boot.md`'s "Boot Modules" section — as a `disk_device_t`, the same interface `drivers/ata.c` implements, so `fat16_mount()`/`ext2_mount()` can mount it without knowing whether the bytes behind it are a real disk or plain RAM. This is what makes `build/pureunix.iso` (`make iso`/`make run`) standalone: `fat.img`/`root.img` travel inside the ISO as GRUB modules instead of separate files QEMU has to be told to attach.
+
+### Design
+
+Two fixed slots (`RAMDISK_SLOTS = 2`), matching PureUNIX's two boot images — slot 0 for `fat.img`, slot 1 for `root.img`, chosen by `kernel_main()` when it calls `ramdisk_attach()`. `disk_device_t`'s `read`/`write` function pointers take no device-context argument, so — mirroring `drivers/ata.c`'s master/slave split — each slot gets its own pair of thunk functions closing over a fixed slot index, rather than a single generic read/write pair with a runtime device parameter.
+
+```c
+disk_device_t *ramdisk_attach(int slot, uint8_t *base, uint32_t size);
+```
+
+`base` is the module's physical start address; because `kernel/vmm.c` identity-maps the first 128 MiB, that physical address is directly dereferenceable as a kernel pointer with no separate mapping step. `read`/`write` are then plain `memcpy`s between the caller's buffer and `base + lba * 512`, bounds-checked against `size`. `present` is set once `ramdisk_attach()` has been called with a non-NULL `base`; before that (no matching GRUB module found), the slot behaves like a disk with nothing plugged in, and `kernel_main()` falls back to `ata_primary_master()`/`ata_primary_slave()`.
+
+### Limitations
+
+- Two slots only, matching the two images PureUNIX currently boots; not a general-purpose ramdisk mechanism.
+- No persistence: writes land in the module's RAM copy, not in `build/pureunix.iso` itself. Every fresh boot starts from the ISO's original image contents again — the same semantics as any other live CD/USB.
+- Depends on the caller (`kernel_main()`) having already reserved the module's physical range via `pmm_init()` (see `docs/memory.md`'s "Boot Modules" section) so nothing else can allocate over it while mounted.
+
+---
+
 ## PCI Bus
 
 **Source**: `drivers/pci.c`
@@ -319,8 +346,9 @@ typedef struct disk_device {
 
 - Reads and writes PCI configuration space via the legacy I/O-port mechanism (`0xCF8`/`0xCFC`), the same mechanism every x86 PC (including QEMU's `i440fx`/`q35` machines) supports without needing ACPI/MCFG.
 - Enumerates every bus (0-255), slot (0-31), and function (0-7 for multi-function devices, detected via header-type bit 7), printing vendor/device/class for each device found.
-- Locates a specific device by vendor/device ID (`pci_find()`), used by `e1000_init()` to find the NIC without hardcoding a bus/slot/function.
-- Reads a BAR's physical base address and size (via the standard "write all-ones, read back, restore" probe), and sets the Bus Master Enable + Memory Space Enable bits in the command register.
+- Locates a specific device by vendor/device ID (`pci_find()`), used by `e1000_init()` to find the NIC without hardcoding a bus/slot/function, or by class/subclass/prog-if (`pci_find_by_class()`), used by `xhci_init()` (`docs/usb.md`) to find "the xHCI controller" without needing to know its vendor/device ID in advance.
+- Reads a BAR's physical base address and size (via the standard "write all-ones, read back, restore" probe), transparently combining a 64-bit BAR's two consecutive dword slots (`pci_bar_is_64bit()` reports which BARs consume two slots) — rejected rather than truncated if its high dword is nonzero, since this kernel is 32-bit/non-PAE and cannot address above 4GB.
+- Sets the Bus Master Enable + Memory Space Enable bits (`pci_enable_bus_mastering()`) and separately clears the Interrupt Disable bit (`pci_enable_legacy_interrupts()`) in the command register — the latter needed for legacy INTx delivery, which most devices don't need cleared by default but xHCI's bring-up explicitly ensures regardless.
 
 ### `pci_device_t`
 
@@ -346,16 +374,20 @@ void     pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offs
 
 void pci_scan(void);   // prints every device found, called from kernel_main()
 bool pci_find(uint16_t vendor_id, const uint16_t *device_ids, int count, pci_device_t *out);
+bool pci_find_by_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if, pci_device_t *out);
 void pci_enable_bus_mastering(const pci_device_t *dev);
+void pci_enable_legacy_interrupts(const pci_device_t *dev);
 
 phys_addr_t pci_bar_address(const pci_device_t *dev, int index);  // 0 for I/O-space BARs
 uint32_t    pci_bar_size(const pci_device_t *dev, int index);
+bool        pci_bar_is_64bit(const pci_device_t *dev, int index);
 ```
 
 ### Limitations
 
 - No PCI Express extended configuration space (MCFG/ECAM) support; legacy port I/O only covers the first 256 bytes of each device's config space, which is all any device this kernel drives needs.
 - No support for PCI bridges beyond simply enumerating past them (bus 0-255 are scanned unconditionally rather than following bridge topology).
+- No MSI/MSI-X support; every device driver (e1000, xHCI) uses legacy INTx exclusively.
 
 ---
 
@@ -424,3 +456,4 @@ void e1000_dump_stats(void);                         // diagnostic: counters + l
 - No jumbo frame support (`RCTL.LPE` unset; frames are capped by the 2048-byte buffer size).
 - No checksum offload; `CTRL.RXCSUM`/TX checksum context descriptors are not used.
 - This file is the raw frame interface only; the Ethernet/ARP/IPv4/ICMP stack built on top of it lives in `net/` — see `docs/networking.md`.
+- `e1000_irq()` may share its legacy IRQ vector with another PCI device (commonly xHCI, under QEMU's default PCI IRQ routing) — see `docs/interrupts.md`'s "Handler Registration" section for the shared-vector dispatch model this relies on, and `docs/usb.md` for a real bug that shared-IRQ handling used to have.

@@ -85,16 +85,37 @@ The linker exports `__kernel_start` and `__kernel_end` symbols that the PMM and 
 
 `boot/grub.cfg`:
 ```
-set timeout=0
+set timeout=1
 set default=0
+
+serial --unit=0 --speed=115200
+terminal_output console serial
 
 menuentry "PureUnix" {
     multiboot2 /boot/pureunix.elf
+    module2 /boot/fat.img fat.img
+    module2 /boot/root.img root.img
     boot
 }
 ```
 
-This is used only for ISO builds (`make iso`). The `make run` target uses QEMU's `-kernel` flag directly and bypasses GRUB.
+Both `make iso` and `make run` boot through this GRUB config — `make run` boots `build/pureunix.iso` via QEMU's `-cdrom`, the same image `make iso` produces; it does not use QEMU's `-kernel` flag. See `docs/build.md` for the Makefile side of ISO assembly.
+
+The two `module2` lines are what make `build/pureunix.iso` a standalone bootable image: `fat.img`/`root.img` (copies of `build/pureunix.img`/`build/ext2.img`) are baked into the ISO and loaded into RAM by GRUB alongside the kernel, rather than being attached to QEMU as separate `-drive` files. The kernel discovers them via the Multiboot2 module tags below.
+
+---
+
+## Boot Modules (`fat.img` / `root.img`)
+
+Multiboot2 tag type 3 (`MULTIBOOT2_TAG_MODULE`, `include/pureunix/multiboot.h`) carries a `(mod_start, mod_end, cmdline)` triple per `module2` line — `cmdline` here is just the string that followed the module's path in `grub.cfg` (`"fat.img"`/`"root.img"`), used as a name, not an actual command line.
+
+`kernel/pmm.c`'s `parse_multiboot2()` records every module tag it sees (up to `MAX_BOOT_MODULES`, currently 4) into a small in-kernel table, and `pmm_init()` calls `reserve_region()` on each module's physical range — the same mechanism that protects the kernel image and heap from `pmm_alloc_frame()` — so a module's bytes are never handed out as a free physical frame once GRUB has loaded it. `kernel_main()` then looks modules up by name via `pmm_module_get()`/`pmm_module_count()` (declared in `include/pureunix/memory.h`) and wraps each one as a `disk_device_t` with `ramdisk_attach()` (`drivers/ramdisk.c`) — a RAM-backed block device whose `read`/`write` are plain `memcpy`s against the module's identity-mapped physical address (see `kernel/vmm.c`'s 128 MiB identity map — no separate mapping step is needed since every module lives well under that ceiling). `fat16_mount()`/`ext2_mount()` then operate on that `disk_device_t` exactly as they would a real ATA disk.
+
+Because module memory is reserved but not copied anywhere else, this doubles as the filesystems' backing store for the life of the boot: writes go straight to the module's RAM, so `/`, `/fat`, and everything on them behave identically to `make run` before this change — including writes — for the duration of that boot session. Like any live CD/USB image, none of it is written back to `build/pureunix.iso` itself; a fresh boot starts from the image's original contents again.
+
+One subtlety this creates: `kernel/heap.c`'s 8 MiB heap can no longer assume it starts right after `__kernel_end` — GRUB may have placed a module there. `heap_reserved_range()` instead starts the heap after whichever is higher of `__kernel_end` or `pmm_modules_end()` (the highest recorded module end address), computed once `pmm_init()` has already parsed the Multiboot2 module tags. See `docs/memory.md`'s Kernel Heap section.
+
+If no module matching a known name is present — e.g. a bare `qemu-system-i386 -kernel build/pureunix.elf` invocation with no GRUB at all, which never produces module tags — `kernel_main()` falls back to `ata_primary_master()`/`ata_primary_slave()`, so the original ATA disk path (`drivers/ata.c`, unchanged) is still fully functional for real IDE hardware or hand-built QEMU setups that pass `-drive ...,if=ide`.
 
 ---
 

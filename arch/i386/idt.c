@@ -20,7 +20,20 @@ typedef struct idt_ptr {
 
 static idt_entry_t idt[256];
 static idt_ptr_t idtp;
-static interrupt_handler_t handlers[256];
+
+/* Legacy PCI INTx lines are commonly shared between devices (e.g. two PCI
+ * functions both routed to IRQ 11) -- when that happens, more than one
+ * driver calls interrupt_register_handler() for the *same* vector, and
+ * both handlers must run on every interrupt (each checking its own
+ * device's pending-interrupt status and doing nothing if it isn't the
+ * source -- see e.g. xhci_irq()'s IMAN.IP check in drivers/xhci.c). A
+ * fixed-size small array per vector avoids needing a dynamic allocator for
+ * something that, in practice, never holds more than a couple of entries;
+ * MAX_HANDLERS_PER_VECTOR is a generous bound on how many devices ever
+ * realistically share one legacy IRQ line. */
+#define MAX_HANDLERS_PER_VECTOR 4
+static interrupt_handler_t handlers[256][MAX_HANDLERS_PER_VECTOR];
+static uint8_t handler_count[256];
 
 extern void idt_load(uint32_t idt_ptr);
 
@@ -58,7 +71,12 @@ static void idt_set_gate(uint8_t num, uint32_t base, uint16_t selector, uint8_t 
 
 void interrupt_register_handler(uint8_t vector, interrupt_handler_t handler)
 {
-    handlers[vector] = handler;
+    if (handler_count[vector] >= MAX_HANDLERS_PER_VECTOR) {
+        panic("interrupt_register_handler: vector %u already has %u handlers "
+              "(raise MAX_HANDLERS_PER_VECTOR in arch/i386/idt.c)",
+              vector, handler_count[vector]);
+    }
+    handlers[vector][handler_count[vector]++] = handler;
 }
 
 void idt_init(void)
@@ -105,8 +123,10 @@ void isr_dispatch(interrupt_regs_t *regs)
         return;
     }
 
-    if (handlers[regs->int_no]) {
-        handlers[regs->int_no](regs);
+    if (handler_count[regs->int_no] > 0) {
+        for (uint8_t i = 0; i < handler_count[regs->int_no]; ++i) {
+            handlers[regs->int_no][i](regs);
+        }
     } else if (regs->int_no < 32) {
         panic("CPU exception %u (%s), err=%x eip=%p",
               regs->int_no, exception_names[regs->int_no], regs->err_code, (void *)regs->eip);

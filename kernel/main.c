@@ -17,6 +17,7 @@
 #include <pureunix/memory.h>
 #include <pureunix/panic.h>
 #include <pureunix/pci.h>
+#include <pureunix/ramdisk.h>
 #include <pureunix/serial.h>
 #include <pureunix/shell.h>
 #include <pureunix/stdio.h>
@@ -27,6 +28,7 @@
 #include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
+#include <pureunix/xhci.h>
 
 /* The real login shell for an interactive session — BusyBox ash by default
  * (/etc/passwd's shell field, seeded "/bin/sh" — see kernel/users.c),
@@ -108,6 +110,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     ata_init();
     pci_scan();
     e1000_init();
+    xhci_init();
     eth_init();
     arp_init();
     ip_init();
@@ -119,8 +122,27 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     ip_configure(IP4_ADDR(10, 0, 2, 15), IP4_ADDR(255, 255, 255, 0), IP4_ADDR(10, 0, 2, 2));
     vfs_init();
 
-    /* FAT16 on primary master (ata0) — compatibility/testing only, mounted at /fat */
-    disk_device_t *disk = ata_primary_master();
+    /* fat.img/root.img travel as GRUB modules baked into build/pureunix.iso
+     * (see boot/grub.cfg and the Makefile's $(ISO) rule) so the ISO is a
+     * standalone, self-contained boot image — no separate IDE drives
+     * needed. ramdisk_attach() wraps each module's identity-mapped memory
+     * (see kernel/vmm.c) as a disk_device_t. Falls back to real ATA disks
+     * (ata0/ata1) when no matching module was loaded — e.g. hand-built
+     * QEMU invocations, or real IDE hardware without a modules-capable
+     * bootloader. */
+    disk_device_t *fat_disk = NULL;
+    disk_device_t *root_disk = NULL;
+    for (uint32_t i = 0; i < pmm_module_count(); ++i) {
+        const boot_module_t *mod = pmm_module_get(i);
+        if (strcmp(mod->cmdline, "fat.img") == 0) {
+            fat_disk = ramdisk_attach(0, (uint8_t *)mod->start, mod->end - mod->start);
+        } else if (strcmp(mod->cmdline, "root.img") == 0) {
+            root_disk = ramdisk_attach(1, (uint8_t *)mod->start, mod->end - mod->start);
+        }
+    }
+
+    /* FAT16 — compatibility/testing only, mounted at /fat */
+    disk_device_t *disk = fat_disk ? fat_disk : ata_primary_master();
     if (disk->present && fat16_mount(disk) == 0) {
         vfs_mount("/fat", VFS_FS_FAT16, fat16_vfs_ops(), NULL);
         printf("FAT16 mounted on /fat\n");
@@ -128,8 +150,8 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
         printf("No FAT16 disk found; /fat will be unavailable.\n");
     }
 
-    /* EXT2 on primary slave (ata1) — primary root filesystem */
-    disk_device_t *disk2 = ata_primary_slave();
+    /* EXT2 — primary root filesystem */
+    disk_device_t *disk2 = root_disk ? root_disk : ata_primary_slave();
     if (disk2->present) {
         if (ext2_mount(disk2) == 0) {
             vfs_mount("/", VFS_FS_EXT2, ext2_vfs_ops(), NULL);
@@ -140,6 +162,8 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     arch_enable_interrupts();
+
+    xhci_enumerate();
 
     e1000_selftest();
     arp_selftest();

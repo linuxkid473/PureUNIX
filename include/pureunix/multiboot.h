@@ -46,8 +46,21 @@ typedef struct multiboot2_mmap_tag {
     multiboot2_mmap_entry_t entries[];
 } __attribute__((packed)) multiboot2_mmap_tag_t;
 
+#define MULTIBOOT2_TAG_MODULE 3
 #define MULTIBOOT2_TAG_FRAMEBUFFER 8
 #define MULTIBOOT2_FRAMEBUFFER_TYPE_RGB 1
+
+/* GRUB's `module2 /boot/foo.img foo.img` — mod_start/mod_end are physical
+ * addresses of the already-loaded module; cmdline is whatever string
+ * followed the path in grub.cfg (used here to identify which image a
+ * module is, rather than relying on load order). */
+typedef struct multiboot2_module_tag {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char cmdline[];
+} __attribute__((packed)) multiboot2_module_tag_t;
 
 /* Fixed-size header; for framebuffer_type == RGB it is immediately followed
  * by a multiboot2_framebuffer_rgb_info_t describing the channel layout. */

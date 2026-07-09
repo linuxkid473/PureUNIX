@@ -15,6 +15,13 @@ typedef void (*interrupt_handler_t)(interrupt_regs_t *regs);
 void arch_init(void);
 void gdt_init(void);
 void idt_init(void);
+/* Adds `handler` to the (small, fixed-capacity) list of handlers invoked
+ * whenever `vector` fires -- not a single-slot "set the handler" call.
+ * Legacy PCI INTx lines are commonly shared between devices, so more than
+ * one driver may register on the same vector; every registered handler
+ * runs on each interrupt, so a handler for a device on a possibly-shared
+ * vector must check its own pending-interrupt status first and do nothing
+ * if it isn't the source (see drivers/xhci.c's xhci_irq() for an example). */
 void interrupt_register_handler(uint8_t vector, interrupt_handler_t handler);
 void isr_dispatch(interrupt_regs_t *regs);
 

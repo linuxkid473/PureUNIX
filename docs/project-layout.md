@@ -5,7 +5,7 @@ PureUNIX/
 ├── boot/
 │   ├── multiboot2.S    Entry point (_start), Multiboot1+2 headers, 32KB stack
 │   ├── linker.ld       Kernel linker script (load at 1MB, exports __kernel_start/__kernel_end)
-│   └── grub.cfg        GRUB menu entry for ISO boot
+│   └── grub.cfg        GRUB menu entry for ISO boot; module2's fat.img/root.img as boot modules
 │
 ├── arch/
 │   └── i386/
@@ -18,10 +18,10 @@ PureUNIX/
 │       └── interrupt_stubs.S   ISR_NOERR/ISR_ERR/IRQ macros, isr_common_stub
 │
 ├── kernel/
-│   ├── main.c          Kernel entry point; mounts FAT16 (primary master) + EXT2 (primary slave)
-│   ├── pmm.c           Bitmap physical memory manager; parses Multiboot1+2 mmap
+│   ├── main.c          Kernel entry point; mounts FAT16 + EXT2 from GRUB modules (fallback: ATA master/slave)
+│   ├── pmm.c           Bitmap physical memory manager; parses Multiboot1+2 mmap + boot modules
 │   ├── vmm.c           Identity-mapped paging; 32 static page tables × 4MB = 128MB
-│   ├── heap.c          Linked-list kernel heap; 8MB fixed at __kernel_end
+│   ├── heap.c          Linked-list kernel heap; 8MB starting past __kernel_end or the last boot module
 │   ├── task.c          Cooperative round-robin scheduler; task_t list; context switch glue
 │   ├── elf.c           ELF32 loader; validates and loads PT_LOAD segments to 0x400000–0x700000
 │   ├── panic.c         panic() — white-on-red VGA + serial + halt
@@ -35,8 +35,13 @@ PureUNIX/
 │   ├── serial.c        COM1 38400 baud; mirrors VGA output; ANSI cursor sequences
 │   ├── tty.c           Console termios: one shared struct termios; canonical/raw SYS_READ(fd 0)
 │   ├── ata.c           ATA PIO; primary master + slave; LBA28; IDENTIFY; sector read/write
+│   ├── ramdisk.c       disk_device_t over a GRUB boot module's identity-mapped RAM (2 fixed slots)
 │   ├── pci.c           PCI config-space I/O (0xCF8/0xCFC); bus/slot/function enumeration; BAR probing
-│   └── e1000.c         Intel e1000-family NIC; MMIO BAR mapping; RX/TX descriptor rings; IRQ-driven RX
+│   ├── e1000.c         Intel e1000-family NIC; MMIO BAR mapping; RX/TX descriptor rings; IRQ-driven RX
+│   ├── input.c         Generic keyboard input-event queue shared by PS/2 and USB HID keyboards
+│   ├── xhci.c          xHCI (USB 3.x) host controller: bring-up, rings, port/slot/device enumeration
+│   ├── usb.c           Host-controller-agnostic USB core: descriptors, enumeration, hc ops vtable
+│   └── hid.c           USB HID Boot Protocol keyboard: SET_PROTOCOL, report decode -> input.c
 │
 ├── net/
 │   ├── eth.c           Ethernet II frame layer: ethertype dispatch table, eth_send()/eth_get_mac()
@@ -113,13 +118,14 @@ PureUNIX/
 │       ├── arch.h      arch_init, arch_enable/disable_interrupts, arch_halt, arch_io
 │       ├── config.h    PUREUNIX_VERSION, PUREUNIX_MAX_PATH, PUREUNIX_MAX_NAME
 │       ├── types.h     uint8_t–uint64_t, size_t, bool, NULL, true, false
-│       ├── memory.h    pmm_*, vmm_*, kmalloc/kfree/kcalloc/krealloc
+│       ├── memory.h    pmm_*, vmm_*, kmalloc/kfree/kcalloc/krealloc, boot_module_t
 │       ├── task.h      task_t, fd_entry_t (with flags field), tasking_init, task_create, task_yield
 │       ├── syscall.h   SYS_* constants (1–9)
 │       ├── vfs.h       vfs_stat_t, vfs_dirent_t, VFS_O_*, all vfs_* functions
 │       ├── fat16.h     fat16_fs_t, fat_dir_entry_t, FAT_ATTR_*, all fat16_* functions
 │       ├── ext2.h      ext2_mount, ext2_unmount, ext2_is_mounted, ext2_stat, ext2_read_file, ext2_readdir
 │       ├── disk.h      disk_device_t, ata_init, ata_primary_master, ata_primary_slave
+│       ├── ramdisk.h   ramdisk_attach — wraps a GRUB boot module as a disk_device_t
 │       ├── keyboard.h  KEY_* constants, keyboard_init, keyboard_getkey, keyboard_try_getkey
 │       ├── termios.h   struct termios, NCCS/V*/ICANON/ECHO/ISIG/... constants
 │       ├── tty.h        tty_init, tty_get_termios, tty_set_termios, tty_read

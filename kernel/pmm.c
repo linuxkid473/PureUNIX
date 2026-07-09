@@ -13,6 +13,16 @@ static uint32_t frame_bitmap[BITMAP_WORDS];
 static uint32_t total_frames;
 static uint32_t free_frames;
 
+/* GRUB modules (boot/grub.cfg's `module2` lines) discovered while parsing
+ * the Multiboot2 info — recorded here rather than a separate subsystem
+ * since this file already owns "walk the MBI tags, reserve what must not
+ * be handed out by pmm_alloc_frame()", and modules need exactly that.
+ * boot_module_t itself lives in memory.h so kernel_main can read it back. */
+#define MAX_BOOT_MODULES 4
+
+static boot_module_t boot_modules[MAX_BOOT_MODULES];
+static uint32_t boot_module_count;
+
 static void frame_set(uint32_t frame)
 {
     if (frame >= MAX_FRAMES) {
@@ -90,6 +100,15 @@ static void parse_multiboot2(uint32_t mbi_addr)
                 }
                 entry += mmap->entry_size;
             }
+        } else if (tag->type == MULTIBOOT2_TAG_MODULE) {
+            multiboot2_module_tag_t *mod = (multiboot2_module_tag_t *)tag;
+            if (boot_module_count < MAX_BOOT_MODULES) {
+                boot_module_t *bm = &boot_modules[boot_module_count++];
+                bm->start = mod->mod_start;
+                bm->end = mod->mod_end;
+                strncpy(bm->cmdline, mod->cmdline, sizeof(bm->cmdline) - 1);
+                bm->cmdline[sizeof(bm->cmdline) - 1] = '\0';
+            }
         }
         cursor += ALIGN_UP(tag->size, 8);
     }
@@ -117,6 +136,7 @@ void pmm_init(uint32_t magic, uint32_t mbi_addr)
 {
     total_frames = MAX_FRAMES;
     free_frames = 0;
+    boot_module_count = 0;
     for (size_t i = 0; i < BITMAP_WORDS; ++i) {
         frame_bitmap[i] = 0xFFFFFFFFU;
     }
@@ -132,6 +152,15 @@ void pmm_init(uint32_t magic, uint32_t mbi_addr)
     reserve_region(0, 0x100000);
     reserve_region((uint32_t)&__kernel_start, (uint32_t)(&__kernel_end - &__kernel_start));
     reserve_region((uint32_t)frame_bitmap, sizeof(frame_bitmap));
+
+    /* GRUB-loaded modules (root.img/fat.img, see kernel_main's use of
+     * pmm_module_get()) live in otherwise-ordinary RAM that mark_region_free()
+     * above already marked available — reserve them explicitly so
+     * pmm_alloc_frame() never hands one out from underneath a mounted
+     * ramdisk. */
+    for (uint32_t i = 0; i < boot_module_count; ++i) {
+        reserve_region(boot_modules[i].start, boot_modules[i].end - boot_modules[i].start);
+    }
 
     /* The kernel heap lives just past the kernel image but is carved out
      * directly by heap_init() via linker symbols, never through this
@@ -171,4 +200,28 @@ uint32_t pmm_total_memory_kb(void)
 uint32_t pmm_free_memory_kb(void)
 {
     return (free_frames * FRAME_SIZE) / 1024;
+}
+
+uint32_t pmm_module_count(void)
+{
+    return boot_module_count;
+}
+
+const boot_module_t *pmm_module_get(uint32_t index)
+{
+    if (index >= boot_module_count) {
+        return NULL;
+    }
+    return &boot_modules[index];
+}
+
+uint32_t pmm_modules_end(void)
+{
+    uint32_t end = 0;
+    for (uint32_t i = 0; i < boot_module_count; ++i) {
+        if (boot_modules[i].end > end) {
+            end = boot_modules[i].end;
+        }
+    }
+    return end;
 }

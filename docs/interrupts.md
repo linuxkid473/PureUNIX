@@ -105,8 +105,9 @@ if int_no == 0x80:
     regs->eax = syscall_dispatch(regs)
     return
 
-if handlers[int_no] != NULL:
-    handlers[int_no](regs)
+if handler_count[int_no] > 0:
+    for handler in handlers[int_no][0 .. handler_count[int_no]]:
+        handler(regs)
 else if int_no < 32:
     panic("CPU exception %u (%s)...")
 else:
@@ -116,7 +117,9 @@ if 32 <= int_no < 48:
     pic_send_eoi(int_no - 32)
 ```
 
-Importantly, the EOI is sent **after** the handler returns for IRQs. The syscall path (INT 0x80) does not go through the handler table and does not send an EOI, which is correct because INT 0x80 is a software interrupt.
+Importantly, the EOI is sent **after every handler returns** for IRQs. The syscall path (INT 0x80) does not go through the handler table and does not send an EOI, which is correct because INT 0x80 is a software interrupt.
+
+**Every handler registered on a vector runs on every interrupt of that vector** — see "Handler Registration" below for why, and the shared-IRQ correctness rule this implies for any handler on a vector that might not be exclusively its own.
 
 ---
 
@@ -158,8 +161,9 @@ All unhandled exceptions call `panic()`, which prints the exception name, error 
 | 1 | 33 | PS/2 keyboard | `keyboard_irq` — reads scancode, queues key |
 | 14 | 46 | ATA primary | `ata_irq` — reads status register (clears interrupt) |
 | *varies* | 32+line | e1000 NIC | `e1000_irq` — reads `ICR` (clears interrupt); on `RXT0` also calls the registered RX handler (`eth_dispatch()`, see `docs/networking.md`), which drains the RX ring and dispatches each frame all the way up through ARP/IP/ICMP handling — including any automatic reply send — synchronously, before the handler returns |
+| *varies* | 32+line | xHCI (USB) | `xhci_irq` — checks `IMAN.IP` first and returns immediately if clear (see "Handler Registration" below — this vector is very commonly shared with e1000 under QEMU's default PCI IRQ routing); otherwise acknowledges the primary interrupter and drains the event ring (`docs/usb.md`) |
 
-The e1000's IRQ line isn't a fixed number like the others — it's whatever the PCI interrupt-line register (config space offset `0x3C`) reports for that device/slot (typically IRQ 11 under QEMU), read at `e1000_init()` time and used to compute its vector (`32 + interrupt_line`).
+The e1000's and xHCI's IRQ lines aren't fixed numbers like the others — each is whatever the PCI interrupt-line register (config space offset `0x3C`) reports for that device/slot (both typically land on IRQ 11 under QEMU's default routing — see "Handler Registration" below for what that implies), read at init time and used to compute the vector (`32 + interrupt_line`).
 
 IRQs 2–13 and 15 are unhandled unless an e1000 happens to land on one of them. If an unhandled one fires, `isr_dispatch` prints "Unhandled interrupt N" and sends EOI.
 
@@ -214,4 +218,6 @@ Any driver or subsystem can register a handler for any vector:
 void interrupt_register_handler(uint8_t vector, interrupt_handler_t handler);
 ```
 
-The handler table is `static interrupt_handler_t handlers[256]` in `idt.c`. Registering a new handler overwrites the previous one. There is no unregister function.
+`interrupt_register_handler()` **adds** to a small fixed-capacity list per vector — it does not replace whatever was previously registered there. The table is `static interrupt_handler_t handlers[256][MAX_HANDLERS_PER_VECTOR]` (`MAX_HANDLERS_PER_VECTOR = 4`) plus a `handler_count[256]` array, both in `idt.c`; `interrupt_register_handler()` panics if a vector's 4-slot list is already full (raise the constant if a fifth handler ever needs to share one vector). There is no unregister function.
+
+This matters because **legacy PCI INTx lines are commonly shared between devices** — under QEMU's default PCI IRQ routing, for instance, e1000 and xHCI both land on IRQ 11, so both `e1000_irq()` and `xhci_irq()` end up registered on the same vector and **both run on every interrupt of that vector**, not just the one whose device actually asserted it. Every handler on a vector that might ever be shared must therefore check its own device's pending-interrupt status first and do nothing if it isn't the source (`xhci_irq()` checks `IMAN.IP`; `e1000_irq()` reading `ICR` when nothing is pending already just returns 0 harmlessly). This was a real bug during xHCI bring-up: before this fix, registering `xhci_irq()` on the shared vector silently *replaced* `e1000_irq()`, so real e1000 interrupts stopped being acknowledged at all — since INTx is level-triggered, the line then stayed asserted forever once one fired, livelocking the CPU in repeated ISR entry. See `docs/usb.md` for the full story.

@@ -4,14 +4,18 @@
 
 The filesystem layer has three components:
 
-- **EXT2 driver** (`fs/ext2/`) — read/write driver for the ATA primary slave disk (Stage 4 made it writable; see `fs/ext2/alloc.c`/`fs/ext2/write.c`). Handles superblock parsing, block group descriptor table, inode reads/writes, block and inode allocation/freeing, directory traversal/insertion/removal, direct and singly-indirect block iteration, symbolic and hard links, and a 4-slot LRU block cache. Primary root filesystem, mounted at `/`.
-- **FAT16 driver** (`fs/fat16.c`) — read/write driver for the ATA primary master disk. Handles cluster allocation/freeing, file and directory CRUD, and all write operations. Mounted at `/fat` for compatibility/testing only. Unlike EXT2, it has no concept of symlinks or hard links.
+- **EXT2 driver** (`fs/ext2/`) — read/write driver operating against a `disk_device_t` (Stage 4 made it writable; see `fs/ext2/alloc.c`/`fs/ext2/write.c`). Handles superblock parsing, block group descriptor table, inode reads/writes, block and inode allocation/freeing, directory traversal/insertion/removal, direct and singly-indirect block iteration, symbolic and hard links, and a 4-slot LRU block cache. Primary root filesystem, mounted at `/`.
+- **FAT16 driver** (`fs/fat16.c`) — read/write driver operating against a `disk_device_t`. Handles cluster allocation/freeing, file and directory CRUD, and all write operations. Mounted at `/fat` for compatibility/testing only. Unlike EXT2, it has no concept of symlinks or hard links.
 - **VFS** (`fs/vfs.c`) — a mount-table router, *not* a dual-dispatch/union layer: every path resolves via longest-prefix match to exactly one mount, and that mount's driver alone serves the call (see `docs/api/vfs.md` for the full mount-table API). Stage 3A added Unix permission enforcement at this same layer; Stage 4 added the centralized `resolve_path()` pathname resolver (symlink-following, `.`/`..`, loop detection) that every `vfs_*` entry point is now built on.
+
+Both drivers are disk-agnostic: they mount any `disk_device_t` (`include/pureunix/disk.h`), not specifically ATA hardware. `kernel_main()` (`kernel/main.c`) picks which `disk_device_t` backs each mount at boot:
 
 | Disk | Role | Filesystem | Mountpoint |
 |---|---|---|---|
-| ATA primary master (`index=0`) | Compatibility/testing store | FAT16 (read/write) | `/fat` |
-| ATA primary slave (`index=1`) | Primary root filesystem | EXT2 (read/write) | `/` |
+| `fat.img` GRUB module → `drivers/ramdisk.c` slot 0 (falls back to ATA primary master) | Compatibility/testing store | FAT16 (read/write) | `/fat` |
+| `root.img` GRUB module → `drivers/ramdisk.c` slot 1 (falls back to ATA primary slave) | Primary root filesystem | EXT2 (read/write) | `/` |
+
+The GRUB-module path is what `build/pureunix.iso` boots through (see `docs/boot.md`'s "Boot Modules" section) — `fat.img`/`root.img` are loaded into RAM by GRUB and mounted directly from memory via `drivers/ramdisk.c`, so the ISO is fully standalone with no separate disk files to attach. The ATA fallback (`drivers/ata.c`, unchanged) only applies when no matching module was loaded, e.g. a bare `-kernel` boot or real IDE hardware.
 
 ---
 

@@ -24,17 +24,27 @@ static size_t align8(size_t value)
 
 /* Computable before heap_init() runs (pmm_init() calls this to keep
  * pmm_alloc_frame() from ever handing out a physical frame that overlaps
- * the live heap — see the pmm_init() call site). */
+ * the live heap — see the pmm_init() call site). Starts past whichever is
+ * higher of the kernel image or the last GRUB module (root.img/fat.img,
+ * see kernel_main): pmm_init() parses modules before calling this, so
+ * pmm_modules_end() is already populated by the time this runs. Without
+ * this, a module GRUB happened to place inside [__kernel_end, +8MiB) would
+ * get its opening bytes stomped by heap_head itself. */
 void heap_reserved_range(phys_addr_t *base, uint32_t *size)
 {
-    *base = ALIGN_UP((uint32_t)&__kernel_end, PUREUNIX_PAGE_SIZE);
+    uint32_t after_kernel = ALIGN_UP((uint32_t)&__kernel_end, PUREUNIX_PAGE_SIZE);
+    uint32_t after_modules = ALIGN_UP(pmm_modules_end(), PUREUNIX_PAGE_SIZE);
+    *base = after_modules > after_kernel ? after_modules : after_kernel;
     *size = HEAP_SIZE;
 }
 
 void heap_init(void)
 {
-    heap_start = (uint8_t *)ALIGN_UP((uint32_t)&__kernel_end, PUREUNIX_PAGE_SIZE);
-    heap_end = heap_start + HEAP_SIZE;
+    phys_addr_t base;
+    uint32_t size;
+    heap_reserved_range(&base, &size);
+    heap_start = (uint8_t *)base;
+    heap_end = heap_start + size;
     heap_head = (heap_block_t *)heap_start;
     heap_head->magic = HEAP_MAGIC;
     heap_head->size = HEAP_SIZE - sizeof(heap_block_t);
