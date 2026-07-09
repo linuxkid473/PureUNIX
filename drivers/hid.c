@@ -1,8 +1,8 @@
 #include <pureunix/hid.h>
-#include <pureunix/input.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/vt.h>
 
 /* One boot report is always exactly 8 bytes (USB HID spec Appendix B.1):
  * byte0 = modifier bitmap, byte1 = reserved, bytes2-7 = up to six
@@ -143,11 +143,18 @@ static bool usage_in_report(const uint8_t report[HID_BOOT_REPORT_SIZE], uint8_t 
  * milestone, not yet implemented for either keyboard type). Only presses
  * generate events; releases exist solely to update modifier/Caps Lock
  * state, exactly like keyboard_irq(). */
+/* USB HID Usage Tables, Keyboard/Keypad Page (0x07): F1..F6 are usage IDs
+ * 0x3A..0x3F -- the same Alt+F<n> VT-switching convention as the PS/2
+ * driver's scancode range (drivers/keyboard.c), see include/pureunix/vt.h. */
+#define HID_USAGE_F1 0x3A
+#define HID_USAGE_F6 0x3F
+
 static void decode_boot_report(hid_keyboard_t *kb)
 {
     uint8_t modifiers = kb->report_buf[0];
     bool shift = (modifiers & (HID_MOD_LEFT_SHIFT | HID_MOD_RIGHT_SHIFT)) != 0;
     bool ctrl = (modifiers & (HID_MOD_LEFT_CTRL | HID_MOD_RIGHT_CTRL)) != 0;
+    bool alt = (modifiers & (HID_MOD_LEFT_ALT | HID_MOD_RIGHT_ALT)) != 0;
 
     for (uint32_t i = 2; i < HID_BOOT_REPORT_SIZE; ++i) {
         uint8_t usage = kb->report_buf[i];
@@ -157,10 +164,19 @@ static void decode_boot_report(hid_keyboard_t *kb)
         if (usage_in_report(kb->prev_report, usage)) {
             continue; /* already held, not a new press */
         }
-        int key = translate_usage(usage, shift, ctrl, &kb->caps_lock);
-        if (key != KEY_NONE) {
-            input_push_key(key);
+        if (alt && usage >= HID_USAGE_F1 && usage <= HID_USAGE_F6) {
+            vt_switch((int)(usage - HID_USAGE_F1));
+            continue;
         }
+        int key = translate_usage(usage, shift, ctrl, &kb->caps_lock);
+        if (key == KEY_NONE) {
+            continue;
+        }
+        if (shift && (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) {
+            vt_scroll_view(vt_active_id(), key == KEY_PAGE_UP ? 10 : -10);
+            continue;
+        }
+        vt_input_push(key);
     }
 
     memcpy(kb->prev_report, kb->report_buf, HID_BOOT_REPORT_SIZE);

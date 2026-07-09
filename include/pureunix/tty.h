@@ -16,9 +16,15 @@ void tty_init(void);
 int tty_get_termios(struct termios *out);
 int tty_set_termios(const struct termios *in);
 
-/* Same contract as read(0, buf, len): returns the number of bytes stored,
- * 0 on end-of-input (VEOF pressed on an empty line), or a negative errno
- * (-EINTR when ISIG's VINTR fires, -EINVAL on a null buffer). */
-int tty_read(char *buf, size_t len);
+/* Same contract as read(fd, buf, len) for fd 0's default console binding:
+ * returns the number of bytes stored, 0 on end-of-input (VEOF pressed on an
+ * empty line), or a negative errno (-EINTR when ISIG's VINTR fires, -EINVAL
+ * on a null buffer). Blocks/echoes against VT vt_id specifically, not
+ * necessarily the calling task's own -- fd 0 (SYS_READ, arch/i386/
+ * syscall.c) always passes the caller's own vt_id; a /dev/ttyN descriptor
+ * opened for a *different* VT (see SYS_OPEN's /dev/tty interception) passes
+ * that VT's id instead, so reading someone else's tty device node blocks
+ * until that VT is the active one, same as a real Linux tty device. */
+int tty_read(int vt_id, char *buf, size_t len);
 
 #endif

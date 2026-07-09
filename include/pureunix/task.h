@@ -10,6 +10,11 @@
 typedef enum fd_kind {
     FD_KIND_FILE = 0,
     FD_KIND_PIPE = 1,
+    /* A /dev/ttyN (or /dev/tty) descriptor opened explicitly via SYS_OPEN
+     * (arch/i386/syscall.c's /dev/tty interception) — distinct from fd
+     * 0/1/2's *default* console binding (file == NULL, see fd_entry_t
+     * below), which never allocates an open_file_t at all. */
+    FD_KIND_TTY = 2,
 } fd_kind_t;
 
 /* Ring buffer shared by both ends of one pipe() call — allocated once per
@@ -53,6 +58,13 @@ typedef struct open_file {
      * pipe_buf_t, one per end). */
     pipe_buf_t *pipe_buf;
     bool pipe_is_write_end;
+
+    /* FD_KIND_TTY: which VT (0-based) this /dev/ttyN descriptor targets —
+     * see arch/i386/syscall.c's SYS_OPEN /dev/tty interception and
+     * include/pureunix/vt.h. Independent of the *opening* task's own
+     * vt_id: e.g. a shell on VT1 opening /dev/tty3 gets a descriptor bound
+     * to VT3 regardless of where it was opened from. */
+    int tty_vt_id;
 } open_file_t;
 
 /* One slot in a task's file descriptor table. Slots 0/1/2 start out with
@@ -156,6 +168,15 @@ typedef struct task {
      * credentials at task_create() time. */
     uid_t uid;
     gid_t gid;
+    /* Which virtual terminal (0-based; see include/pureunix/vt.h) this
+     * task's fd 0/1/2 default console binding and controlling-terminal
+     * ioctls (VT_ACTIVATE/VT_GETACTIVE) target — -1 for tasks that predate
+     * vt_init() (the initial kernel task, until kernel_main() claims VT1)
+     * or otherwise aren't attached to any VT. Inherited from the creator at
+     * task_alloc() time exactly like uid/gid/cwd below, which is what keeps
+     * a shell and every process it launches (ping, seq, make, ...) bound to
+     * the VT it was started on regardless of which VT is active later. */
+    int vt_id;
     /* Working directory, used to resolve relative paths a syscall hands
      * the VFS (see SYS_CHDIR/SYS_GETCWD in arch/i386/syscall.c). Always an
      * absolute, normalized path (vfs_normalize()'s output). A child

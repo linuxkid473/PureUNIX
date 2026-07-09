@@ -17,6 +17,15 @@
  * (user/font.c). */
 #define TIOCSFONT 2
 
+/* Virtual terminal switching (include/pureunix/vt.h) — the `tty` command
+ * (user/tty.c) uses these so it goes through the exact same kernel
+ * VT-switching path (vt_switch()) as the Alt+F<n> keyboard shortcut, not a
+ * separate implementation. VT numbers here are 1-based (VT_GETACTIVE/
+ * VT_ACTIVATE's argp is a `1..NUM_VTS` VT number, matching the vtN naming
+ * users see — vt_switch() itself is 0-based internally). */
+#define VT_GETACTIVE 3 /* argp: int * (out) — the caller's current VT number */
+#define VT_ACTIVATE  4 /* argp: const int * (in) — VT number to switch to */
+
 struct winsize {
     unsigned short ws_row;
     unsigned short ws_col;

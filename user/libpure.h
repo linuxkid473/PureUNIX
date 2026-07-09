@@ -179,6 +179,11 @@ struct dirent {
 /* ioctl() — must match include/pureunix/ioctl.h. */
 #define TIOCGWINSZ 1
 #define TIOCSFONT  2
+#define VT_GETACTIVE 3
+#define VT_ACTIVATE  4
+
+/* Must match NUM_VTS in include/pureunix/vt.h. */
+#define PU_NUM_VTS 6
 
 /* TIOCSFONT's valid scale range — must match include/pureunix/font.h. */
 #define FONT_SCALE_MIN 1

@@ -1,5 +1,6 @@
 #include <pureunix/arch.h>
 #include <pureunix/io.h>
+#include <pureunix/task.h>
 
 static volatile uint64_t ticks;
 static uint32_t pit_hz = 100;
@@ -29,6 +30,15 @@ void pit_sleep(uint32_t ms)
 {
     uint64_t end = ticks + ((uint64_t)ms * pit_hz + 999) / 1000;
     while (ticks < end) {
+        /* Yield first so another ready task (e.g. a different VT's shell
+         * while this one sleeps between `ping` packets — see
+         * docs/scheduler.md) gets a turn; if nothing else is ready,
+         * task_yield() is a no-op and the halt below just waits for the
+         * next tick instead of spinning. Callers that can be reached via
+         * int $0x80 (SYS_NANOSLEEP, SYS_PING) must have already
+         * re-enabled interrupts — see arch/i386/syscall.c — or neither the
+         * timer tick nor this yield's eventual return could ever happen. */
+        task_yield();
         arch_halt();
     }
 }

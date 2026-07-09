@@ -46,10 +46,11 @@
  * subclass, Keyboard protocol) with an Interrupt IN endpoint already
  * configured, attaches to it: issues SET_PROTOCOL(Boot) and arms a
  * repeating interrupt transfer that decodes each 8-byte boot report and
- * feeds translated key events into the shared input queue
- * (include/pureunix/input.h) -- the same queue drivers/keyboard.c's PS/2
- * driver feeds, so this keyboard and any PS/2 keyboard produce identical
- * events to everything above them. Returns false (silently, not an error)
+ * feeds translated key events into the active VT's input queue
+ * (include/pureunix/vt.h's vt_input_push()) -- the same call
+ * drivers/keyboard.c's PS/2 driver makes, so this keyboard and any PS/2
+ * keyboard produce identical events to everything above them. Returns
+ * false (silently, not an error)
  * if `dev` isn't a Boot Protocol keyboard at all; logs and returns false if
  * it is one but attachment fails. */
 bool hid_try_attach(const usb_hc_ops_t *hc, const usb_device_t *dev);

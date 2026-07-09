@@ -1,7 +1,8 @@
 #include <pureunix/arch.h>
-#include <pureunix/input.h>
 #include <pureunix/io.h>
 #include <pureunix/keyboard.h>
+#include <pureunix/task.h>
+#include <pureunix/vt.h>
 
 #define KBD_DATA 0x60
 #define KBD_STATUS 0x64
@@ -71,7 +72,15 @@ static void keyboard_irq(interrupt_regs_t *regs)
 
     if (extended) {
         if (!released) {
-            input_push_key(extended_key(sc));
+            int key = extended_key(sc);
+            if (shift_down && (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) {
+                /* Shift+PageUp/PageDown browses the active VT's scrollback
+                 * (see drivers/vga.c's console_t.sb_view) rather than
+                 * producing a normal key event. */
+                vt_scroll_view(vt_active_id(), key == KEY_PAGE_UP ? 10 : -10);
+            } else {
+                vt_input_push(key);
+            }
         }
         extended = false;
         return;
@@ -96,6 +105,16 @@ static void keyboard_irq(interrupt_regs_t *regs)
         caps_lock = !caps_lock;
         return;
     }
+    /* F1..F6 (Set 1 scancodes 0x3B..0x40, never 0xE0-prefixed) + Alt: the
+     * one kernel VT-switching path (include/pureunix/vt.h) -- consumed
+     * here entirely, never forwarded as a key event. A firmware that routes
+     * Fn+Alt+F<n> down to the same Alt+F<n> scancode pair (true of every
+     * PS/2-compatible keyboard controller: Fn is handled below the OS,
+     * there is no separate Fn scancode) needs nothing extra here. */
+    if (alt_down && sc >= 0x3B && sc <= 0x40) {
+        vt_switch((int)(sc - 0x3B));
+        return;
+    }
 
     int ch = shift_down ? shift_map[sc] : normal_map[sc];
     if (ch >= 'a' && ch <= 'z' && caps_lock) {
@@ -111,7 +130,7 @@ static void keyboard_irq(interrupt_regs_t *regs)
         else if (ch == 'c' || ch == 'C') ch = KEY_CTRL_C;
     }
     if (ch) {
-        input_push_key(ch);
+        vt_input_push(ch);
     }
 }
 
@@ -125,18 +144,31 @@ void keyboard_init(void)
 }
 
 /* keyboard_getkey()/keyboard_try_getkey() are kept as the public API for
- * backward compatibility with every existing caller (drivers/tty.c, the
- * built-in shell, etc.) but now just forward to the shared input.c queue --
- * see include/pureunix/input.h -- which is also fed by drivers/hid.c's USB
- * keyboard driver, so callers here see both keyboard types identically. */
+ * backward compatibility with every existing caller (the legacy in-kernel
+ * shell/editor, kernel/users.c's login prompt) but now forward to the
+ * *calling task's own* VT input queue (include/pureunix/vt.h) -- which is
+ * also fed by drivers/hid.c's USB keyboard driver, so callers here see both
+ * keyboard types identically, and a call from a backgrounded VT's task
+ * simply never sees a key (see vt_input_push()'s "active VT only" delivery
+ * rule) instead of stealing one meant for whichever VT is actually on
+ * screen. Callers with no VT of their own (task_current()->vt_id == -1 --
+ * true only before kernel_main() calls vt_init(), see kernel/task.c) fall
+ * back to VT1 (index 0), the boot console. */
+static int caller_vt_id(void)
+{
+    task_t *t = task_current();
+    int vt_id = t ? t->vt_id : -1;
+    return vt_id >= 0 ? vt_id : 0;
+}
+
 int keyboard_try_getkey(void)
 {
-    return input_try_getkey();
+    return vt_input_try_getkey(caller_vt_id());
 }
 
 int keyboard_getkey(void)
 {
-    return input_getkey();
+    return vt_input_getkey(caller_vt_id());
 }
 
 bool keyboard_ctrl_down(void)

@@ -5,9 +5,11 @@
 **Source**: `drivers/vga.c`  
 **Header**: `include/pureunix/vga.h`
 
+> **Multi-console since virtual terminals** (`docs/vt.md`): this driver now owns a small pool of independent `console_t` buffers (cell grid, cursor, ANSI parser state, scrollback), exactly one of which is bound to real hardware at a time (`vga_bind_active()`). Everything below describes one `console_t`'s behavior; `kernel/vt.c` is the layer that decides which one is "VT1" through "VT6" and switches between them — see `docs/vt.md` for that layer.
+
 ### Responsibilities
 
-- Manages the 80×25 text grid, backed by either the legacy VGA text mode framebuffer at `0xB8000`, or — when GRUB/multiboot2 granted a usable linear framebuffer (`drivers/framebuffer.c`) at least as big as the grid — a software text renderer that draws each cell as a glyph bitmap onto that framebuffer instead (`use_fb`; see `vga_init()`). `cell_char[][]`/`cell_attr[][]` hold the grid's true contents either way, so both backends can be driven by the exact same escape-sequence parser below.
+- Manages the text grid, backed by either the legacy VGA text mode framebuffer at `0xB8000`, or — when GRUB/multiboot2 granted a usable linear framebuffer (`drivers/framebuffer.c`) at least as big as the grid — a software text renderer that draws each cell as a glyph bitmap onto that framebuffer instead (`use_fb`; see `vga_init()`). `cell_char[][]`/`cell_attr[][]` (per-console since `docs/vt.md`) hold the grid's true contents either way, so both backends can be driven by the exact same escape-sequence parser below.
 - Interprets a subset of ANSI/VT100 escape sequences for color and cursor control.
 - Synchronizes all output to the serial port (every character written to VGA is also sent to COM1) — since `serial_putc()` is called unconditionally before any escape-sequence interpretation, the serial mirror reflects the raw byte stream regardless of whether this driver's own parsing of it is complete or correct.
 - Provides the hardware cursor position via CRTC registers in text mode, or a software-drawn inverted-cell overlay in framebuffer mode.
@@ -171,7 +173,8 @@ These are used by the VGA driver to keep the terminal emulator in sync with the 
 5. Translates the scancode using either `normal_map` or `shift_map` (128-entry arrays indexed by scancode).
 6. Applies Caps Lock to alphabetic keys.
 7. If Ctrl is held: maps `s`→`KEY_CTRL_S`, `q`→`KEY_CTRL_Q`, `f`→`KEY_CTRL_F`, `c`→`KEY_CTRL_C`.
-8. Pushes the key code to the shared input queue via `input_push_key()` (`drivers/input.c`, `include/pureunix/input.h`) — the same queue a USB HID Boot Protocol keyboard feeds too (`drivers/hid.c`, see `docs/usb.md`), so both keyboard types produce identical events to everything above this layer.
+8. Alt+F1..Alt+F6 (Set-1 scancodes `0x3B`-`0x40` with `alt_down` set) is intercepted here and calls `vt_switch()` (`kernel/vt.c`) directly instead of producing a key event — see `docs/vt.md`. Shift+PageUp/PageDown is intercepted the same way, for scrollback viewing (`vt_scroll_view()`).
+9. Otherwise, pushes the key code to the active virtual terminal's own input queue via `vt_input_push()` (`kernel/vt.c`, `include/pureunix/vt.h`) — the same call a USB HID Boot Protocol keyboard makes too (`drivers/hid.c`, see `docs/usb.md`), so both keyboard types produce identical events to everything above this layer. This replaced a single global queue (`drivers/input.c`, retired) once more than one virtual terminal could exist to route a keystroke to.
 
 Extended scancodes map to:
 
@@ -219,7 +222,7 @@ int  keyboard_try_getkey(void);   // non-blocking: returns KEY_NONE if buffer em
 bool keyboard_ctrl_down(void);    // returns current Ctrl state
 ```
 
-`keyboard_getkey`/`keyboard_try_getkey` are now thin wrappers forwarding to `input_getkey()`/`input_try_getkey()` (`drivers/input.c`) — kept as the public API for backward compatibility with every existing caller (`drivers/tty.c`, the shell), so none of them needed to change when USB HID keyboard support was added. `keyboard_getkey` (via `input_getkey`) loops calling `arch_halt()` until a key is available from *either* keyboard type. This is the primary mechanism by which the kernel waits for user input.
+`keyboard_getkey`/`keyboard_try_getkey` are thin wrappers forwarding to `vt_input_getkey()`/`vt_input_try_getkey()` (`kernel/vt.c`), scoped to the *calling task's own* virtual terminal (`task_t.vt_id` — see `docs/vt.md`) — kept as the public API for backward compatibility with the legacy in-kernel shell/editor and `kernel/users.c`'s login prompt, none of which needed to change when USB HID keyboard support (or, later, virtual terminals) was added. `keyboard_getkey` (via `vt_input_getkey`) calls `task_yield()` then `arch_halt()` in a loop until a key is available on that VT's own queue from *either* keyboard type — the `task_yield()` is what lets a different VT's task keep making progress while this one waits; see `docs/vt.md`'s "Concurrency" section.
 
 ### Limitations
 

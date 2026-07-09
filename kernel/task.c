@@ -104,7 +104,7 @@ int open_file_unref(open_file_t *f)
             rc = vfs_write_file(f->path, f->data ? f->data : (const uint8_t *)"", f->size, 0);
         }
         kfree(f->data);
-    } else { /* FD_KIND_PIPE */
+    } else if (f->kind == FD_KIND_PIPE) {
         pipe_buf_t *p = f->pipe_buf;
         if (p) {
             if (f->pipe_is_write_end) {
@@ -117,6 +117,9 @@ int open_file_unref(open_file_t *f)
             }
         }
     }
+    /* FD_KIND_TTY: a /dev/ttyN descriptor owns no buffer of its own (reads/
+     * writes go straight through to kernel/vt.c) — nothing to flush or
+     * retire on close, matching real UNIX close() on a tty device node. */
     /* f itself is a slot in the static g_open_files[] pool, not a kmalloc'd
      * block — nothing to free; refcount == 0 (already true here) is what
      * marks it available for open_file_alloc() to reuse. */
@@ -134,6 +137,7 @@ void tasking_init(void)
     reserve_stdio(&main_task);
     main_task.uid = 0;
     main_task.gid = 0;
+    main_task.vt_id = -1; /* claimed as VT1 once kernel_main() calls vt_init() */
     strcpy(main_task.cwd, "/");
     current = &main_task;
     task_list_head = &main_task;
@@ -158,6 +162,7 @@ static task_t *task_alloc(const char *name)
      * spawning" rule that exists before a real login/setuid model arrives. */
     task->uid = current ? current->uid : 0;
     task->gid = current ? current->gid : 0;
+    task->vt_id = current ? current->vt_id : -1;
     strcpy(task->cwd, current && current->cwd[0] ? current->cwd : "/");
     task->parent = current;
     task->pd_phys = current ? current->pd_phys : vmm_kernel_directory_phys();

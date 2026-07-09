@@ -110,19 +110,21 @@ Reads from `fd`.
 
 **fd == 0 (stdin), still holding its default console binding** (see "File descriptors are now shared, refcounted open file descriptions" below — `SYS_DUP2` can redirect fd 0 to a real file or pipe, in which case it's read like any other fd instead):
 
-Routed through `tty_read()` (`drivers/tty.c`), which applies whatever `struct termios` is currently in effect for the console — see `SYS_TCGETATTR`/`SYS_TCSETATTR` below. By default (canonical mode, `ICANON|ECHO|ECHOE|ISIG`):
+Routed through `tty_read(vt_id, ...)` (`drivers/tty.c`) against the calling task's own virtual terminal (`task_t.vt_id` — see `docs/vt.md`), which applies whatever `struct termios` is currently in effect *for that VT* — see `SYS_TCGETATTR`/`SYS_TCSETATTR` below. By default (canonical mode, `ICANON|ECHO|ECHOE|ISIG`):
 
-Reads up to `len` bytes from the keyboard into `buf`, echoing each character as it's typed and honoring `VERASE`/`VKILL`/`VEOF` line editing. Blocks until the user presses Enter (a trailing `\n` is included in the returned bytes) or `VEOF` (Ctrl-D) is pressed on an empty line (returns 0). `VINTR` (Ctrl-C) aborts the read and returns `-EINTR`. Extended key codes with no ASCII meaning (arrows, F-keys, ...) are silently dropped.
+Reads up to `len` bytes from the keyboard into `buf`, echoing each character as it's typed and honoring `VERASE`/`VKILL`/`VEOF` line editing. Blocks until the user presses Enter (a trailing `\n` is included in the returned bytes) or `VEOF` (Ctrl-D) is pressed on an empty line (returns 0). `VINTR` (Ctrl-C) aborts the read and returns `-EINTR`. Extended key codes with no ASCII meaning (arrows, F-keys, ...) are silently dropped. If this task's VT isn't the one currently on screen, this simply blocks — keystrokes are only ever delivered to the active VT (`kernel/vt.c`'s `vt_input_push()`) — until it becomes active again.
 
 In raw mode (`ICANON` clear), returns as soon as at least one byte is available (blocking for the first byte, then draining whatever else is already queued without blocking further), without line editing; echo still follows `ECHO`. See `docs/api/drivers.md` for `tty_read()`'s exact contract.
 
-Note for anyone adding future syscalls that can block waiting on the keyboard: `int $0x80` runs with interrupts masked (see `arch/i386/interrupt_stubs.S`'s `isr128`), so a blocking read must call `arch_enable_interrupts()` before waiting — otherwise `keyboard_getkey()`'s `hlt` loop can never be woken by the keyboard IRQ. `tty_read()` does this already.
+Note for anyone adding future syscalls that can block waiting on the keyboard (or on anything else): `int $0x80` runs with interrupts masked (see `arch/i386/interrupt_stubs.S`'s `isr128`), so a blocking read must call `arch_enable_interrupts()` before waiting — otherwise the wait's `hlt` loop can never be woken by the driving IRQ. `tty_read()` does this already. It must also `task_yield()` in that wait loop (not just `hlt`), or every *other* task — including a different VT's shell — is frozen out until this one unblocks some other way; see `docs/vt.md`'s "Concurrency" section and `docs/scheduler.md`'s Limitations.
 
-**fd ≥ 3, or fd 0/1/2 redirected via `SYS_DUP2` (a real open file or pipe)**:
+**fd ≥ 3, or fd 0/1/2 redirected via `SYS_DUP2` (a real open file, pipe, or `/dev/ttyN`)**:
 
 For `FD_KIND_FILE`: reads up to `len` bytes from the current file offset into `buf`. Advances the offset by the number of bytes copied — shared with every other fd referencing the same open file description (see below), not just this one. Returns 0 at EOF (offset ≥ file size). Zero-length reads are valid and return 0. The file content was loaded into a kernel buffer at `SYS_OPEN` time; no disk I/O occurs during `SYS_READ`.
 
 For `FD_KIND_PIPE` (the read end of a `SYS_PIPE`): see `SYS_PIPE` below.
+
+For `FD_KIND_TTY` (an explicit `/dev/ttyN`/`/dev/tty` fd — see `SYS_OPEN` and `docs/vt.md`): same `tty_read()` as fd 0 above, but against *that* fd's own target VT (`open_file_t.tty_vt_id`) regardless of which VT the calling task itself belongs to — reading another VT's tty device node blocks until that VT becomes active, same as real Linux.
 
 **Error returns**:
 
@@ -174,6 +176,8 @@ Both the initial `vfs_stat()`/`vfs_create()` check and the subsequent `vfs_read_
 **Descriptor allocation**: `arch/i386/syscall.c`'s `find_free_fd()` — the lowest available index in `[0, MAX_OPEN_FILES)` (16), real POSIX "lowest available fd" semantics. Indices 3–15 are available whenever unused. Indices 0/1/2 (stdin/stdout/stderr) are available **only if they were explicitly `SYS_CLOSE`'d** (`fd_entry_t.closed_explicitly`, `include/pureunix/task.h`) — never touched, or console-bound again after a `SYS_DUP2`-based redirect-then-restore cycle, are both *not* eligible, even though both also read as `used == true, file == NULL`. This distinction (added alongside the BusyBox port, see `docs/userland.md`'s "Platform Work This Needed") is what makes the standard `close(0); open(path)` idiom (BusyBox's `uniq FILE` and other coreutils' optional-`FILE`-argument handling) actually hand back fd 0, while *not* letting an unrelated `open()` steal a shell's own stdout out from under a redirect it's mid-restore on.
 
 **Limitations**: path pointer is accepted without bounds-checking (no user/kernel memory separation); there is no `O_RDWR` (read-modify-write of an existing file requires read, then a separate truncating write).
+
+**`/dev/tty1`–`/dev/tty6`/`/dev/tty` interception**: before any of the above, `SYS_OPEN` checks `path` against `dev_tty_path_vt()` — if it names a console device, the call returns a `FD_KIND_TTY` descriptor (`open_file_t.tty_vt_id` set to the target VT, 0-based) bound straight to `kernel/vt.c`, bypassing `vfs_*()` entirely (there's no on-disk content; the paths exist on the EXT2 image only so they're real, listable, `stat()`-able entries — see `docs/vt.md`). `SYS_READ`/`SYS_WRITE`/`SYS_IOCTL`/`SYS_TCGETATTR`/`SYS_TCSETATTR` each have a corresponding `FD_KIND_TTY` branch.
 
 ---
 
@@ -438,9 +442,9 @@ The `int` written to `*status` is the child's bare exit code (e.g. a child that 
 
 ## SYS_TCGETATTR (26) / SYS_TCSETATTR (27)
 
-Get/set the console's `struct termios` (`include/pureunix/termios.h`). PureUNIX has exactly one terminal — the VGA console fed by the PS/2 keyboard — so this is process-independent, kernel-global state (`drivers/tty.c`'s `console_termios`) shared by fds 0, 1, and 2, not per-open-file-description state like a real UNIX's tty layer.
+Get/set a `struct termios` (`include/pureunix/termios.h`). Per-VT: each of the 6 virtual terminals (`kernel/vt.c`, `docs/vt.md`) has its own, resolved via the calling task's own `task_t.vt_id` for the fd 0/1/2 default binding, or the target VT of an explicit `FD_KIND_TTY` fd (`/dev/ttyN`) — not process-independent, kernel-global state the way it was before virtual terminals existed.
 
-**Arguments** (both): `EBX`: fd, must be 0, 1, or 2. `ECX`: `struct termios *`. `SYS_TCSETATTR` additionally takes `EDX`: `actions` (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) — all three apply immediately, since there is no pending-output queue or unread-input buffer to drain or flush; the argument only exists so the syscall's shape matches POSIX.
+**Arguments** (both): `EBX`: fd — 0, 1, or 2, or an explicit `FD_KIND_TTY` fd. `ECX`: `struct termios *`. `SYS_TCSETATTR` additionally takes `EDX`: `actions` (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) — all three apply immediately, since there is no pending-output queue or unread-input buffer to drain or flush; the argument only exists so the syscall's shape matches POSIX.
 
 **Returns**: 0 on success, or a negative error.
 
@@ -450,7 +454,7 @@ Get/set the console's `struct termios` (`include/pureunix/termios.h`). PureUNIX 
 |---|---|---|
 | `-EINVAL` | -22 | null `struct termios *`, or (SYS_TCSETATTR only) `actions` is not `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` |
 | `-EBADF` | -9 | fd is outside [0, `MAX_OPEN_FILES`), or fd is ≥ 3 and not an open descriptor |
-| `-ENOTTY` | -25 | fd is ≥ 3 and *is* an open descriptor, just not a terminal (it's a regular file) |
+| `-ENOTTY` | -25 | fd is ≥ 3, *is* an open descriptor, and isn't `FD_KIND_TTY` (it's a regular file or a pipe) |
 
 Changing `ICANON`/`ECHO` takes effect on the very next `SYS_READ` — see `SYS_READ`'s fd == 0 case above.
 
@@ -458,9 +462,16 @@ Changing `ICANON`/`ECHO` takes effect on the very next `SYS_READ` — see `SYS_R
 
 ## SYS_IOCTL (28)
 
-Generic device control. PureUNIX implements exactly one request: `TIOCGWINSZ`, which reports the console's fixed 80x25 VGA text-grid size (`vga_get_size()`, `drivers/vga.c`) — there is no resize event, so this never changes at runtime.
+Generic device control. Four requests (`include/pureunix/ioctl.h`):
 
-**Arguments**: `EBX`: fd, must be 0, 1, or 2. `ECX`: request (`TIOCGWINSZ`, the only supported value). `EDX`: pointer to a `struct winsize` to fill.
+| Request | Value | `EDX` (`argp`) | Effect |
+|---|---|---|---|
+| `TIOCGWINSZ` | 1 | `struct winsize *` (out) | Reports the console text-grid size (`vga_get_size()`, `drivers/vga.c`) — the same physical grid for every VT; no resize event, so this never changes at runtime. |
+| `TIOCSFONT` | 2 | `int *` (in) | Sets the framebuffer console's font scale (`vga_apply_font_scale()`); `-EINVAL` in legacy 80x25 text mode or out of `[FONT_SCALE_MIN, FONT_SCALE_MAX]`. See the `font` command (`user/font.c`). |
+| `VT_GETACTIVE` | 3 | `int *` (out) | Writes the 1-based VT number *this fd's own tty* names (POSIX `ttyname()` semantics — an explicit `/dev/ttyN` fd reports the VT it was opened against; the fd 0/1/2 default binding reports the caller's own `task_t.vt_id`). Used by `tty` (`user/tty.c`). |
+| `VT_ACTIVATE` | 4 | `const int *` (in) | Switches the foreground VT via `vt_switch()` (`kernel/vt.c`) — the exact same call Alt+F`N` makes (`drivers/keyboard.c`/`drivers/hid.c`). Used by `tty N`. See `docs/vt.md`. |
+
+**Arguments**: `EBX`: fd — 0, 1, or 2 (the default console binding), or an explicit `/dev/ttyN`/`/dev/tty` fd (`FD_KIND_TTY`, see `docs/vt.md`). `ECX`: request. `EDX`: request-specific pointer, per the table above.
 
 ```c
 struct winsize {
@@ -475,9 +486,9 @@ struct winsize {
 
 | Code | Value | Condition |
 |---|---|---|
-| `-EINVAL` | -22 | `request` is not `TIOCGWINSZ`, or the `struct winsize *` is null |
+| `-EINVAL` | -22 | `request` isn't one of the four above, a required `argp` is null, or (for `TIOCSFONT`/`VT_ACTIVATE`) the value is out of range |
 | `-EBADF` | -9 | fd is outside [0, `MAX_OPEN_FILES`), or fd is ≥ 3 and not an open descriptor |
-| `-ENOTTY` | -25 | fd is ≥ 3 and *is* an open descriptor, just not a terminal (it's a regular file) |
+| `-ENOTTY` | -25 | fd is ≥ 3, *is* an open descriptor, and isn't `FD_KIND_TTY` (it's a regular file or a pipe) |
 
 There is no dedicated `isatty()` syscall — `pu_isatty(fd)` (`user/libpure.c`) is implemented as `pu_tcgetattr(fd, &t) == 0`, mirroring how real UNIX `isatty()` is conventionally just a `tcgetattr`/`ioctl(TCGETS)` call that succeeds or fails.
 
@@ -510,7 +521,9 @@ Unlike POSIX `getcwd(3)`, there is no `buf == NULL` auto-allocating mode — the
 
 ## SYS_NANOSLEEP (31)
 
-Blocks the calling task for a requested duration, backed directly by the PIT tick counter's busy-halt loop (`arch/i386/pit.c`'s `pit_sleep()`, already used internally since before userspace could reach it) — the same cooperative-scheduling caveat as everything else non-preemptive applies: nothing else runs while this task sleeps.
+Blocks the calling task for a requested duration, backed directly by the PIT tick counter's busy-halt loop (`arch/i386/pit.c`'s `pit_sleep()`, already used internally since before userspace could reach it). `pit_sleep()` calls `task_yield()` before each `arch_halt()`, so another ready task — including a different virtual terminal's shell or a process running on it — gets to run while this one sleeps (see `docs/vt.md`'s "Concurrency" section); a task that never blocks, sleeps, or waits on a child at all still isn't preempted, per `docs/scheduler.md`'s cooperative-scheduling limitations.
+
+Calls `arch_enable_interrupts()` before calling `pit_sleep()`, for the same reason `SYS_PING` does (see below): `int $0x80` enters with interrupts masked, and `pit_sleep()` needs the PIT tick interrupt to actually fire. Without it, a process sleeping between iterations of its own loop (`user/ping.c`'s repeated `sleep()`-free but structurally identical `SYS_PING`-then-loop pattern is the same class of bug) would deadlock the entire kernel solid, not just fail to yield.
 
 **Arguments**: `EBX`: pointer to a `struct pureunix_timespec { long tv_sec; long tv_nsec; }` (`include/pureunix/time.h`) requesting the sleep duration. `ECX`: pointer to a `struct pureunix_timespec` to receive the remaining time if the sleep is interrupted early, or `NULL` to discard it — always written as `{0, 0}` here, since PureUNIX has no signal delivery yet to interrupt a sleep early (see "Unimplemented Syscalls" below); a `SYS_NANOSLEEP` call always runs to completion.
 

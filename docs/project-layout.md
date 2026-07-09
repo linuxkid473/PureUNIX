@@ -24,24 +24,24 @@ PureUNIX/
 │   ├── heap.c          Linked-list kernel heap; 8MB starting past __kernel_end or the last boot module
 │   ├── task.c          Cooperative round-robin scheduler; task_t list; context switch glue
 │   ├── elf.c           ELF32 loader; validates and loads PT_LOAD segments to 0x400000–0x700000
+│   ├── vt.c            Virtual terminal subsystem: 6 VTs, vt_switch(), per-VT termios/keyboard queue (docs/vt.md)
 │   ├── panic.c         panic() — white-on-red VGA + serial + halt
 │   ├── reboot.c        Keyboard controller reset; ACPI/QEMU power off ports
 │   ├── users.c         /etc/passwd + /etc/shadow, first-boot setup wizard, login prompt, adduser/passwd
 │   └── crypto.c        CoreCrypto — SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256 password hashing
 │
 ├── drivers/
-│   ├── vga.c           80×25 VGA text mode; ANSI SGR colors; hardware cursor; serial mirror
-│   ├── keyboard.c      PS/2 IRQ1 driver; scan set 1; 128-entry ring buffer; shift/caps
-│   ├── serial.c        COM1 38400 baud; mirrors VGA output; ANSI cursor sequences
-│   ├── tty.c           Console termios: one shared struct termios; canonical/raw SYS_READ(fd 0)
+│   ├── vga.c           Multi-console text rendering (docs/vt.md); ANSI SGR colors; scrollback; one console bound to real hardware at a time
+│   ├── keyboard.c      PS/2 IRQ1 driver; scan set 1; 128-entry ring buffer; shift/caps/alt; Alt+F<n> VT switch
+│   ├── serial.c        COM1 38400 baud; mirrors the active console's output; ANSI cursor sequences
+│   ├── tty.c           Per-VT termios (docs/vt.md); canonical/raw SYS_READ(fd 0)/`/dev/ttyN`
 │   ├── ata.c           ATA PIO; primary master + slave; LBA28; IDENTIFY; sector read/write
 │   ├── ramdisk.c       disk_device_t over a GRUB boot module's identity-mapped RAM (2 fixed slots)
 │   ├── pci.c           PCI config-space I/O (0xCF8/0xCFC); bus/slot/function enumeration; BAR probing
 │   ├── e1000.c         Intel e1000-family NIC; MMIO BAR mapping; RX/TX descriptor rings; IRQ-driven RX
-│   ├── input.c         Generic keyboard input-event queue shared by PS/2 and USB HID keyboards
 │   ├── xhci.c          xHCI (USB 3.x) host controller: bring-up, rings, port/slot/device enumeration
 │   ├── usb.c           Host-controller-agnostic USB core: descriptors, enumeration, hc ops vtable
-│   └── hid.c           USB HID Boot Protocol keyboard: SET_PROTOCOL, report decode -> input.c
+│   └── hid.c           USB HID Boot Protocol keyboard: SET_PROTOCOL, report decode -> kernel/vt.c
 │
 ├── net/
 │   ├── eth.c           Ethernet II frame layer: ethertype dispatch table, eth_send()/eth_get_mac()
@@ -97,6 +97,8 @@ PureUNIX/
 │   ├── readtest.c      SYS_READ test: reads from VFS-backed fd ≥ 3 via pu_open + pu_read
 │   ├── ext2test.c      EXT2 integration test: 14 cases covering stat, read, seek, indirect blocks
 │   ├── ping.c          Functional: ICMP echo client via pu_ping() (SYS_PING) -- installed as /bin/ping
+│   ├── font.c          Runtime console font scaling via ioctl(TIOCSFONT) -- installed as /bin/font
+│   ├── tty.c           Report/switch the calling shell's virtual terminal via ioctl(VT_GETACTIVE/VT_ACTIVATE) -- installed as /bin/tty; see docs/vt.md
 │   ├── newlib_crt0.S/.c newlib-linked program entry stub — see docs/userland.md's "A real C library (newlib)"
 │   ├── newlib_syscalls.c newlib's POSIX syscall names, translated to int $0x80 — see docs/libc.md
 │   ├── newlib_compat/  Shadow headers for gaps in newlib's own (sys/mman.h, dirent.h, ...) — see docs/libc.md

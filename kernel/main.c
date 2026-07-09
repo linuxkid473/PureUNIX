@@ -28,6 +28,7 @@
 #include <pureunix/users.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
+#include <pureunix/vt.h>
 #include <pureunix/xhci.h>
 
 /* The real login shell for an interactive session — BusyBox ash by default
@@ -83,6 +84,27 @@ static void run_login_shell(void)
     shell_run();
 }
 
+/* Entry point for VT2..NUM_VTS's session tasks (kernel/vt.c, task_create()
+ * below) — VT1 keeps running as main_task itself (see kernel_main()'s tail
+ * loop) rather than getting a seventh task, since kernel_main() already is
+ * a task in tasking_init()'s sense.
+ *
+ * task_alloc() (kernel/task.c) copies vt_id from the *creator* at creation
+ * time, same as uid/gid/cwd — which would make every one of these inherit
+ * main_task's own vt_id (0, VT1) rather than the one it's actually meant
+ * for. Overriding it here, as the very first thing this task does once
+ * it's actually scheduled (task_current() now correctly returns this task,
+ * not its creator), is what makes it — and, via that same inheritance
+ * rule, every process it goes on to launch (its shell, and everything the
+ * shell launches) — belong to its own VT instead. */
+static void vt_session_main(void *arg)
+{
+    task_current()->vt_id = (int)(uint32_t)arg;
+    for (;;) {
+        run_login_shell();
+    }
+}
+
 /* Boot-checkpoint diagnostic: total RAM the PMM is managing plus a full
  * heap_dump() (bounds, free/used/largest-free-block, cumulative allocation
  * failures, integrity verdict) -- see heap_dump()'s comment in
@@ -128,6 +150,11 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     pit_init(100);
     keyboard_init();
     tty_init();
+    vt_init();
+    /* main_task (this function's own task, per tasking_init()) becomes
+     * VT1's session for the rest of boot -- see the tail loop below and
+     * vt_session_main() above for VT2..NUM_VTS. */
+    task_current()->vt_id = 0;
     ata_init();
     pci_scan();
     e1000_init();
@@ -206,9 +233,31 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
         users_first_boot_setup();
     }
 
+    /* One interactive login on VT1 (the only VT actually on screen at boot)
+     * establishes the credentials (task_set_creds(), kernel/users.c) and
+     * env (USER/HOME/SHELL, shell/builtins.c) every VT's session shares --
+     * PureUnix has no multi-user, login-per-tty model yet (see docs/vt.md),
+     * so VT2..NUM_VTS start pre-authenticated as that same identity rather
+     * than each prompting its own login (which would mean NUM_VTS-1
+     * password prompts all fighting over the one physical keyboard before
+     * any of them are even visible). */
+    users_login();
+    boot_checkpoint("after login");
+
+    for (int i = 1; i < NUM_VTS; ++i) {
+        if (!task_create("vt-session", vt_session_main, (void *)(uint32_t)i)) {
+            printf("warning: failed to start VT%d session\n", i + 1);
+        }
+    }
+
     for (;;) {
+        run_login_shell();
+        /* Exiting the login shell logs back out, getty-style -- but only
+         * VT1 (the interactively logged-in one) re-prompts; VT2..NUM_VTS's
+         * vt_session_main() above just starts another pre-authenticated
+         * session on its own VT, matching how it started in the first
+         * place. */
         users_login();
         boot_checkpoint("after login");
-        run_login_shell();
     }
 }

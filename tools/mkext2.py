@@ -54,6 +54,7 @@ FIRST_FREE_BLOCK  = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS  # 133
 S_IFDIR = 0x4000
 S_IFREG = 0x8000
 S_IFLNK = 0xA000
+S_IFCHR = 0x2000
 S_IRWXU = 0o755    # owner rwx
 DEFAULT_DIR_MODE  = S_IFDIR | 0o755
 DEFAULT_FILE_MODE = S_IFREG | 0o644
@@ -576,6 +577,14 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'ping.elf' for p in programs):
         fs.add_symlink(bin_ino, 'ping', 'ping.elf')
 
+    # Same idea for tty (user/tty.c -- ioctl(VT_GETACTIVE)/ioctl(VT_ACTIVATE)
+    # over kernel/vt.c, see docs/vt.md) -- a plain name-without-.elf symlink
+    # so BusyBox ash's own PATH lookup (an exact filename match, unlike the
+    # legacy in-kernel shell's automatic ".elf" fallback) finds it as
+    # "tty"/"tty N", not just "tty.elf".
+    if any(os.path.basename(p).lower() == 'tty.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'tty', 'tty.elf')
+
     # BusyBox multi-call binary: one ELF, dispatched by argv[0]'s basename
     # (applets/applets.c's find_applet_by_name()) — every applet name is
     # just a symlink to the same busybox.elf, exactly like a real BusyBox
@@ -583,6 +592,23 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'busybox.elf' for p in programs):
         for applet in BUSYBOX_APPLETS:
             fs.add_symlink(bin_ino, applet, 'busybox.elf')
+
+
+def add_dev(fs, dir_cache: dict, num_vts: int = 6):
+    """Add /dev/tty1../ttyN and /dev/tty -- see include/pureunix/vt.h and
+    arch/i386/syscall.c's SYS_OPEN /dev/tty interception, which recognizes
+    these paths and binds the resulting fd straight to a kernel/vt.c VT
+    instead of ever reading these inodes' (empty) on-disk content. They
+    exist on disk only so the paths are real, listable, stat()-able
+    filesystem entries (`ls /dev`, `stat /dev/tty2`) -- PureUNIX's VFS has
+    no true device-node/rdev machinery yet (see docs/vt.md), so S_IFCHR
+    here is cosmetic: it makes `ls -l` show the right type letter, nothing
+    more. Kept in sync with kernel/vt.c's NUM_VTS by the caller."""
+    dev_ino = ensure_dir(fs, dir_cache, '/dev')
+    mode = S_IFCHR | 0o666
+    for n in range(1, num_vts + 1):
+        fs.add_file(dev_ino, f'tty{n}', b'', mode=mode)
+    fs.add_file(dev_ino, 'tty', b'', mode=mode)
 
 
 def ensure_dir(fs, dir_cache: dict, path: str) -> int:
@@ -720,6 +746,9 @@ def main(argv):
     # forever.
     fs.add_symlink(ROOT_INO, 'loop_a', 'loop_b')
     fs.add_symlink(ROOT_INO, 'loop_b', 'loop_a')
+
+    # ------------------------------------------------------------------ /dev
+    add_dev(fs, dir_cache)
 
     # ------------------------------------------------------------------ /bin
     if programs:

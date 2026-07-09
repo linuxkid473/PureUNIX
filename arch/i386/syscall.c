@@ -16,6 +16,7 @@
 #include <pureunix/tty.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
+#include <pureunix/vt.h>
 
 /* fcntl() commands — same numbering as newlib's <sys/_default_fcntl.h> (and
  * Linux), so user/newlib_syscalls.c's fcntl() can pass cmd straight through
@@ -78,6 +79,32 @@ static int readdir_collect_cb(const vfs_dirent_t *entry, void *ctx_)
  * its own stdin/stdout/stderr. Anything else is either a bad descriptor or
  * a real open file that just isn't a terminal. Shared by SYS_TCGETATTR and
  * SYS_TCSETATTR. */
+/* /dev/tty1..NUM_VTS name a specific VT directly (1-based, matching the
+ * vtN numbers users see); /dev/tty is the calling task's own controlling
+ * terminal (its task_t.vt_id). Returns the 0-based VT id SYS_OPEN should
+ * bind the new descriptor to, or -1 if `path` isn't a console device path
+ * at all. See include/pureunix/vt.h and SYS_OPEN's FD_KIND_TTY case below. */
+static int dev_tty_path_vt(const char *path)
+{
+    if (strcmp(path, "/dev/tty") == 0) {
+        task_t *t = task_current();
+        int vt_id = t ? t->vt_id : -1;
+        return vt_id >= 0 ? vt_id : 0;
+    }
+    if (strncmp(path, "/dev/tty", 8) != 0) {
+        return -1;
+    }
+    const char *num = path + 8;
+    if (num[0] < '1' || num[0] > '9' || num[1] != '\0') {
+        return -1;
+    }
+    int n = num[0] - '0';
+    if (n < 1 || n > NUM_VTS) {
+        return -1;
+    }
+    return n - 1;
+}
+
 static int tty_fd_check(int fd)
 {
     if (fd < 0 || fd >= MAX_OPEN_FILES) {
@@ -87,10 +114,17 @@ static int tty_fd_check(int fd)
     if (!t || !t->fds[fd].used) {
         return -EBADF;
     }
-    if ((fd == 0 || fd == 1 || fd == 2) && !t->fds[fd].file) {
+    open_file_t *f = t->fds[fd].file;
+    if ((fd == 0 || fd == 1 || fd == 2) && !f) {
         return 0;
     }
-    return t->fds[fd].file ? -ENOTTY : -EBADF;
+    /* An explicit /dev/ttyN fd (SYS_OPEN's /dev/tty interception above) is
+     * a real open_file_t, but a real tty all the same -- unlike a
+     * FD_KIND_FILE/FD_KIND_PIPE fd, which never is. */
+    if (f && f->kind == FD_KIND_TTY) {
+        return 0;
+    }
+    return f ? -ENOTTY : -EBADF;
 }
 
 /* Finds the lowest fd >= start that's free for a *new* allocation
@@ -242,10 +276,13 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         open_file_t *f = t->fds[fd].file;
 
         if ((fd == 1 || fd == 2) && !f) {
-            /* Default console binding — see include/pureunix/task.h. */
-            for (size_t i = 0; i < len; ++i) {
-                putchar(buf[i]);
-            }
+            /* Default console binding — see include/pureunix/task.h. Routed
+             * through the writing task's *own* VT (vt_putc()/vt_write()),
+             * not the physically active one: a backgrounded VT's process
+             * (e.g. `ping` left running on VT2 while VT1 is on screen)
+             * must update only its own saved console buffer, never bleed
+             * output onto whatever VT the user actually has on screen. */
+            vt_write(t->vt_id, buf, len);
             return len;
         }
         if (!f) {
@@ -257,6 +294,13 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_write(f, buf, len);
+        }
+        if (f->kind == FD_KIND_TTY) {
+            /* /dev/ttyN opened explicitly -- see SYS_OPEN's /dev/tty
+             * interception below and SYS_READ's matching FD_KIND_TTY
+             * branch above. */
+            vt_write(f->tty_vt_id, buf, len);
+            return (uint32_t)len;
         }
 
         /* FD_KIND_FILE: writes accumulate in a kmalloc'd in-memory buffer
@@ -305,8 +349,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (fd == 0 && !f) {
             /* stdin: routed through the termios-aware console tty driver —
              * see drivers/tty.c. Behaves like the classic canonical/echoing
-             * console unless SYS_TCSETATTR has put it in raw mode. */
-            return (uint32_t)tty_read(buf, len);
+             * console unless SYS_TCSETATTR has put it in raw mode. Targets
+             * the calling task's own VT (t->vt_id; -1 falls back to VT1,
+             * same as drivers/keyboard.c/drivers/tty.c's own fallback). */
+            return (uint32_t)tty_read(t->vt_id >= 0 ? t->vt_id : 0, buf, len);
         }
         if (!f) {
             return (uint32_t)-EBADF;
@@ -317,6 +363,14 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_read(f, buf, len);
+        }
+        if (f->kind == FD_KIND_TTY) {
+            /* /dev/ttyN opened explicitly (SYS_OPEN's /dev/tty interception
+             * below) -- blocks against that specific VT's own input queue,
+             * regardless of which VT the caller itself belongs to (e.g.
+             * reading /dev/tty3 from a shell on VT1 blocks until VT3 is
+             * actually active, exactly like a real Linux tty device node). */
+            return (uint32_t)tty_read(f->tty_vt_id, buf, len);
         }
 
         /* Zero-length read: valid per POSIX; nothing to copy */
@@ -355,6 +409,29 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         char path_buf[PUREUNIX_MAX_PATH];
         resolve_path(path_buf, raw_path);
         const char *path = path_buf;
+
+        int dev_vt = dev_tty_path_vt(path);
+        if (dev_vt >= 0) {
+            /* /dev/ttyN / /dev/tty: a real fd bound to a specific VT (see
+             * include/pureunix/vt.h), intercepted before any of the normal
+             * VFS-backed open() logic below -- there is no on-disk content
+             * to read, just kernel/vt.c's own console/keyboard-queue state. */
+            task_t *t = task_current();
+            int fd = find_free_fd(t, 0);
+            if (fd < 0) {
+                return (uint32_t)-EMFILE;
+            }
+            open_file_t *f = open_file_alloc(FD_KIND_TTY);
+            if (!f) {
+                return (uint32_t)-ENOSPC;
+            }
+            f->flags = flags;
+            f->tty_vt_id = dev_vt;
+            t->fds[fd].used = true;
+            t->fds[fd].closed_explicitly = false;
+            t->fds[fd].file = f;
+            return (uint32_t)fd;
+        }
 
         bool want_write  = (flags & O_WRONLY) != 0;
         bool want_creat  = (flags & O_CREAT) != 0;
@@ -1105,6 +1182,40 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             }
             return 0;
         }
+        if (request == VT_GETACTIVE) {
+            /* Which VT *this fd* names -- POSIX ttyname() semantics (the
+             * `tty` command, user/tty.c, is a thin wrapper over exactly
+             * this), not "whichever VT happens to be on screen right now"
+             * (that's a separate, genuinely global question a background
+             * VT's own `tty` should NOT answer with someone else's VT
+             * number). An explicit /dev/ttyN fd (FD_KIND_TTY) reports the
+             * VT it was opened against; the fd 0/1/2 default console
+             * binding reports the calling task's own vt_id. */
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            task_t *t = task_current();
+            open_file_t *of = t->fds[fd].file;
+            int vt_id = (of && of->kind == FD_KIND_TTY) ? of->tty_vt_id
+                                                          : (t->vt_id >= 0 ? t->vt_id : 0);
+            *(int *)argp = vt_id + 1;
+            return 0;
+        }
+        if (request == VT_ACTIVATE) {
+            /* The exact same kernel VT-switching path Alt+F<n> uses (see
+             * drivers/keyboard.c/hid.c) — the `tty N` command (user/tty.c)
+             * reaches here via ioctl(fd, VT_ACTIVATE, &n) instead of
+             * duplicating any switching logic of its own. */
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            int n = *(int *)argp;
+            if (n < 1 || n > NUM_VTS) {
+                return (uint32_t)-EINVAL;
+            }
+            vt_switch(n - 1);
+            return 0;
+        }
         return (uint32_t)-EINVAL;
     }
     case SYS_CHDIR: {
@@ -1154,6 +1265,16 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EINVAL;
         }
         uint32_t ms = (uint32_t)req->tv_sec * 1000u + (uint32_t)(req->tv_nsec / 1000000L);
+        /* int $0x80 enters with interrupts masked (isr128, an interrupt
+         * gate) and only re-enables them on its own iret -- pit_sleep()
+         * needs the PIT tick interrupt to actually fire (and, now that it
+         * also task_yield()s, needs other tasks' own interrupt-driven waits
+         * to keep making progress too), so without this it hangs exactly
+         * like SYS_PING's own pit_sleep() call already documents below. A
+         * process sleeping between iterations (e.g. `ping`'s loop) is
+         * exactly the case that must not freeze every other VT while it
+         * waits — see docs/scheduler.md. */
+        arch_enable_interrupts();
         pit_sleep(ms);
         /* No signal delivery exists yet (docs/syscalls.md's "Unimplemented
          * Syscalls"), so a sleep can never be interrupted early — it always

@@ -172,7 +172,7 @@ typedef struct usb_device {
  * usb_hc_ops_t operation, this runs asynchronously and must not block
  * (no control transfers, no waiting on another command/transfer) and
  * should do the minimum work needed (e.g. drivers/hid.c just decodes an
- * 8-byte report and calls input_push_key()) before returning. `buf` is the
+ * 8-byte report and calls vt_input_push()) before returning. `buf` is the
  * same buffer pointer passed to submit_interrupt_transfer() -- valid only
  * for the duration of this call, since the host controller re-arms the
  * same buffer for the next transfer immediately after this returns. */
