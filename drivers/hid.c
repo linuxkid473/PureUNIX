@@ -178,12 +178,17 @@ static void decode_boot_report(hid_keyboard_t *kb)
 static void hid_report_callback(uint32_t slot_id, uint8_t endpoint_address, const void *buf,
                                  uint16_t length, bool success, void *ctx)
 {
-    (void)slot_id;
-    (void)endpoint_address;
     hid_keyboard_t *kb = (hid_keyboard_t *)ctx;
     if (!success || length < HID_BOOT_REPORT_SIZE) {
+        usb_debugf("hid: slot %u: ep %02x: report callback fired but not usable "
+                   "(success=%u length=%u)\n",
+                   slot_id, endpoint_address, success, length);
         return;
     }
+    const uint8_t *bytes = (const uint8_t *)buf;
+    usb_debugf("hid: slot %u: ep %02x: report received: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+               slot_id, endpoint_address, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+               bytes[5], bytes[6], bytes[7]);
     memcpy(kb->report_buf, buf, HID_BOOT_REPORT_SIZE);
     decode_boot_report(kb);
 }

@@ -38,7 +38,7 @@ void serial_write(const char *s)
     }
 }
 
-static void serial_write_uint(unsigned value)
+void serial_write_uint(unsigned value)
 {
     char tmp[12];
     size_t len = 0;

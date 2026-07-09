@@ -178,6 +178,11 @@ struct dirent {
 
 /* ioctl() — must match include/pureunix/ioctl.h. */
 #define TIOCGWINSZ 1
+#define TIOCSFONT  2
+
+/* TIOCSFONT's valid scale range — must match include/pureunix/font.h. */
+#define FONT_SCALE_MIN 1
+#define FONT_SCALE_MAX 4
 
 struct winsize {
     unsigned short ws_row;

@@ -703,3 +703,13 @@ int tcsetattr(int fd, int actions, const struct termios *in)
 {
     return pu_tcsetattr(fd, actions, in);
 }
+
+/* ------------------------------------------------------------------ */
+/* sys/ioctl.h — thin wrapper over libpure's pu_ioctl, so term.c can query  */
+/* the console's real size (TIOCGWINSZ) instead of assuming a fixed 80x25. */
+/* ------------------------------------------------------------------ */
+
+int ioctl(int fd, int request, void *argp)
+{
+    return pu_ioctl(fd, request, argp);
+}

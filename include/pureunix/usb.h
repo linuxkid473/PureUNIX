@@ -1,7 +1,34 @@
 #ifndef PUREUNIX_USB_H
 #define PUREUNIX_USB_H
 
+#include <pureunix/stdio.h>
 #include <pureunix/types.h>
+
+/* Per-transfer/per-report/per-poll USB stack logging: command completions,
+ * transfer events, armed-transfer/doorbell notices, raw HID reports, and
+ * per-port poll spam. This was added wholesale while chasing the real-
+ * hardware xHCI keyboard bring-up bugs (see kernel/vmm.c's
+ * vmm_map_mmio_uc()/vmm_map_framebuffer_wc() comments) and fires on every
+ * interrupt completion and every key press once a keyboard is attached --
+ * useful while debugging that class of bug, unusable as normal boot output.
+ * Off by default; flip to 1 (or -DUSB_DEBUG=1) to get it back on serial.
+ * One-shot boot messages (controller discovery, BIOS handoff, reset, port
+ * enumeration, keyboard-attached, and all error paths) stay as plain
+ * printf() and are unaffected by this flag. */
+#ifndef USB_DEBUG
+#define USB_DEBUG 0
+#endif
+
+#if USB_DEBUG
+#define usb_debugf(...) printf(__VA_ARGS__)
+#else
+/* Not a bare ((void)0): that would leave every argument otherwise-unused
+ * when USB_DEBUG is off, e.g. arm_interrupt_transfer()'s trb_phys in
+ * drivers/xhci.c, which exists only to be logged here. The dead `if (0)`
+ * branch still references each argument (silencing -Wunused-variable) but
+ * is compiled out entirely at -O2, so printf is never actually called. */
+#define usb_debugf(...) do { if (0) { printf(__VA_ARGS__); } } while (0)
+#endif
 
 /* Host-controller-agnostic USB core: standard descriptor layouts (USB 2.0
  * spec chapter 9) and the generic device-enumeration sequence, driven

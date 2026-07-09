@@ -363,11 +363,19 @@ void e1000_init(void)
     /* BAR0 sits far above the 128 MiB identity map (typically ~0xFEBC0000
      * on QEMU), so it needs its own mapping -- identity-mapped 1:1 like
      * everything else in this kernel (see docs/memory.md), just installed
-     * lazily here instead of at vmm_init() time. */
+     * lazily here instead of at vmm_init() time.
+     *
+     * vmm_map_mmio_uc(), not a bare vmm_map_page(): PCI device registers
+     * need strict, paging-level Uncacheable semantics, not whatever the
+     * BIOS's MTRRs happen to say for that range -- see the comment on
+     * vmm_map_framebuffer_wc() in kernel/vmm.c (a neighboring MMIO BAR
+     * sharing a 4MiB PD chunk with the write-combined framebuffer is what
+     * broke the xHCI keyboard on real hardware; this driver uses the exact
+     * same mapping pattern, so it gets the same fix). */
     uint32_t pages = (bar_size + PUREUNIX_PAGE_SIZE - 1) / PUREUNIX_PAGE_SIZE;
     for (uint32_t i = 0; i < pages; ++i) {
         phys_addr_t page = bar0 + i * PUREUNIX_PAGE_SIZE;
-        vmm_map_page(page, page, PAGE_PRESENT | PAGE_WRITE);
+        vmm_map_mmio_uc(page, page, PAGE_WRITE);
     }
     mmio_base = (volatile uint32_t *)(uintptr_t)bar0;
     printf("e1000: MMIO mapped at %p (%u KiB)\n", (void *)(uintptr_t)bar0, bar_size / 1024);

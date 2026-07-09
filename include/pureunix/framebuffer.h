@@ -26,6 +26,15 @@ const fb_info_t *fb_get_info(void);
 void fb_put_pixel(uint32_t x, uint32_t y, uint32_t rgb);
 void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb);
 
+/* Starts mirroring the framebuffer in a kmalloc'd RAM buffer so fb_scroll_up()
+ * below can stop reading VRAM on every scroll -- see the comment on the
+ * `shadow` variable in drivers/framebuffer.c for why that read (not the
+ * write) is what makes scrolling slow on real hardware. Requires kmalloc(),
+ * so must be called after heap_init() (see kernel/main.c); no-op if called
+ * again or if there's no framebuffer. Safe to skip: every function above
+ * just keeps operating directly on VRAM, as they did before this existed. */
+void fb_enable_shadow(void);
+
 /* Shifts the sub-rectangle [x, x+w) x [y, y+h) up by pixel_rows, filling the
  * exposed bottom strip with bg_rgb. Bootloaders may grant a framebuffer
  * larger than requested, so callers scroll only their own region. */

@@ -109,3 +109,29 @@ const uint8_t *font_glyph(char c)
     }
     return glyphs[uc - FONT_FIRST_CHAR];
 }
+
+static int scale = 1;
+
+bool font_set_scale(int new_scale)
+{
+    if (new_scale < FONT_SCALE_MIN || new_scale > FONT_SCALE_MAX) {
+        return false;
+    }
+    scale = new_scale;
+    return true;
+}
+
+int font_get_scale(void)
+{
+    return scale;
+}
+
+int font_cell_w(void)
+{
+    return FONT_CELL_W * scale;
+}
+
+int font_cell_h(void)
+{
+    return FONT_CELL_H * scale;
+}

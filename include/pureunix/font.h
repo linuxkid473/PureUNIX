@@ -9,8 +9,23 @@
 #define FONT_FIRST_CHAR 0x20
 #define FONT_LAST_CHAR 0x7E
 
+#define FONT_SCALE_MIN 1
+#define FONT_SCALE_MAX 4
+
 /* Returns FONT_CELL_H bytes, one per row, MSB = leftmost pixel. Falls back
- * to the blank glyph for characters outside the printable ASCII range. */
+ * to the blank glyph for characters outside the printable ASCII range.
+ * Always the base (1x) bitmap — scaling is applied by the renderer using
+ * font_scale(), not baked into the glyph data. */
 const uint8_t *font_glyph(char c);
+
+/* Runtime nearest-neighbor pixel-replication scale factor applied on top of
+ * the base FONT_CELL_W x FONT_CELL_H glyph (e.g. scale 2 renders each glyph
+ * pixel as a 2x2 block, so a console cell is FONT_CELL_W*2 x FONT_CELL_H*2
+ * pixels). Lets the `font` shell command resize console text without
+ * rebuilding the kernel or re-rasterizing a new bitmap. */
+bool font_set_scale(int scale);
+int font_get_scale(void);
+int font_cell_w(void);
+int font_cell_h(void);
 
 #endif

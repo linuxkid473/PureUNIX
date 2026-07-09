@@ -39,4 +39,10 @@ void vga_set_cursor(size_t row, size_t col);
 void vga_move_cursor_rel(int drow, int dcol);
 void vga_status_bar(const char *left, const char *right);
 
+/* Re-sizes the console grid for a new drivers/font.c scale factor (see
+ * font_set_scale()) and repaints. No-op (returns false) in legacy 80x25 VGA
+ * text mode, which has no adjustable glyph size, or for an out-of-range
+ * scale. See the `font` shell command (shell/builtins.c). */
+bool vga_apply_font_scale(int scale);
+
 #endif

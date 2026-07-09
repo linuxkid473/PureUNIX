@@ -1082,20 +1082,30 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (chk != 0) {
             return (uint32_t)chk;
         }
-        if (request != TIOCGWINSZ) {
-            return (uint32_t)-EINVAL;
+        if (request == TIOCGWINSZ) {
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            struct winsize *ws = (struct winsize *)argp;
+            size_t rows, cols;
+            vga_get_size(&rows, &cols);
+            ws->ws_row = (unsigned short)rows;
+            ws->ws_col = (unsigned short)cols;
+            ws->ws_xpixel = 0;
+            ws->ws_ypixel = 0;
+            return 0;
         }
-        if (!argp) {
-            return (uint32_t)-EINVAL;
+        if (request == TIOCSFONT) {
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            int scale = *(int *)argp;
+            if (!vga_apply_font_scale(scale)) {
+                return (uint32_t)-EINVAL;
+            }
+            return 0;
         }
-        struct winsize *ws = (struct winsize *)argp;
-        size_t rows, cols;
-        vga_get_size(&rows, &cols);
-        ws->ws_row = (unsigned short)rows;
-        ws->ws_col = (unsigned short)cols;
-        ws->ws_xpixel = 0;
-        ws->ws_ypixel = 0;
-        return 0;
+        return (uint32_t)-EINVAL;
     }
     case SYS_CHDIR: {
         const char *path = (const char *)regs->ebx;

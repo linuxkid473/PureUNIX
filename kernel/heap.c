@@ -1,5 +1,6 @@
 #include <pureunix/kernel.h>
 #include <pureunix/memory.h>
+#include <pureunix/stdio.h>
 #include <pureunix/string.h>
 
 #define HEAP_SIZE (8U * 1024U * 1024U)
@@ -16,6 +17,12 @@ typedef struct heap_block {
 static heap_block_t *heap_head;
 static uint8_t *heap_start;
 static uint8_t *heap_end;
+/* Cumulative count of kmalloc() calls that returned NULL because nothing in
+ * the free list was big enough -- see heap_dump()/kernel/main.c's boot
+ * checkpoints. A nonzero count here, even from a request that later
+ * succeeded (e.g. after something else kfree()'d), is a sign the heap ran
+ * closer to its limit than intended. */
+static uint32_t alloc_failures;
 
 static size_t align8(size_t value)
 {
@@ -84,6 +91,7 @@ void *kmalloc(size_t size)
             return b + 1;
         }
     }
+    alloc_failures++;
     return NULL;
 }
 
@@ -160,4 +168,64 @@ size_t heap_free_bytes(void)
 size_t heap_used_bytes(void)
 {
     return (size_t)(heap_end - heap_start) - heap_free_bytes();
+}
+
+size_t heap_largest_free_block(void)
+{
+    size_t largest = 0;
+    for (heap_block_t *b = heap_head; b; b = b->next) {
+        if (b->free && b->size > largest) {
+            largest = b->size;
+        }
+    }
+    return largest;
+}
+
+uint32_t heap_alloc_failures(void)
+{
+    return alloc_failures;
+}
+
+bool heap_check_integrity(void)
+{
+    heap_block_t *prev = NULL;
+    for (heap_block_t *b = heap_head; b; b = b->next) {
+        if (b->magic != HEAP_MAGIC) {
+            printf("heap: CORRUPT: block %p has bad magic %x (expected %x)\n", (void *)b,
+                   (unsigned)b->magic, (unsigned)HEAP_MAGIC);
+            return false;
+        }
+        if ((uint8_t *)b < heap_start || (uint8_t *)(b + 1) + b->size > heap_end) {
+            printf("heap: CORRUPT: block %p size=%u extends outside heap range [%p, %p)\n",
+                   (void *)b, (unsigned)b->size, (void *)heap_start, (void *)heap_end);
+            return false;
+        }
+        if (b->prev != prev) {
+            printf("heap: CORRUPT: block %p prev=%p, walk expected %p\n", (void *)b,
+                   (void *)b->prev, (void *)prev);
+            return false;
+        }
+        /* This allocator never leaves a gap between adjacent blocks (see
+         * split_block()/coalesce() above), so block N's declared size must
+         * land exactly on block N+1's header -- if it doesn't, either a
+         * write ran past the end of this block's payload into the next
+         * block's header, or `size` itself got clobbered. */
+        if (b->next && (uint8_t *)b->next != (uint8_t *)(b + 1) + b->size) {
+            printf("heap: CORRUPT: block %p size=%u -- next=%p, expected %p\n", (void *)b,
+                   (unsigned)b->size, (void *)b->next, (void *)((uint8_t *)(b + 1) + b->size));
+            return false;
+        }
+        prev = b;
+    }
+    return true;
+}
+
+void heap_dump(const char *label)
+{
+    bool ok = heap_check_integrity();
+    printf("heap[%s]: start=%p end=%p total=%u used=%u free=%u largest_free=%u "
+           "alloc_failures=%u integrity=%s\n",
+           label, (void *)heap_start, (void *)heap_end, (unsigned)(heap_end - heap_start),
+           (unsigned)heap_used_bytes(), (unsigned)heap_free_bytes(),
+           (unsigned)heap_largest_free_block(), (unsigned)alloc_failures, ok ? "OK" : "CORRUPT");
 }

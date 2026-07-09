@@ -40,7 +40,7 @@ KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 	$(patsubst %.S,$(BUILD)/%.o,$(KERNEL_AS_SRCS))
 DEPS := $(KERNEL_OBJS:.o=.d)
 
-USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test systest termiostest ping
+USER_PROGRAMS := hello calc viewer editor sh opentest readtest ext2test systest termiostest ping font
 USER_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
 # Neatvi (vi/ex clone, vendored under user/vi/ — see user/vi/vi.h's header

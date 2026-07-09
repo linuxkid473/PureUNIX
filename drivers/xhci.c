@@ -104,15 +104,26 @@ static inline void xhci_barrier(void)
 /* Maps every page the BAR spans into the kernel's identity-mapped address
  * space (virt == phys), exactly like e1000_init()'s BAR0 mapping
  * (drivers/e1000.c) -- xHCI's BAR is typically a 64-bit BAR sitting far
- * above the low 128MiB identity map, but vmm_map_page() lazily allocates
+ * above the low 128MiB identity map, but vmm_map_mmio_uc() lazily allocates
  * whatever page tables it needs for any address, so the same call works
- * here unchanged. */
+ * here unchanged.
+ *
+ * vmm_map_mmio_uc(), not a bare vmm_map_page(): this BAR must be strictly
+ * Uncacheable at the paging level, not merely "whatever the BIOS's MTRRs
+ * happen to say" -- see the comment on vmm_map_framebuffer_wc() in
+ * kernel/vmm.c for the real-hardware bug that came from this xHCI mapping
+ * relying on that ambiguity (a neighboring framebuffer PD chunk had already
+ * been blanket-marked Write-Combining, and this BAR happened to land in the
+ * unused padding of that same chunk). doorbell/ERDP writes below
+ * (xhci_barrier() and friends) assume true hardware UC ordering with only a
+ * compiler barrier -- that assumption is only valid because this call now
+ * forces it explicitly instead of hoping for it. */
 static volatile uint8_t *map_bar(phys_addr_t base, uint32_t size)
 {
     uint32_t pages = (size + PUREUNIX_PAGE_SIZE - 1) / PUREUNIX_PAGE_SIZE;
     for (uint32_t i = 0; i < pages; ++i) {
         phys_addr_t page = base + i * PUREUNIX_PAGE_SIZE;
-        vmm_map_page(page, page, PAGE_PRESENT | PAGE_WRITE);
+        vmm_map_mmio_uc(page, page, PAGE_WRITE);
     }
     return (volatile uint8_t *)(uintptr_t)base;
 }
@@ -475,6 +486,10 @@ static void process_event_ring(void)
             phys_addr_t completed_trb = trb->parameter_lo;
             uint32_t completion_code = XHCI_TRB_GET_COMPLETION_CODE(trb->status);
             uint32_t slot_id = XHCI_TRB_GET_SLOT_ID(trb->control);
+            usb_debugf("xhci: event: Command Completion trb=%p code=%u slot=%u%s\n",
+                       (void *)(uintptr_t)completed_trb, completion_code, slot_id,
+                       (pending_cmd.trb_phys != 0 && completed_trb == pending_cmd.trb_phys)
+                           ? "" : " (unmatched -- no command currently waiting on this TRB)");
             if (pending_cmd.trb_phys != 0 && completed_trb == pending_cmd.trb_phys) {
                 pending_cmd.completion_code = completion_code;
                 pending_cmd.slot_id = slot_id;
@@ -485,6 +500,8 @@ static void process_event_ring(void)
             uint32_t completion_code = XHCI_TRB_GET_COMPLETION_CODE(trb->status);
             uint32_t event_slot_id = XHCI_TRB_GET_SLOT_ID(trb->control);
             uint32_t event_dci = XHCI_TRB_GET_ENDPOINT_ID(trb->control);
+            usb_debugf("xhci: event: Transfer Event trb=%p code=%u slot=%u dci=%u\n",
+                       (void *)(uintptr_t)completed_trb, completion_code, event_slot_id, event_dci);
 
             /* Routed by (slot, DCI) rather than by TRB-pointer match --
              * unlike pending_cmd/pending_xfer's single outstanding
@@ -495,6 +512,9 @@ static void process_event_ring(void)
                 && interrupt_listeners[event_slot_id][event_dci].active) {
                 xhci_interrupt_listener_t *listener = &interrupt_listeners[event_slot_id][event_dci];
                 bool success = (completion_code == XHCI_COMPLETION_SUCCESS);
+                usb_debugf("xhci: event: routed to interrupt listener slot=%u dci=%u ep=%02x "
+                           "success=%u\n",
+                           event_slot_id, event_dci, listener->endpoint_address, success);
                 /* A Boot Protocol report is always exactly the endpoint's
                  * full max packet size -- this driver doesn't attempt to
                  * compute the exact transferred byte count from the
@@ -506,12 +526,24 @@ static void process_event_ring(void)
             } else if (pending_xfer.trb_phys != 0 && completed_trb == pending_xfer.trb_phys) {
                 pending_xfer.completion_code = completion_code;
                 pending_xfer.done = true;
+            } else {
+                usb_debugf("xhci: event: Transfer Event unmatched (no pending control transfer, "
+                           "no active interrupt listener for slot=%u dci=%u) -- event dropped\n",
+                           event_slot_id, event_dci);
             }
+        } else if (type == XHCI_TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
+            /* Diagnostic only -- xhci_enumerate() still does its own polled
+             * PORTSC scan rather than consuming this event to drive
+             * enumeration (see that function's comment), but logging it
+             * unconditionally here proves whether the controller is telling
+             * us about a connect at all, which the polled scan alone cannot
+             * distinguish from "never saw one." Port number is bits 31:24
+             * of the Port Status Change Event's Parameter field. */
+            uint32_t port = (trb->parameter_lo >> 24) & 0xFFU;
+            usb_debugf("xhci: event: Port Status Change port=%u\n", port);
+        } else {
+            usb_debugf("xhci: event: unrecognized TRB type=%u -- ignored\n", type);
         }
-        /* Port Status Change Event is handled by directly polling PORTSC
-         * from xhci_enumerate() rather than consumed here -- see its
-         * comment for why a polled port scan is sufficient for this
-         * driver's boot-time-only enumeration model. */
 
         uint32_t next = ring->dequeue_index + 1;
         if (next == XHCI_TRBS_PER_PAGE) {
@@ -1037,6 +1069,11 @@ static bool configure_endpoint(uint32_t slot_id, uint8_t endpoint_address,
                                         * exactly max_packet_size bytes every time. */
     xhci_barrier();
 
+    usb_debugf("xhci: slot %u: endpoint context built: dci=%u ep=%02x max_packet=%u "
+               "b_interval=%u xhci_interval=%u ring_phys=%p\n",
+               slot_id, dci, endpoint_address, max_packet_size, interval, xhci_interval,
+               (void *)(uintptr_t)st->rings[dci].phys);
+
     submit_command(st->input_ctx_phys, 0, 0,
                    XHCI_TRB_TYPE(XHCI_TRB_TYPE_CONFIGURE_ENDPOINT_CMD) | (slot_id << 24));
     uint32_t completion_code = 0;
@@ -1063,10 +1100,14 @@ static void arm_interrupt_transfer(uint32_t slot_id, uint32_t dci)
     xhci_ring_t *ring = &ctrl.slots[slot_id].rings[dci];
     phys_addr_t buf_phys = (phys_addr_t)(uintptr_t)listener->buf;
 
-    ring_enqueue(ring, buf_phys, 0, listener->length,
+    phys_addr_t trb_phys = ring_enqueue(ring, buf_phys, 0, listener->length,
                  XHCI_TRB_TYPE(XHCI_TRB_TYPE_NORMAL) | XHCI_TRB_CONTROL_ISP
                      | XHCI_TRB_CONTROL_IOC);
     xhci_barrier();
+    usb_debugf("xhci: interrupt transfer armed: slot=%u dci=%u ep=%02x trb=%p buf=%p len=%u "
+               "-- ringing doorbell\n",
+               slot_id, dci, listener->endpoint_address, (void *)(uintptr_t)trb_phys,
+               listener->buf, listener->length);
     doorbell_ring((uint8_t)slot_id, (uint8_t)dci);
 }
 
@@ -1195,10 +1236,43 @@ void xhci_enumerate(void)
         }
         uint32_t offset = XHCI_OP_PORTSC_BASE + (port - 1) * XHCI_OP_PORTSC_STRIDE;
         uint32_t portsc = op_read32(offset);
+        usb_debugf("xhci: port %u: initial scan portsc=%x (ccs=%u ped=%u pls=%u speed=%u)\n", port,
+                   portsc, (portsc & XHCI_PORTSC_CCS) != 0, (portsc & XHCI_PORTSC_PED) != 0,
+                   (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK,
+                   XHCI_PORTSC_GET_SPEED(portsc));
+
+        /* CCS reflects real analog device-presence detection, not something
+         * this driver's own reset/bring-up sequence should need to wait on
+         * -- but unlike QEMU's virtual device (CCS=1 from the very first
+         * read after HCRST, with no signal-integrity/link-training delay to
+         * model), real silicon's port state can take a short, variable time
+         * to settle after this controller's own HCRST tears down and
+         * retrains the downstream link, especially right after a BIOS/SMM
+         * Legacy Support handoff was actively using the same port. A single
+         * unconditional read here would misclassify that transient window
+         * as "nothing plugged in" with no way to tell the two apart from the
+         * boot log alone -- so retry (bounded) before giving up, logging
+         * every raw portsc value seen along the way. */
         if (!(portsc & XHCI_PORTSC_CCS)) {
-            continue;
+            bool became_connected = false;
+            for (uint32_t i = 0; i < XHCI_POLL_ITERATIONS; ++i) {
+                portsc = op_read32(offset);
+                if (portsc & XHCI_PORTSC_CCS) {
+                    became_connected = true;
+                    break;
+                }
+            }
+            if (!became_connected) {
+                usb_debugf("xhci: port %u: no device connected after settle-wait (final "
+                           "portsc=%x) -- skipping\n",
+                           port, portsc);
+                continue;
+            }
+            printf("xhci: port %u: device connected after settle-wait (portsc=%x)\n", port,
+                   portsc);
+        } else {
+            printf("xhci: port %u: device connected (portsc=%x)\n", port, portsc);
         }
-        printf("xhci: port %u: device connected (portsc=%x)\n", port, portsc);
 
         if (!reset_port(port)) {
             continue;

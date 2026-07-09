@@ -8,7 +8,31 @@
 #define PAGE_PRESENT    0x001U
 #define PAGE_WRITE      0x002U
 #define PAGE_USER       0x004U
+#define PAGE_PWT        0x008U
+#define PAGE_PCD        0x010U
 #define PAGE_GLOBAL     0x100U
+/* PAT bit (bit 7) of a 4KiB PTE. Combined with PCD/PWT (bits 4/3), it picks
+ * one of the 8 PAT-MSR entries as (PAT:PCD:PWT):
+ *
+ *   PAT=0,PCD=1,PWT=1 -> entry 3 -> UC (strong, MTRR-independent) — the
+ *                        hardware reset default, never reprogrammed by this
+ *                        kernel. vmm_map_mmio_uc() below selects this for
+ *                        every PCI device register mapping (xHCI, e1000,
+ *                        ...): real hardware needs those writes to reach the
+ *                        device immediately and in issue order, which only
+ *                        true UC guarantees.
+ *   PAT=1,PCD=0,PWT=0 -> entry 4 -> Write-Combining, reprogrammed from its
+ *                        Write-Back reset default by enable_pat_write_
+ *                        combining() in vmm.c. vmm_map_framebuffer_wc() below
+ *                        selects this, and only this, for the linear
+ *                        framebuffer's own bytes — see the comment above
+ *                        enable_pat_write_combining() for why WC is not
+ *                        optional for framebuffer performance on real
+ *                        hardware, and the comment above vmm_map_mmio_uc()
+ *                        for why it must never leak onto a PCI BAR.
+ *
+ * Entries 0-2 and 5-7 are never touched and keep their reset semantics. */
+#define PAGE_PAT        0x080U
 
 /*
  * Virtual address space layout

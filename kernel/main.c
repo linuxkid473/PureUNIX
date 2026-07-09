@@ -83,6 +83,21 @@ static void run_login_shell(void)
     shell_run();
 }
 
+/* Boot-checkpoint diagnostic: total RAM the PMM is managing plus a full
+ * heap_dump() (bounds, free/used/largest-free-block, cumulative allocation
+ * failures, integrity verdict) -- see heap_dump()'s comment in
+ * include/pureunix/memory.h. Sprinkled after the boot stages most likely to
+ * eat a disproportionate chunk of the fixed-size kernel heap (framebuffer
+ * shadow, xHCI DMA setup, filesystem mount, login) so a later "kcalloc
+ * failed" can be traced back to which stage actually exhausted it, instead
+ * of wrongly being read as "this machine is out of RAM." */
+static void boot_checkpoint(const char *label)
+{
+    printf("checkpoint[%s]: ram_total=%u KiB ram_free=%u KiB\n", label, pmm_total_memory_kb(),
+           pmm_free_memory_kb());
+    heap_dump(label);
+}
+
 void kernel_main(uint32_t magic, uint32_t mbi_addr)
 {
     serial_init();
@@ -102,6 +117,12 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     printf("Boot magic=%x mbi=%p\n", magic, (void *)mbi_addr);
 
     heap_init();
+    /* Allocates its own PMM frames, not heap memory (see fb_enable_shadow()'s
+     * comment in drivers/framebuffer.c for why, and for why it must run
+     * before anything else in this function ever calls pmm_alloc_frame()) --
+     * needed for the console to scroll at a usable speed on real hardware. */
+    fb_enable_shadow();
+    boot_checkpoint("after framebuffer init");
     tasking_init();
     syscall_init();
     pit_init(100);
@@ -111,6 +132,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     pci_scan();
     e1000_init();
     xhci_init();
+    boot_checkpoint("after xhci init");
     eth_init();
     arp_init();
     ip_init();
@@ -160,6 +182,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
             printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
         }
     }
+    boot_checkpoint("after filesystem mount");
 
     arch_enable_interrupts();
 
@@ -185,6 +208,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 
     for (;;) {
         users_login();
+        boot_checkpoint("after login");
         run_login_shell();
     }
 }

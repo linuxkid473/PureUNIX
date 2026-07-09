@@ -22,10 +22,94 @@ static void enable_paging(void)
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
 }
 
-/* Identity-maps the 4MiB-aligned PD entries spanning [base, base+size), using
- * one of the spare fb_tables. Used for MMIO regions (e.g. the linear
- * framebuffer) that live far outside the low RAM identity map above. */
-static void map_extra_region(phys_addr_t base, uint32_t size)
+static bool cpu_has_pat(void)
+{
+    uint32_t edx;
+    __asm__ volatile("cpuid" : "=d"(edx) : "a"(1) : "ebx", "ecx");
+    return (edx & (1U << 16)) != 0;
+}
+
+static uint64_t rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void wrmsr(uint32_t msr, uint64_t value)
+{
+    uint32_t lo = (uint32_t)value;
+    uint32_t hi = (uint32_t)(value >> 32);
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+/* On real hardware the GPU's linear-framebuffer BAR is MMIO: firmware leaves
+ * its MTRR type at the reset default, Uncacheable, and every store to it is
+ * therefore a separate, strongly-ordered, blocking round trip over the PCI
+ * bus (tens to hundreds of cycles each, with zero write buffering). This
+ * driver writes one pixel — sometimes one *byte* — at a time (see
+ * fb_put_pixel()/draw_cell_ex() in drivers/{framebuffer,vga}.c), so a single
+ * redrawn line can be tens of thousands of individually-serialized bus
+ * transactions: that's what makes real hardware visibly paint scrollback
+ * line by line. QEMU's virtual display is backed by an ordinary host RAM
+ * region, not a real PCI bus, so it never reproduces this penalty — which is
+ * exactly why the slowdown was invisible in every QEMU test run.
+ *
+ * The fix is Write-Combining (WC): reprogram PAT entry 4 (index
+ * PAT=1,PCD=0,PWT=0 — left otherwise untouched so entries 0-3 keep their
+ * PCD/PWT-only reset semantics for anything else that relies on them) from
+ * its default Write-Back to WC, then tag the framebuffer's own PTEs with the
+ * PAT bit (see PAGE_PAT, applied in vmm_map_framebuffer_wc() below) to
+ * select that entry. WC lets the CPU buffer consecutive stores into full
+ * cache-line bursts instead of draining each one individually — the same
+ * technique every mainstream OS's framebuffer console (Linux vesafb/fbcon,
+ * Windows, etc.) uses for exactly this reason. No-op (leaves the default,
+ * safe write-back-but-actually-UC-via-MTRR behavior) on CPUs without PAT. */
+static bool pat_wc_available;
+
+static void enable_pat_write_combining(void)
+{
+    if (!cpu_has_pat()) {
+        pat_wc_available = false;
+        return;
+    }
+    uint64_t pat = rdmsr(0x277);
+    pat = (pat & ~(0xFFULL << 32)) | (0x01ULL << 32);
+    wrmsr(0x277, pat);
+    pat_wc_available = true;
+}
+
+/* Identity-maps [base, base+size) 1:1, page by page, as Write-Combining,
+ * using the spare fb_tables reserved above — the only place in this kernel
+ * that ever sets PAGE_PAT. See vmm_map_framebuffer_wc()'s declaration in
+ * include/pureunix/memory.h for the full contract and vmm_map_mmio_uc()
+ * below for the counterpart PCI MMIO devices must use instead.
+ *
+ * This used to blanket-fill every page across the whole 4MiB-aligned PD
+ * chunk(s) covering [base, base+size) with PRESENT+WC, not just the pages
+ * that were actually framebuffer bytes — harmless when the chunk padding
+ * really was unused address space, but real hardware routinely packs PCI
+ * BARs back-to-back in the same MMIO aperture, so on the HP Pavilion the
+ * xHCI controller's BAR landed inside that same 4MiB-aligned padding region
+ * right after the framebuffer. That pre-marked every xHCI register page
+ * PRESENT+WC before xhci_init() ever ran. vmm_map_page() (the old map_bar()
+ * path) does fully overwrite a PTE it's given, so xHCI's own explicitly-
+ * mapped pages ended up back at PRESENT+WRITE — but with no PAGE_PCD/PWT
+ * either, that left them at PAT entry 0 (Write-Back by the PAT reset
+ * default), relying entirely on the BIOS's MTRR for that range to still
+ * force UC. On QEMU's software-emulated MMIO that ambiguity is invisible
+ * (every access "just works" regardless of memory type); on real silicon it
+ * was enough to break the strict, immediately-visible, in-order writes the
+ * doorbell register and ERDP (event ring dequeue pointer) need — see
+ * xhci_barrier() in drivers/xhci.c, which only issues a *compiler* barrier
+ * because it assumes true hardware UC, not whatever a race with this
+ * function's blanket fill happened to leave behind.
+ *
+ * Now only pages inside [base, base+size) are ever marked PRESENT here, so
+ * a neighboring BAR in the same 4MiB chunk is left completely unmapped
+ * until its own driver calls vmm_map_mmio_uc() for it, with no window where
+ * it could inherit WC (or anything else) from this function. */
+void vmm_map_framebuffer_wc(phys_addr_t base, uint32_t size)
 {
     if (size == 0) {
         return;
@@ -33,18 +117,37 @@ static void map_extra_region(phys_addr_t base, uint32_t size)
     uint32_t region_base = ALIGN_DOWN(base, 0x400000U);
     uint32_t region_end = ALIGN_UP(base + size, 0x400000U);
     uint32_t next_table = 0;
+    uint32_t extra_flags = pat_wc_available ? PAGE_PAT : 0;
 
-    for (uint32_t addr = region_base; addr < region_end && next_table < FB_EXTRA_TABLES;
-         addr += 0x400000U, ++next_table) {
-        uint32_t pd_i = addr >> 22;
+    for (uint32_t chunk = region_base; chunk < region_end && next_table < FB_EXTRA_TABLES;
+         chunk += 0x400000U, ++next_table) {
+        uint32_t pd_i = chunk >> 22;
         if (page_directory[pd_i] & PAGE_PRESENT) {
             continue;
         }
         for (uint32_t i = 0; i < 1024; ++i) {
-            fb_tables[next_table][i] = (addr + i * PUREUNIX_PAGE_SIZE) | PAGE_PRESENT | PAGE_WRITE;
+            uint32_t page_addr = chunk + i * PUREUNIX_PAGE_SIZE;
+            if (page_addr >= base && page_addr < base + size) {
+                fb_tables[next_table][i] = page_addr | PAGE_PRESENT | PAGE_WRITE | extra_flags;
+            }
         }
         page_directory[pd_i] = (uint32_t)fb_tables[next_table] | PAGE_PRESENT | PAGE_WRITE;
     }
+}
+
+/* Counterpart to vmm_map_framebuffer_wc() above, for PCI device MMIO
+ * registers (xHCI, e1000, ...): forces PAGE_PCD|PAGE_PWT (PAGE_PAT left
+ * clear), selecting PAT entry 3 — UC, and per the Intel SDM's PAT/MTRR
+ * combining rules that specific selection is UC regardless of what the
+ * BIOS's MTRRs say for that physical range, unlike relying on MTRRs alone.
+ * Every PCI BAR mapping in this kernel (drivers/xhci.c's map_bar(),
+ * drivers/e1000.c's equivalent) must go through this, never a bare
+ * vmm_map_page(), specifically so none of them can ever end up sharing a
+ * memory type with vmm_map_framebuffer_wc()'s WC mapping by accident again. */
+void vmm_map_mmio_uc(virt_addr_t virt, phys_addr_t phys, uint32_t flags)
+{
+    uint32_t safe_flags = (flags & (PAGE_WRITE | PAGE_USER)) | PAGE_PCD | PAGE_PWT;
+    vmm_map_page(virt, phys, safe_flags);
 }
 
 void vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size)
@@ -52,6 +155,8 @@ void vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size)
     memset(page_directory, 0, sizeof(page_directory));
     memset(identity_tables, 0, sizeof(identity_tables));
     memset(fb_tables, 0, sizeof(fb_tables));
+
+    enable_pat_write_combining();
 
     for (uint32_t table = 0; table < ARRAY_SIZE(identity_tables); ++table) {
         for (uint32_t i = 0; i < 1024; ++i) {
@@ -61,7 +166,7 @@ void vmm_init(phys_addr_t identity_extra_base, uint32_t identity_extra_size)
         page_directory[table] = (uint32_t)identity_tables[table] | PAGE_PRESENT | PAGE_WRITE;
     }
 
-    map_extra_region(identity_extra_base, identity_extra_size);
+    vmm_map_framebuffer_wc(identity_extra_base, identity_extra_size);
 
     load_page_directory(page_directory);
     enable_paging();

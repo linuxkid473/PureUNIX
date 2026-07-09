@@ -78,6 +78,26 @@ static void reserve_region(uint32_t base, uint32_t length)
     }
 }
 
+/* E820/Multiboot region type numbers (both multiboot1's mmap_addr entries
+ * and multiboot2's tag-6 entries share this numbering -- it's really just
+ * E820 passed through). 1 is the only type mark_region_free() ever acts on;
+ * everything else stays reserved (left set in the bitmap from pmm_init()'s
+ * initial "assume nothing is free" fill) -- printed here purely as boot
+ * diagnostics, to let the raw map be diffed between machines (see the "PMM
+ * mmap" lines below) when free memory unexpectedly comes up short on real
+ * hardware but not under QEMU. */
+static const char *mmap_type_name(uint32_t type)
+{
+    switch (type) {
+    case 1: return "usable";
+    case 2: return "reserved";
+    case 3: return "acpi-reclaimable";
+    case 4: return "acpi-nvs";
+    case 5: return "bad";
+    default: return "unknown";
+    }
+}
+
 static void parse_multiboot2(uint32_t mbi_addr)
 {
     uint32_t total_size = *(uint32_t *)mbi_addr;
@@ -95,6 +115,17 @@ static void parse_multiboot2(uint32_t mbi_addr)
             uint8_t *mmap_end = (uint8_t *)tag + tag->size;
             while (entry < mmap_end) {
                 multiboot2_mmap_entry_t *e = (multiboot2_mmap_entry_t *)entry;
+                /* base_addr/length are 64-bit (a real machine's map can
+                 * describe memory above 4 GiB, e.g. behind the PCI hole on a
+                 * 16 GiB HP Pavilion) but this printf() only understands
+                 * 32-bit varargs -- split each into hi:lo halves explicitly
+                 * rather than truncating-cast to a pointer, which would
+                 * silently print a wrapped, wrong address for any region at
+                 * or above 4 GiB. */
+                printf("PMM mmap: base=%x_%08x len_kib=%x_%08x type=%u (%s)\n",
+                       (uint32_t)(e->base_addr >> 32), (uint32_t)e->base_addr,
+                       (uint32_t)((e->length / 1024) >> 32), (uint32_t)(e->length / 1024),
+                       e->type, mmap_type_name(e->type));
                 if (e->type == 1) {
                     mark_region_free(e->base_addr, e->length);
                 }
@@ -122,6 +153,10 @@ static void parse_multiboot1(uint32_t mbi_addr)
         uint32_t end = mbi->mmap_addr + mbi->mmap_length;
         while (cursor < end) {
             multiboot1_mmap_t *entry = (multiboot1_mmap_t *)cursor;
+            printf("PMM mmap: base=%x_%08x len_kib=%x_%08x type=%u (%s)\n",
+                   (uint32_t)(entry->base_addr >> 32), (uint32_t)entry->base_addr,
+                   (uint32_t)((entry->length / 1024) >> 32), (uint32_t)(entry->length / 1024),
+                   entry->type, mmap_type_name(entry->type));
             if (entry->type == 1) {
                 mark_region_free(entry->base_addr, entry->length);
             }
@@ -190,6 +225,58 @@ phys_addr_t pmm_alloc_frame(void)
 void pmm_free_frame(phys_addr_t frame)
 {
     frame_clear(frame / FRAME_SIZE);
+}
+
+/* Finds and reserves `count` physically contiguous free frames in a single
+ * left-to-right scan of the bitmap, or reserves nothing and returns 0 if no
+ * run that long exists. This is NOT "call pmm_alloc_frame() `count` times
+ * and hope" -- that was tried for the framebuffer shadow (see
+ * fb_enable_shadow() in drivers/framebuffer.c) and is pathologically slow
+ * for a large `count`: pmm_alloc_frame() itself is an O(total_frames) scan
+ * from frame 0 every single call, so allocating N frames one at a time costs
+ * O(N * total_frames) once the free run of interest sits past a large
+ * already-reserved region (exactly the real layout here: the kernel image,
+ * GRUB's fat.img/root.img modules, and the kernel heap are all reserved
+ * back-to-back near the bottom of the low 128MiB, so any allocator scanning
+ * from frame 0 has to step over all of them, every call, to reach the
+ * actual multi-megabyte free region beyond the heap) -- observed in testing
+ * as a multi-second stall building a ~1000-frame run under QEMU's software
+ * CPU emulation, potentially much worse for a larger request. This does the
+ * same "track the current run, reset on any used bit" logic but as one
+ * O(total_frames) pass regardless of `count`, then commits (frame_set()s)
+ * the run only once it's confirmed long enough, so a failed search never
+ * leaves a partial reservation to unwind. */
+phys_addr_t pmm_alloc_contiguous(uint32_t count)
+{
+    if (count == 0 || count > total_frames) {
+        return 0;
+    }
+    uint32_t run_start = 0;
+    uint32_t run_len = 0;
+    for (uint32_t i = 0; i < total_frames; ++i) {
+        if (frame_test(i)) {
+            run_len = 0;
+            continue;
+        }
+        if (run_len == 0) {
+            run_start = i;
+        }
+        if (++run_len == count) {
+            for (uint32_t f = run_start; f < run_start + count; ++f) {
+                frame_set(f);
+            }
+            return (phys_addr_t)run_start * FRAME_SIZE;
+        }
+    }
+    return 0;
+}
+
+void pmm_free_contiguous(phys_addr_t base, uint32_t count)
+{
+    uint32_t start = base / FRAME_SIZE;
+    for (uint32_t f = start; f < start + count; ++f) {
+        frame_clear(f);
+    }
 }
 
 uint32_t pmm_total_memory_kb(void)

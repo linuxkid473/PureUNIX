@@ -163,6 +163,11 @@ bool usb_enumerate_port(const usb_hc_ops_t *hc, uint32_t port, uint32_t speed, u
         return false;
     }
 
+    usb_debugf("usb: slot %u: configuration descriptor header: wTotalLength=%u "
+               "bNumInterfaces=%u bConfigurationValue=%u\n",
+               slot_id, cfg_header.wTotalLength, cfg_header.bNumInterfaces,
+               cfg_header.bConfigurationValue);
+
     uint16_t total_length = cfg_header.wTotalLength;
     if (total_length < sizeof(cfg_header)) {
         total_length = sizeof(cfg_header);

@@ -12,9 +12,11 @@
  *     than a real tty driver — the console defaults to canonical+echo (see
  *     tty.c's termios_set_defaults()), which both garbles the screen (every
  *     keystroke echoed back) and delivers input a line at a time instead of
- *     a key at a time, so this is not optional. No ioctl(TIOCGWINSZ)/$LINES/
- *     $COLUMNS sizing though — rows/cols are hardcoded to PureUNIX's actual
- *     VGA text mode, 25x80.
+ *     a key at a time, so this is not optional. term_init() also queries
+ *     ioctl(TIOCGWINSZ) for the real console size (drivers/vga.c now sizes
+ *     the grid to the detected framebuffer resolution and current font
+ *     scale rather than a fixed 80x25 — see vga_get_size()), falling back
+ *     to 25x80 only if the ioctl somehow fails.
  *   - term_suspend: no-op (no job control / SIGSTOP on PureUNIX).
  *   - term_read: no poll() before the blocking read — PureUNIX's read(0,...)
  *     already blocks (via keyboard_getkey()'s arch_halt() loop) until a key
@@ -25,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include "vi.h"
 
 static struct sbuf *term_sbuf;	/* output buffer if not NULL */
@@ -44,8 +47,14 @@ void term_init(void)
 	tcsetattr(0, TCSANOW, &raw);
 
 	term_sbuf = sbuf_make();
-	rows = 25;
-	cols = 80;
+	struct winsize ws;
+	if (ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+		rows = ws.ws_row;
+		cols = ws.ws_col;
+	} else {
+		rows = 25;
+		cols = 80;
+	}
 	term_str("\33[m");
 	term_window(win_top, win_rows > 0 ? win_rows : rows);
 }

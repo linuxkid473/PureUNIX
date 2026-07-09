@@ -8,7 +8,14 @@
 
 #define VIM_MAX_LINES 512
 #define VIM_MAX_COL   256
-#define VIM_ROWS      23   /* content rows 0-22; row 23 = status; row 24 = cmdline */
+
+/* Content rows/cols, recomputed from the real console size (vga_get_size())
+ * each time editor_open() runs — the last two screen rows are always the
+ * status bar and command line, so content gets whatever's left. Falls back
+ * to the historical 23x80 if the console ever reports something smaller
+ * than that (shouldn't happen: legacy VGA text mode is always >= 25x80). */
+static size_t vim_rows = 23;
+static size_t vim_cols = 80;
 
 typedef enum { NORMAL, INSERT, COMMAND, VSEARCH } vim_mode_t;
 
@@ -67,9 +74,9 @@ static void clamp_cx(void)
 static void do_scroll(void)
 {
     if (V.cy < V.row_off)              V.row_off = V.cy;
-    if (V.cy >= V.row_off + VIM_ROWS)  V.row_off = V.cy - VIM_ROWS + 1;
+    if (V.cy >= V.row_off + vim_rows)  V.row_off = V.cy - vim_rows + 1;
     if (V.cx < V.col_off)              V.col_off = V.cx;
-    if (V.cx >= V.col_off + 80)        V.col_off = V.cx - 79;
+    if (V.cx >= V.col_off + vim_cols)  V.col_off = V.cx - vim_cols + 1;
 }
 
 /* ── undo ─────────────────────────────────────────────────────────────────── */
@@ -174,13 +181,13 @@ static void draw(void)
 {
     do_scroll();
 
-    for (size_t sr = 0; sr < VIM_ROWS; ++sr) {
+    for (size_t sr = 0; sr < vim_rows; ++sr) {
         vga_goto(sr, 0);
         size_t fr = V.row_off + sr;
         if (fr < V.nlines) {
             const char *line = V.buf[fr];
             size_t len = strlen(line);
-            for (size_t c = V.col_off; c < len && c < V.col_off + 80; ++c)
+            for (size_t c = V.col_off; c < len && c < V.col_off + vim_cols; ++c)
                 putchar(line[c]);
         } else {
             putchar('~');
@@ -188,22 +195,22 @@ static void draw(void)
         vga_erase_eol();
     }
 
-    /* status bar — row 23, inverted colors */
+    /* status bar — row vim_rows, inverted colors */
     uint8_t saved_color = vga_color();
     vga_set_color(VGA_BLACK, VGA_LIGHT_GREY);
-    vga_goto(23, 0);
+    vga_goto(vim_rows, 0);
     const char *mstr = (V.mode == INSERT) ? " -- INSERT -- " : " -- NORMAL -- ";
     printf("%s %s%s", mstr, V.path[0] ? V.path : "[No Name]", V.dirty ? " [+]" : "");
     vga_erase_eol();
     char rc[16];
     snprintf(rc, sizeof(rc), " %u:%-3u", (uint32_t)(V.cy + 1), (uint32_t)(V.cx + 1));
     size_t rlen = strlen(rc);
-    vga_goto(23, 80 - rlen);
+    vga_goto(vim_rows, rlen < vim_cols ? vim_cols - rlen : 0);
     printf("%s", rc);
     vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
 
-    /* command / message line — row 24 */
-    vga_goto(24, 0);
+    /* command / message line — row vim_rows + 1 */
+    vga_goto(vim_rows + 1, 0);
     if (V.mode == COMMAND) {
         putchar(':');
         printf("%.*s", (int)V.cmdlen, V.cmd);
@@ -218,12 +225,12 @@ static void draw(void)
     vga_erase_eol();
 
     /* place hardware cursor */
-    if (V.mode == COMMAND)       vga_set_cursor(24, V.cmdlen + 1);
-    else if (V.mode == VSEARCH)  vga_set_cursor(24, V.search_len + 1);
+    if (V.mode == COMMAND)       vga_set_cursor(vim_rows + 1, V.cmdlen + 1);
+    else if (V.mode == VSEARCH)  vga_set_cursor(vim_rows + 1, V.search_len + 1);
     else {
         size_t crow = V.cy - V.row_off;
         size_t ccol = V.cx - V.col_off;
-        if (crow < VIM_ROWS) vga_set_cursor(crow, ccol);
+        if (crow < vim_rows) vga_set_cursor(crow, ccol);
     }
     (void)saved_color;
 }
@@ -535,9 +542,9 @@ static void handle_normal(int key)
     case 'g':
         V.pending = 'g'; break;
     case KEY_PAGE_UP:
-        V.cy = (V.cy >= VIM_ROWS) ? V.cy - VIM_ROWS : 0; clamp_cx(); break;
+        V.cy = (V.cy >= vim_rows) ? V.cy - vim_rows : 0; clamp_cx(); break;
     case KEY_PAGE_DOWN:
-        V.cy = (V.cy + VIM_ROWS < V.nlines) ? V.cy + VIM_ROWS : V.nlines - 1;
+        V.cy = (V.cy + vim_rows < V.nlines) ? V.cy + vim_rows : V.nlines - 1;
         clamp_cx(); break;
     /* ── enter insert mode ───────────────────── */
     case 'i':
@@ -754,6 +761,11 @@ static void handle_search(int key)
 
 int editor_open(const char *path)
 {
+    size_t scr_rows, scr_cols;
+    vga_get_size(&scr_rows, &scr_cols);
+    vim_rows = (scr_rows > 2) ? scr_rows - 2 : 1;
+    vim_cols = scr_cols;
+
     memset(&V, 0, sizeof(V));
     V.running = true;
     V.mode    = NORMAL;
