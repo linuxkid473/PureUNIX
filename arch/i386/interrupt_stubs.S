@@ -98,6 +98,18 @@ isr129:
     pushl $129
     jmp isr_common_stub
 
+/* Kernel-internal sigreturn trap (int $0x82) — the signal trampoline's
+ * own exit path (arch/i386/signal.c), same "not a public syscall number"
+ * precedent as int $0x81 above. Nothing outside the trampoline itself is
+ * ever expected to execute this. */
+.global isr130
+.type isr130, @function
+isr130:
+    cli
+    pushl $0
+    pushl $130
+    jmp isr_common_stub
+
 .extern isr_dispatch
 .global isr_common_stub
 .type isr_common_stub, @function

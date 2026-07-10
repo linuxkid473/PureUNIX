@@ -1,0 +1,20 @@
+# BusyBox ash job control (M9): background jobs, `jobs`, `kill %N`, and
+# `wait` — enabled by CONFIG_ASH_JOB_CONTROL=y. See project memory
+# project_process_management_subsystem.md for what this covers and the
+# one known-broken scenario it deliberately does NOT test yet: Ctrl+Z
+# stopping a real (forked+exec'd, not builtin) *foreground* job hangs the
+# shell — root cause not yet found. Backgrounding, `jobs`, and `kill %N`
+# on a background job are all confirmed working and covered here.
+WAIT #\s*$
+TYPE /bin/sleep 100 &
+SLEEP 1
+TYPE jobs
+WAIT Running
+TYPE kill %1
+SLEEP 1
+TYPE jobs
+WAIT Terminated
+TYPE wait
+SLEEP 1
+TYPE echo job-control-done
+WAIT job-control-done

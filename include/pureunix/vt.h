@@ -63,4 +63,29 @@ int vt_set_termios(int vt_id, const struct termios *in);
  * this on whichever VT is active. */
 void vt_scroll_view(int vt_id, int delta);
 
+/* Makes the calling task a session leader (sid == pgid == its own pid —
+ * see include/pureunix/task.h) and VT vt_id's controlling-terminal owner,
+ * with itself as that VT's initial foreground process group. Called
+ * exactly once per VT, by whichever task first claims it as its own
+ * (kernel/main.c: main_task for VT1, each vt_session_main() task for
+ * VT2..NUM_VTS) — see docs/process-management.md. */
+void vt_claim_session(int vt_id);
+
+/* VT vt_id's current foreground process group — the only pgid whose
+ * member processes may receive a keyboard-generated signal (Ctrl+C/
+ * Ctrl+Z/Ctrl+\) from that VT, and (once M6 wires it up) the only pgid
+ * whose processes may read from that VT without SIGTTIN-equivalent
+ * blocking. 0 (never a valid pgid) if vt_id is out of range or hasn't
+ * been claimed by a session yet. */
+int vt_get_fg_pgid(int vt_id);
+/* Sets VT vt_id's foreground process group — the kernel-side backing for
+ * tcsetpgrp() (TIOCSPGRP via SYS_IOCTL, arch/i386/syscall.c), which is
+ * how job-control-aware shells (BusyBox ash) move a job into the
+ * foreground. No membership/session validation is performed here (kept
+ * intentionally simple — see docs/process-management.md's scope notes);
+ * arch/i386/syscall.c's ioctl handler is what applies POSIX's caller-
+ * must-share-this-controlling-terminal's-session check before calling
+ * this. */
+void vt_set_fg_pgid(int vt_id, int pgid);
+
 #endif

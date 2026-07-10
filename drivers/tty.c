@@ -53,8 +53,14 @@ int tty_set_termios(const struct termios *in)
 /* Maps a vt_input_getkey() result to the byte a tty consumer should see.
  * KEY_BACKSPACE (scancode-level, value 8) is normalized to the currently
  * configured VERASE byte so the erase check below has one thing to compare
- * against regardless of which key produced it. Extended keys with no ASCII
- * meaning (arrows, F-keys, ...) return -1 and are dropped. */
+ * against regardless of which key produced it. KEY_CTRL_C/Z/BACKSLASH
+ * (drivers/keyboard.c/hid.c — sentinel values above 128, not raw bytes)
+ * are normalized to their real ASCII control-code bytes (0x03/0x1A/0x1C)
+ * so the VINTR/VSUSP/VQUIT comparisons below (and a caller's own
+ * tcsetattr()-configured control characters, if changed from the default)
+ * see the same byte a real PS/2 controller sending those raw control
+ * codes directly would have produced. Extended keys with no ASCII meaning
+ * (arrows, F-keys, ...) return -1 and are dropped. */
 static int key_to_byte(const struct termios *t, int key)
 {
     if (key == KEY_ENTER) {
@@ -62,6 +68,15 @@ static int key_to_byte(const struct termios *t, int key)
     }
     if (key == KEY_BACKSPACE) {
         return (int)t->c_cc[VERASE];
+    }
+    if (key == KEY_CTRL_C) {
+        return 0x03;
+    }
+    if (key == KEY_CTRL_Z) {
+        return 0x1A;
+    }
+    if (key == KEY_CTRL_BACKSLASH) {
+        return 0x1C;
     }
     if (key >= 1 && key < 128) {
         return key;
@@ -99,19 +114,26 @@ static int next_byte(int vt_id, const struct termios *t)
     return b;
 }
 
+/* Ctrl+C/Ctrl+Z/Ctrl+\ are handled entirely below this layer now —
+ * kernel/vt.c's vt_input_push() intercepts them the instant they arrive
+ * from the keyboard IRQ (when ISIG is set) and delivers a real signal
+ * straight to the VT's foreground process group, without ever queuing
+ * them as ordinary input data. This is deliberately *not* done here in
+ * the read() path: a foreground job that never calls read() at all (a
+ * CPU-bound loop, `sleep`, ...) still has to be interruptible by
+ * Ctrl+C, exactly like a real Unix line discipline — coupling signal
+ * generation to a specific read() call would silently fail to interrupt
+ * exactly those cases. So by the time next_byte() below ever returns a
+ * value, it is never one of those three control characters (with ISIG
+ * on); see docs/process-management.md. */
 static int tty_read_canonical(int vt_id, const struct termios *t, char *buf, size_t len)
 {
-    bool sig = (t->c_lflag & ISIG) != 0;
     char line[TTY_LINE_MAX];
     size_t n = 0;
 
     for (;;) {
         int c = next_byte(vt_id, t);
 
-        if (sig && c == t->c_cc[VINTR]) {
-            vt_write(vt_id, "^C\n", 3);
-            return -EINTR;
-        }
         if (c == t->c_cc[VEOF]) {
             if (n == 0) {
                 return 0;
@@ -154,19 +176,16 @@ static int tty_read_canonical(int vt_id, const struct termios *t, char *buf, siz
 
 static int tty_read_raw(int vt_id, const struct termios *t, char *buf, size_t len)
 {
-    bool sig = (t->c_lflag & ISIG) != 0;
     size_t i = 0;
 
     /* VMIN == 0 with nothing buffered would mean "return immediately, even
      * with zero bytes" (POSIX's polling raw-read mode) — PureUNIX's keyboard
      * queue has no non-blocking peek suitable for that, so every raw read
      * here blocks for the first byte regardless of VMIN/VTIME, then drains
-     * whatever else is already queued without blocking again. */
+     * whatever else is already queued without blocking again. Ctrl+C/
+     * Ctrl+Z/Ctrl+\ are handled below this layer (kernel/vt.c's
+     * vt_input_push()) — see tty_read_canonical()'s header comment. */
     int first = next_byte(vt_id, t);
-    if (sig && first == t->c_cc[VINTR]) {
-        vt_write(vt_id, "^C\n", 3);
-        return -EINTR;
-    }
     buf[i++] = (char)first;
     echo_char(vt_id, t, (char)first);
 
@@ -178,10 +197,6 @@ static int tty_read_raw(int vt_id, const struct termios *t, char *buf, size_t le
         int c = key_to_byte(t, key);
         if (c < 0) {
             continue;
-        }
-        if (sig && c == t->c_cc[VINTR]) {
-            vt_write(vt_id, "^C\n", 3);
-            break;
         }
         buf[i++] = (char)c;
         echo_char(vt_id, t, (char)c);

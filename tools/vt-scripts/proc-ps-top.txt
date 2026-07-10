@@ -1,0 +1,16 @@
+# /proc content + BusyBox ps/top against the real process table.
+# ps -ef/aux need CONFIG_DESKTOP; top needs newlib's %llu scanf support
+# (see tools/build-newlib.sh's --enable-newlib-io-long-long) to parse
+# /proc/stat's jiffy counters — both are regression-prone toolchain/config
+# flags, not code, so this script is the only thing that would catch a
+# silent revert. See project memory project_process_management_subsystem.md.
+WAIT #\s*$
+TYPE cat /proc/stat
+WAIT cpu
+TYPE ps -ef
+WAIT PID
+TYPE ps aux
+WAIT PID
+TYPE top -n 1 -b
+WAIT PID
+SLEEP 1

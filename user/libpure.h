@@ -40,6 +40,15 @@
 #define SYS_DUP2      38
 #define SYS_KILL      39
 #define SYS_PING      43
+#define SYS_SETPGID   45
+#define SYS_GETPGID   46
+#define SYS_SETSID    47
+#define SYS_GETSID    48
+#define SYS_SIGACTION   49
+#define SYS_SIGPROCMASK 50
+#define SYS_SIGPENDING  51
+#define SYS_SETPRIORITY 52
+#define SYS_GETPRIORITY 53
 
 /* open() flags — must match include/pureunix/fcntl.h */
 #define O_RDONLY 0
@@ -86,6 +95,17 @@
  * target, see that file's own header comment). */
 #define SIGKILL 9
 #define SIGTERM 15
+#define SIGSTOP 17
+#define SIGTSTP 18
+#define SIGCONT 19
+#define SIGCHLD 20
+#define SIGUSR1 30
+
+#define PU_SIG_DFL 0u
+#define PU_SIG_IGN 1u
+#define PU_SIG_SETMASK 0
+#define PU_SIG_BLOCK   1
+#define PU_SIG_UNBLOCK 2
 
 /* Must match PUREUNIX_MAX_NAME in include/pureunix/config.h. */
 #define PU_MAX_NAME 64
@@ -314,6 +334,58 @@ int    pu_wait(int pid, int *status);
  * callable mid-program (e.g. by a fork()ed child that must not fall
  * through to the parent's remaining code). */
 void   pu_exit(int code) __attribute__((noreturn));
+
+/* -------------------------------------------------------------------- */
+/* Process groups and sessions                                           */
+/* -------------------------------------------------------------------- */
+
+/* pid == 0 means the caller; pgid == 0 means "use pid's own id" (make it
+ * a new group leader). Returns 0, or -ESRCH/-EPERM — see
+ * docs/process-management.md. */
+int    pu_setpgid(int pid, int pgid);
+/* pid == 0 means the caller. Returns the pgid, or -ESRCH. */
+int    pu_getpgid(int pid);
+/* Creates a new session/process group, both equal to the caller's own id.
+ * Fails with -EPERM if the caller is already a process group leader.
+ * Returns the new session id, or the negative errno. */
+int    pu_setsid(void);
+/* pid == 0 means the caller. Returns the sid, or -ESRCH. */
+int    pu_getsid(int pid);
+
+/* -------------------------------------------------------------------- */
+/* Signals                                                                */
+/* -------------------------------------------------------------------- */
+
+/* Mirrors include/pureunix/signal.h's pu_sigaction_t exactly (kernel and
+ * userland are built with different toolchains/sysroots, so this can't
+ * just be #include'd — same story as every SYS_* number above). */
+typedef struct pu_sigaction {
+    uint32_t handler; /* PU_SIG_DFL, PU_SIG_IGN, or a real handler(int) function pointer */
+} pu_sigaction_t;
+
+/* Installs `act` as sig's disposition (unless NULL, a pure query), and
+ * if `old` is non-NULL, reports what it was before. Returns 0, or a
+ * negative errno (-EINVAL for sig <= 0/out of range/SIGKILL/SIGSTOP). */
+int    pu_sigaction(int sig, const pu_sigaction_t *act, pu_sigaction_t *old);
+/* how: PU_SIG_BLOCK/PU_SIG_UNBLOCK/PU_SIG_SETMASK (SYS_SIGPROCMASK). set
+ * may be NULL (pure query); old may be NULL. */
+int    pu_sigprocmask(int how, const uint32_t *set, uint32_t *old);
+/* Returns the caller's current pending-signals bitmask. */
+uint32_t pu_sigpending(void);
+
+/* -------------------------------------------------------------------- */
+/* nice/renice                                                           */
+/* -------------------------------------------------------------------- */
+
+/* pid == 0 means the caller. Clamps nice to [-20, 19]. Returns 0, or
+ * -ESRCH. */
+int    pu_setpriority(int pid, int nice);
+/* pid == 0 means the caller. Writes the nice value to *out_nice and
+ * returns 0, or returns -ESRCH — an out-param rather than returning the
+ * value directly, since a valid nice value can itself be negative and
+ * collide with a negative-errno convention (see
+ * include/pureunix/task.h's task_getpriority()). */
+int    pu_getpriority(int pid, int *out_nice);
 
 /* -------------------------------------------------------------------- */
 /* Terminal control                                                       */

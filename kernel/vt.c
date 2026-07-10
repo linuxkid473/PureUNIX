@@ -7,11 +7,14 @@
  * queues, and vt_switch() as the single kernel-wide VT-switching path. */
 #include <pureunix/arch.h>
 #include <pureunix/errno.h>
+#include <pureunix/keyboard.h>
+#include <pureunix/signal.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
 #include <pureunix/termios.h>
 #include <pureunix/vga.h>
 #include <pureunix/vt.h>
+#include <pureunix/wait.h>
 
 #define VT_KEYBUF_SIZE 128
 
@@ -21,6 +24,15 @@ typedef struct vt {
     int keybuf[VT_KEYBUF_SIZE];
     volatile uint32_t key_head;
     volatile uint32_t key_tail;
+    /* Woken by vt_input_push() whenever this VT gains a queued key —
+     * see vt_input_getkey() below. */
+    wait_queue_t key_wq;
+    /* Controlling-terminal/job-control state — see vt_claim_session()/
+     * vt_get_fg_pgid()/vt_set_fg_pgid() and include/pureunix/vt.h. 0
+     * until a session claims this VT (0 is never a valid pgid/sid, real
+     * ids start at 1). */
+    int owner_sid;
+    int fg_pgid;
 } vt_t;
 
 static vt_t vts[NUM_VTS];
@@ -85,16 +97,82 @@ int vt_active_id(void)
     return active_vt;
 }
 
+/* Same KEY_* -> raw-control-byte normalization drivers/tty.c's
+ * key_to_byte() does for VERASE/VKILL/data characters, but only the
+ * three bytes vt_input_push() itself needs to recognize as *signal*
+ * characters — real canonical-mode line editing (echo, backspace,
+ * line-kill) stays entirely in drivers/tty.c, which is a strictly higher
+ * layer than this one and must never be called from here. */
+static int key_to_signal_byte(int key)
+{
+    if (key == KEY_CTRL_C) {
+        return 0x03;
+    }
+    if (key == KEY_CTRL_Z) {
+        return 0x1A;
+    }
+    if (key == KEY_CTRL_BACKSLASH) {
+        return 0x1C;
+    }
+    if (key >= 1 && key < 128) {
+        return key;
+    }
+    return -1;
+}
+
 void vt_input_push(int key)
 {
     if (key == 0 /* KEY_NONE */) {
         return;
     }
     vt_t *vt = &vts[active_vt];
+
+    /* Real terminal line-discipline behavior: Ctrl+C/Ctrl+Z/Ctrl+\ are
+     * consumed by the tty layer itself the instant they arrive — not
+     * queued as ordinary input data — and reach the *foreground process
+     * group*, regardless of whether anything is even blocked in read()
+     * right now (a job that never reads stdin at all, e.g. a CPU-bound
+     * loop or `sleep`, must still be interruptible by Ctrl+C — coupling
+     * this to drivers/tty.c's read() path the way an earlier version of
+     * this code did would silently fail to interrupt exactly those
+     * cases). Respects ISIG exactly like drivers/tty.c's own read()
+     * paths do for the same three characters when ISIG is off (e.g. a
+     * raw-mode full-screen program that wants Ctrl+C delivered as
+     * literal data) — see docs/process-management.md. */
+    if (vt->termios.c_lflag & ISIG) {
+        int b = key_to_signal_byte(key);
+        int sig = 0;
+        const char *echo = NULL;
+        if (b == (int)vt->termios.c_cc[VINTR]) {
+            sig = SIGINT;
+            echo = "^C\n";
+        } else if (b == (int)vt->termios.c_cc[VQUIT]) {
+            sig = SIGQUIT;
+            echo = "^\\\n";
+        } else if (b == (int)vt->termios.c_cc[VSUSP]) {
+            sig = SIGTSTP;
+            echo = "^Z\n";
+        }
+        if (sig) {
+            /* Called from the keyboard IRQ handler (drivers/keyboard.c /
+             * drivers/hid.c) — vt_write()/signal_send_pgrp() only ever
+             * touch console buffers / task_t fields directly, never block
+             * or context-switch, so this is IRQ-context safe the same way
+             * wait_queue_wake_one() below is. */
+            vt_write(active_vt, echo, strlen(echo));
+            signal_send_pgrp((uint32_t)vt->fg_pgid, sig);
+            return;
+        }
+    }
+
     uint32_t next = (vt->key_head + 1) % VT_KEYBUF_SIZE;
     if (next != vt->key_tail) {
         vt->keybuf[vt->key_head] = key;
         vt->key_head = next;
+        /* wait_queue_wake_one() is IRQ-context safe (see
+         * include/pureunix/wait.h). One key pushed can only satisfy one
+         * blocked reader's "queue is non-empty" predicate at a time. */
+        wait_queue_wake_one(&vt->key_wq);
     }
 }
 
@@ -112,19 +190,28 @@ int vt_input_try_getkey(int vt_id)
     return key;
 }
 
+typedef struct {
+    int vt_id;
+    int key;
+} getkey_ctx_t;
+
+static bool getkey_ready(void *ctx)
+{
+    getkey_ctx_t *c = (getkey_ctx_t *)ctx;
+    return (c->key = vt_input_try_getkey(c->vt_id)) != 0;
+}
+
 int vt_input_getkey(int vt_id)
 {
-    int key;
-    while ((key = vt_input_try_getkey(vt_id)) == 0) {
-        /* Yield first so any other ready task (a background VT's shell, a
-         * long-lived process on it, ...) gets a turn while this task has
-         * nothing useful to do; if nothing else is ready, task_yield() is a
-         * no-op and the halt below just waits for the next interrupt (timer
-         * tick, keyboard, ...) instead of spinning. */
-        task_yield();
-        arch_halt();
+    if (!valid_vt(vt_id)) {
+        return 0;
     }
-    return key;
+    getkey_ctx_t ctx = { .vt_id = vt_id, .key = 0 };
+    /* See include/pureunix/wait.h's invariant: callers reached through
+     * int $0x80 must already have called arch_enable_interrupts() —
+     * drivers/tty.c's tty_read() does, before ever reaching here. */
+    wait_queue_sleep(&vts[vt_id].key_wq, getkey_ready, &ctx);
+    return ctx.key;
 }
 
 void vt_putc(int vt_id, char c)
@@ -180,4 +267,35 @@ void vt_scroll_view(int vt_id, int delta)
         return;
     }
     vga_console_scroll_view(vts[vt_id].console, delta);
+}
+
+void vt_claim_session(int vt_id)
+{
+    if (!valid_vt(vt_id)) {
+        return;
+    }
+    task_t *t = task_current();
+    if (!t) {
+        return;
+    }
+    t->sid = t->id;
+    t->pgid = t->id;
+    vts[vt_id].owner_sid = (int)t->id;
+    vts[vt_id].fg_pgid = (int)t->id;
+}
+
+int vt_get_fg_pgid(int vt_id)
+{
+    if (!valid_vt(vt_id)) {
+        return 0;
+    }
+    return vts[vt_id].fg_pgid;
+}
+
+void vt_set_fg_pgid(int vt_id, int pgid)
+{
+    if (!valid_vt(vt_id)) {
+        return;
+    }
+    vts[vt_id].fg_pgid = pgid;
 }

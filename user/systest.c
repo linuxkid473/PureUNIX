@@ -382,7 +382,15 @@ static void test_kill(void)
        killing. Self always exists. */
     check_eq("kill(self, 0) succeeds (self always exists)", 0, pu_kill(pu_getpid(), 0));
     check_eq("kill(a definitely-nonexistent pid, 0) returns ESRCH", ESRCH, pu_kill(999999, 0));
-    check_eq("kill(pid <= 0, anything) returns EINVAL (no process-group support)", EINVAL, pu_kill(0, SIGTERM));
+    /* kill(pid<=0, ...): process-group targeting, added in M5 — see
+       test_signals() below for the real delivery test (safely isolated
+       from this test binary's own shared process group). A null signal
+       (sig==0) is always safe to test directly here: it never actually
+       delivers anything, only probes group existence. */
+    check_eq("kill(0, 0) succeeds (own group always exists, null signal probes only)",
+             0, pu_kill(0, 0));
+    check_eq("kill(a definitely-nonexistent pgid, anything) returns ESRCH",
+             ESRCH, pu_kill(-999999, SIGTERM));
 
     /* A forked child that just spins yielding (so the parent actually gets
        scheduled to kill it) — killed from the parent with SIGTERM, then
@@ -406,6 +414,341 @@ static void test_kill(void)
              -SIGTERM, status);
 
     check_eq("kill() on an already-reaped pid returns ESRCH", ESRCH, pu_kill(pid, SIGTERM));
+}
+
+/* ==================================================================== */
+
+static void test_pgrp_session(void)
+{
+    section("Process groups and sessions (setpgid/getpgid/setsid/getsid)");
+
+    int self = pu_getpid();
+    check_true("getpgid(0) returns a positive pgid", pu_getpgid(0) > 0);
+    check_eq("getpgid(0) == getpgid(getpid())", pu_getpgid(0), pu_getpgid(self));
+    check_eq("getsid(0) == getsid(getpid())", pu_getsid(0), pu_getsid(self));
+    check_eq("getpgid() of a definitely-nonexistent pid returns ESRCH", ESRCH, pu_getpgid(999999));
+    check_eq("getsid() of a definitely-nonexistent pid returns ESRCH", ESRCH, pu_getsid(999999));
+    check_eq("setpgid() on a pid that isn't the caller or its child returns EPERM",
+             EPERM, pu_setpgid(1, 0));
+
+    /* A forked child starts in the parent's own group (pgid inherited
+       unchanged, per fork() semantics — include/pureunix/task.h) — never
+       equal to its own freshly-assigned pid, so setpgid(0, 0) (become a
+       new group leader) must still have real work to do here. Both parent
+       and child call setpgid() on it, the standard race-avoidance idiom
+       (POSIX): whichever runs first "wins", the other's call is then a
+       no-op that still succeeds. */
+    int pid = pu_fork();
+    check_true("fork() (for pgrp test) returns a value >= 0", pid >= 0);
+    if (pid == 0) {
+        pu_setpgid(0, 0);
+        int ok = (pu_getpgid(0) == pu_getpid()) ? 1 : 0;
+        pu_exit(ok);
+        /* unreachable */
+    }
+    pu_setpgid(pid, 0);
+    int status = -1;
+    int reaped = pu_wait(pid, &status);
+    check_eq("wait() reaps the setpgid() child", pid, reaped);
+    check_eq("child's own setpgid(0,0) made it its own group leader", 1, status);
+
+    /* setsid(): a freshly forked child (pgid inherited, not its own id) is
+       not a group leader, so setsid() must succeed; calling it *again*
+       afterwards must fail with EPERM (POSIX: a process group leader may
+       never start a new session — see task_setsid()). */
+    int pid2 = pu_fork();
+    check_true("fork() (for setsid test) returns a value >= 0", pid2 >= 0);
+    if (pid2 == 0) {
+        int sid = pu_setsid();
+        int leader_ok = (sid == pu_getpid() && pu_getsid(0) == pu_getpid() &&
+                          pu_getpgid(0) == pu_getpid())
+                             ? 1
+                             : 0;
+        int second_call_rejected = (pu_setsid() == EPERM) ? 1 : 0;
+        pu_exit(leader_ok && second_call_rejected ? 1 : 0);
+        /* unreachable */
+    }
+    int status2 = -1;
+    int reaped2 = pu_wait(pid2, &status2);
+    check_eq("wait() reaps the setsid() child", pid2, reaped2);
+    check_eq("setsid() makes a non-leader its own session+group leader; "
+             "a second call on an existing leader is rejected",
+             1, status2);
+}
+
+/* ==================================================================== */
+
+static void test_preemption(void)
+{
+    section("Minimal preemption: a CPU-bound task can't starve another");
+
+    /* A child that never calls a single syscall in its loop -- not
+       pu_yield(), not anything -- deliberately never cooperates with the
+       scheduler again once it starts. Under the old purely-cooperative
+       model (docs/process-management.md), the instant this child is ever
+       scheduled, nothing could ever take the CPU back from it -- this
+       exact scenario would hang the whole system forever. `volatile`
+       keeps -O2 from proving the empty loop has no observable effect and
+       deleting it outright. */
+    int pid = pu_fork();
+    check_true("fork() (for preemption test) returns a value >= 0", pid >= 0);
+    if (pid == 0) {
+        volatile long i = 0;
+        for (;;) {
+            i++;
+            (void)i;
+        }
+        /* unreachable */
+    }
+
+    /* One single, deliberate, explicit yield -- after this, this parent
+       is merely TASK_RUNNABLE, competing in the exact same round-robin as
+       every other task in the system (including the shell that fork()ed
+       and exec()'d this very test binary, itself spin-yielding in its own
+       wait() -- see kernel/task.c's task_waitpid(), not yet converted to
+       real wait-queue blocking -- while it waits for this process to
+       exit; that's an additional harmless RUNNABLE competitor, not a
+       threat to this test: whichever task the scheduler visits next,
+       *every* path back to this line still requires forcibly reclaiming
+       the CPU from the spinning child at least once, since it never
+       cooperates again after the fork() above).
+       Every line below this comment only ever executes if the
+       timer-interrupt-driven preemption added in this milestone actually
+       works. If it doesn't, this call simply never returns -- there is no
+       clean "FAIL" outcome for that regression, only a hang (of this test
+       binary, and by extension the whole boot session), which is itself
+       the strongest possible signal something is deeply wrong. */
+    pu_yield();
+
+    check_eq("kill() reaches a still-spinning, never-yielding child "
+             "(the parent could only get here via forced preemption)",
+             0, pu_kill(pid, SIGKILL));
+    int status = 1;
+    int reaped = pu_wait(pid, &status);
+    check_eq("wait() reaps the preempted, killed child", pid, reaped);
+    check_eq("wait() reports it died by SIGKILL", -SIGKILL, status);
+}
+
+/* ==================================================================== */
+
+static volatile int g_sigchld_count = 0;
+static volatile int g_last_sig = 0;
+
+static void chld_handler(int sig)
+{
+    g_sigchld_count++;
+    g_last_sig = sig;
+}
+
+static void test_signals(void)
+{
+    section("Signals: default actions, SIG_IGN, a real handler via the trampoline, SIGKILL");
+
+    /* SIG_IGN blocks a signal that would otherwise terminate. */
+    pu_sigaction_t ign = { .handler = PU_SIG_IGN };
+    pu_sigaction_t dfl = { .handler = PU_SIG_DFL };
+    check_eq("sigaction(SIGTERM, SIG_IGN) succeeds", 0, pu_sigaction(SIGTERM, &ign, NULL));
+    check_eq("kill(self, SIGTERM) while ignored does not terminate",
+             0, pu_kill(pu_getpid(), SIGTERM));
+    check_eq("sigaction(SIGTERM, SIG_DFL) restores the default", 0, pu_sigaction(SIGTERM, &dfl, NULL));
+
+    /* SIGKILL/SIGSTOP's disposition can never even be *set* — POSIX. */
+    check_eq("sigaction(SIGKILL, ...) is rejected (uncatchable/unignorable)",
+             EINVAL, pu_sigaction(SIGKILL, &ign, NULL));
+    check_eq("sigaction(SIGSTOP, ...) is rejected (uncatchable/unignorable)",
+             EINVAL, pu_sigaction(SIGSTOP, &ign, NULL));
+
+    /* A real SIGCHLD handler actually runs -- proof the trampoline works
+       end-to-end, not just that sigaction() records what was asked. */
+    pu_sigaction_t chld_act;
+    chld_act.handler = (unsigned int)(unsigned long)chld_handler;
+    check_eq("sigaction(SIGCHLD, a real handler) succeeds",
+             0, pu_sigaction(SIGCHLD, &chld_act, NULL));
+    int before = g_sigchld_count;
+    int cpid = pu_fork();
+    check_true("fork() (for the SIGCHLD handler test) returns a value >= 0", cpid >= 0);
+    if (cpid == 0) {
+        pu_exit(0);
+        /* unreachable */
+    }
+    int cstatus = -1;
+    int creaped = pu_wait(cpid, &cstatus);
+    check_eq("wait() reaps the child that triggers SIGCHLD", cpid, creaped);
+    /* Delivery happens at this task's own next ring3-return boundary
+       (arch/i386/idt.c) -- in practice that's the very int $0x80 return
+       from the pu_wait() call above, so the handler has, by observation,
+       always already run by this point. Poll briefly instead of a bare
+       assert regardless, matching real asynchronous-signal semantics
+       rather than assuming one specific delivery instant. */
+    for (int i = 0; i < 1000 && g_sigchld_count == before; i++) {
+        pu_yield();
+    }
+    check_true("a real SIGCHLD handler actually ran (trampoline delivery works)",
+               g_sigchld_count > before);
+    check_eq("the handler received the correct signal number", SIGCHLD, g_last_sig);
+    pu_sigaction(SIGCHLD, &dfl, NULL);
+
+    /* kill(0, sig)/kill(-pgid, sig): process-group delivery, added in
+       M5. Testing a *real* delivery from this process directly would hit
+       this test binary's own shared process group (still shared with the
+       ash session that launched it, absent job control) -- isolate it in
+       a child that first makes itself its own group leader instead. */
+    int gpid = pu_fork();
+    check_true("fork() (for kill(0,...) group-delivery test) returns a value >= 0", gpid >= 0);
+    if (gpid == 0) {
+        pu_setpgid(0, 0);
+        pu_kill(0, SIGKILL);
+        pu_exit(99); /* unreachable if kill(0, SIGKILL) actually worked */
+    }
+    int gstatus = 1;
+    int greaped = pu_wait(gpid, &gstatus);
+    check_eq("wait() reaps the kill(0, SIGKILL) test child", gpid, greaped);
+    check_eq("kill(0, SIGKILL) reaches every member of the caller's own group (itself)",
+             -SIGKILL, gstatus);
+
+    /* sigprocmask()/sigpending(): a blocked signal stays pending instead
+       of being dropped or delivered early. */
+    uint32_t mask = 1u << SIGUSR1;
+    check_eq("sigprocmask(SIG_BLOCK) succeeds", 0, pu_sigprocmask(PU_SIG_BLOCK, &mask, NULL));
+    pu_sigaction_t catch_act;
+    catch_act.handler = (unsigned int)(unsigned long)chld_handler;
+    check_eq("sigaction(a blockable test signal, a real handler) succeeds",
+             0, pu_sigaction(SIGUSR1, &catch_act, NULL));
+    check_eq("kill(self, blocked signal) succeeds (it's queued, not dropped)",
+             0, pu_kill(pu_getpid(), SIGUSR1));
+    check_true("the blocked signal shows up in sigpending()",
+               (pu_sigpending() & (1u << SIGUSR1)) != 0);
+    int before2 = g_sigchld_count;
+    check_eq("sigprocmask(SIG_UNBLOCK) succeeds", 0, pu_sigprocmask(PU_SIG_UNBLOCK, &mask, NULL));
+    for (int i = 0; i < 1000 && g_sigchld_count == before2; i++) {
+        pu_yield();
+    }
+    check_true("unblocking delivers the signal that was queued while blocked",
+               g_sigchld_count > before2);
+    pu_sigaction(SIGUSR1, &dfl, NULL);
+}
+
+/* ==================================================================== */
+
+static volatile long g_priority_count = 0;
+static int g_priority_report_fd = -1;
+
+static void priority_term_handler(int sig)
+{
+    (void)sig;
+    long count = g_priority_count;
+    pu_write(g_priority_report_fd, (const char *)&count, sizeof(count));
+    pu_exit(0);
+}
+
+static void test_priority(void)
+{
+    section("nice/renice: SYS_SETPRIORITY/SYS_GETPRIORITY");
+
+    int nice_val = -999;
+    check_eq("getpriority(0) succeeds", 0, pu_getpriority(0, &nice_val));
+    check_eq("a freshly forked/exec'd process defaults to nice 0", 0, nice_val);
+
+    check_eq("setpriority(0, 10) succeeds", 0, pu_setpriority(0, 10));
+    pu_getpriority(0, &nice_val);
+    check_eq("getpriority() reflects the new value", 10, nice_val);
+
+    check_eq("setpriority(0, 100) succeeds (clamped)", 0, pu_setpriority(0, 100));
+    pu_getpriority(0, &nice_val);
+    check_eq("nice value clamps to the POSIX maximum (19)", 19, nice_val);
+
+    check_eq("setpriority(0, -100) succeeds (clamped)", 0, pu_setpriority(0, -100));
+    pu_getpriority(0, &nice_val);
+    check_eq("nice value clamps to the POSIX minimum (-20)", -20, nice_val);
+
+    pu_setpriority(0, 0); /* restore for the rest of the suite */
+
+    check_eq("setpriority() on a definitely-nonexistent pid returns ESRCH",
+             ESRCH, pu_setpriority(999999, 0));
+    check_eq("getpriority() on a definitely-nonexistent pid returns ESRCH",
+             ESRCH, pu_getpriority(999999, &nice_val));
+
+    /* setpriority() targeting a *child*, not just self. */
+    int cpid = pu_fork();
+    check_true("fork() (for setpriority-on-child test) returns a value >= 0", cpid >= 0);
+    if (cpid == 0) {
+        for (;;) {
+            pu_yield();
+        }
+        /* unreachable */
+    }
+    check_eq("setpriority() targeting a child succeeds", 0, pu_setpriority(cpid, 15));
+    int child_nice = -999;
+    check_eq("getpriority() on that child succeeds", 0, pu_getpriority(cpid, &child_nice));
+    check_eq("...and reflects the value set on it", 15, child_nice);
+    pu_kill(cpid, SIGKILL);
+    pu_wait(cpid, NULL);
+
+    /* A real, observable scheduling effect, not just field storage: a
+       heavily-reniced (+19) CPU-bound child accumulates measurably fewer
+       loop iterations than a default-priority sibling over the same
+       stretch of real time — proving kernel/task.c's next_ready_task()
+       actually acts on nice (see its own comment for the exact scheme:
+       a nice > 0 task is skipped `nice` extra scheduling passes between
+       turns). Both children spin with *no* syscalls in their own loop —
+       relying entirely on the same timer-driven preemption
+       test_preemption() above already proved works — and report their
+       final count via a real SIGTERM handler once killed, since there's
+       no nanosleep() wrapper in this low-level API to bound wall time
+       any more directly than a large bounded busy-loop here in the
+       parent (same idiom test_preemption() uses). */
+    int lo_pipe[2], hi_pipe[2];
+    check_eq("pipe() for the nice=0 spinner's report", 0, pu_pipe(lo_pipe));
+    check_eq("pipe() for the nice=19 spinner's report", 0, pu_pipe(hi_pipe));
+
+    pu_sigaction_t term_act;
+    term_act.handler = (unsigned int)(unsigned long)priority_term_handler;
+
+    int lo_pid = pu_fork();
+    check_true("fork() (nice=0 spinner) returns a value >= 0", lo_pid >= 0);
+    if (lo_pid == 0) {
+        pu_close(lo_pipe[0]);
+        g_priority_report_fd = lo_pipe[1];
+        pu_sigaction(SIGTERM, &term_act, NULL);
+        for (;;) {
+            g_priority_count++;
+        }
+        /* unreachable */
+    }
+    int hi_pid = pu_fork();
+    check_true("fork() (nice=19 spinner) returns a value >= 0", hi_pid >= 0);
+    if (hi_pid == 0) {
+        pu_close(hi_pipe[0]);
+        g_priority_report_fd = hi_pipe[1];
+        pu_sigaction(SIGTERM, &term_act, NULL);
+        pu_setpriority(0, 19);
+        for (;;) {
+            g_priority_count++;
+        }
+        /* unreachable */
+    }
+    pu_close(lo_pipe[1]);
+    pu_close(hi_pipe[1]);
+
+    for (volatile long i = 0; i < 40000000L; i++) {
+    }
+
+    check_eq("kill(SIGTERM) reaches the nice=0 spinner", 0, pu_kill(lo_pid, SIGTERM));
+    check_eq("kill(SIGTERM) reaches the nice=19 spinner", 0, pu_kill(hi_pid, SIGTERM));
+    pu_wait(lo_pid, NULL);
+    pu_wait(hi_pid, NULL);
+
+    long lo_count = 0, hi_count = 0;
+    check_eq("read() gets the nice=0 spinner's final count",
+             (int)sizeof(lo_count), pu_read(lo_pipe[0], (char *)&lo_count, sizeof(lo_count)));
+    check_eq("read() gets the nice=19 spinner's final count",
+             (int)sizeof(hi_count), pu_read(hi_pipe[0], (char *)&hi_count, sizeof(hi_count)));
+    pu_close(lo_pipe[0]);
+    pu_close(hi_pipe[0]);
+
+    check_true("a nice=0 task accumulates measurably more CPU-bound loop "
+               "iterations than a nice=19 sibling over the same real time",
+               lo_count > hi_count);
 }
 
 /* ==================================================================== */
@@ -1446,6 +1789,10 @@ int main(void)
     test_chdir_getcwd();
     test_pipe_dup();
     test_kill();
+    test_pgrp_session();
+    test_preemption();
+    test_signals();
+    test_priority();
     test_write_read_basics();
     test_isatty_ioctl();
     test_open_close();

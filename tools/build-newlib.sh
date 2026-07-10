@@ -46,12 +46,20 @@ cd "${WORK_DIR}/build"
 # used here are fully self-contained (and support %f natively, unlike nano
 # IO which needs an extra `-Wl,-u,_printf_float`) at the cost of a larger
 # libc.a; plenty of room in the 3 MiB per-process window for that.
+#
+# --enable-newlib-io-long-long: BusyBox's procps/top.c parses
+# /proc/stat's jiffy counters with sscanf("...%llu%llu...", ...) — without
+# this, newlib's vfscanf silently can't match %llu (this was found by
+# top failing "can't read '/proc/stat'" even though the file's content and
+# a plain fopen()/fgets() against it were both already verified correct;
+# root cause was this newlib build flag, not procfs).
 "${WORK_DIR}"/newlib-${NEWLIB_VERSION}/configure \
   --target=i686-elf \
   --prefix="${INSTALL_DIR}" \
   --disable-newlib-multithread \
   --disable-nls \
   --disable-multilib \
+  --enable-newlib-io-long-long \
   CFLAGS_FOR_TARGET="-ffreestanding -O2 -fno-stack-protector -fno-pic -fno-pie -m32 -march=i686 -DMISSING_SYSCALL_NAMES"
 
 # Only the newlib subtree is built/installed — libgloss (board support

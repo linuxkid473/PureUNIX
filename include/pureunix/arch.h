@@ -47,6 +47,16 @@ void irq_disable(uint8_t irq);
 void pit_init(uint32_t hz);
 uint64_t pit_ticks(void);
 void pit_sleep(uint32_t ms);
+/* True (and clears the flag) if pit_irq() decided a CPU-bound task has
+ * monopolized the CPU for a full quantum with another task genuinely
+ * runnable — see arch/i386/pit.c's minimal-preemption comment. Checked
+ * (and acted on with a single task_yield()) at isr_dispatch()'s
+ * ring3-return boundary, arch/i386/idt.c. */
+bool pit_take_need_resched(void);
+/* Flags the same deferred-reschedule mechanism pit_take_need_resched()
+ * consumes, without itself calling task_yield() — see arch/i386/pit.c's
+ * own comment on this function for why. */
+void pit_force_resched(void);
 
 void syscall_init(void);
 uint32_t syscall_dispatch(interrupt_regs_t *regs);
@@ -66,6 +76,27 @@ static inline void arch_enable_interrupts(void)
 static inline void arch_disable_interrupts(void)
 {
     __asm__ volatile("cli");
+}
+
+/* Saves EFLAGS (which captures the current IF state) and clears IF,
+ * returning the saved value for a matching arch_restore_interrupts() —
+ * the standard save/cli .. restore idiom for a critical section that must
+ * work correctly whether the caller already had interrupts enabled
+ * (ordinary kernel/syscall code) or already had them disabled (code
+ * called from inside an IRQ handler, which must never come out of a
+ * nested critical section with interrupts re-enabled early — only the
+ * common ISR stub's own `sti` right before `iret` may do that). See
+ * kernel/wait.c's wait queues, the only current user. */
+static inline uint32_t arch_save_and_disable_interrupts(void)
+{
+    uint32_t flags;
+    __asm__ volatile("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void arch_restore_interrupts(uint32_t flags)
+{
+    __asm__ volatile("pushl %0\n\tpopfl" : : "r"(flags) : "memory", "cc");
 }
 
 #endif

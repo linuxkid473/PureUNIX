@@ -12,7 +12,12 @@ typedef void (*sighandler_t)(int);
 #define SIG_IGN ((sighandler_t)1)
 
 #define SIGINT    2
-#define SIGSTOP  19
+/* Matches the real system-wide value (user/libpure.h, kernel/signal.h)
+ * now that PureUNIX has real signals — was a placeholder 19 (colliding
+ * with the real SIGCONT) from before this existed; kill()/signal()/
+ * raise() below remain true no-ops regardless, this is just for numeric
+ * consistency across the codebase. */
+#define SIGSTOP  17
 #define SIGWINCH 28
 
 sighandler_t signal(int signum, sighandler_t handler);

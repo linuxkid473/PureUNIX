@@ -1,0 +1,17 @@
+# Regression test: Ctrl+C must interrupt a foreground job even when that
+# job never reads stdin itself (e.g. `sleep` — it only calls nanosleep,
+# it never blocks in read()). This is the specific architectural
+# regression this test exists to catch: signal-character interception
+# lives in kernel/vt.c's vt_input_push() (the keyboard IRQ path), not in
+# drivers/tty.c's read() path — a version of this code that coupled
+# Ctrl+C detection to an active read() call would leave `sleep 100` fully
+# uninterruptible, and this script would simply time out (WAIT below
+# would never see the shell prompt return within 100 seconds).
+WAIT #\s*$
+TYPE sleep 100
+SLEEP 1
+KEY ctrl+c
+WAIT \^C
+SLEEP 1
+TYPE echo alive-after-ctrlc
+WAIT alive-after-ctrlc

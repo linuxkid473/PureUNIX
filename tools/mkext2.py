@@ -489,9 +489,10 @@ BUSYBOX_APPLETS = [
     "ash", "sh", "basename", "cat", "chmod", "chown", "clear", "cmp", "cp",
     "cut", "dd", "diff", "dirname", "echo", "egrep", "env", "false", "fgrep",
     "find", "grep", "head", "hexdump", "kill", "less", "ln", "ls", "mkdir",
-    "mv", "od", "paste", "printenv", "printf", "pwd", "realpath", "rm",
-    "rmdir", "seq", "sleep", "sort", "strings", "tail", "tee", "test",
-    "touch", "tr", "true", "uniq", "wc", "which", "xargs", "yes",
+    "mv", "nice", "od", "paste", "printenv", "printf", "ps", "pwd",
+    "realpath", "renice", "rm", "rmdir", "seq", "sleep", "sort", "strings",
+    "tail", "tee", "test", "top", "touch", "tr", "true", "uniq", "wc",
+    "which", "xargs", "yes",
 ]
 
 DOC_ALIASES = {

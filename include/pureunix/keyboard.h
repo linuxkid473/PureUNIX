@@ -23,6 +23,13 @@ enum {
     KEY_CTRL_Q,
     KEY_CTRL_F,
     KEY_CTRL_C,
+    /* Ctrl+Z (SIGTSTP) / Ctrl+\ (SIGQUIT) — see drivers/tty.c's
+     * key_to_byte(), which maps these (and KEY_CTRL_C above) to their
+     * real termios control-character byte values (VSUSP/VQUIT/VINTR —
+     * kernel/vt.c's termios_defaults()) rather than delivering them as
+     * literal keystrokes, and docs/process-management.md. */
+    KEY_CTRL_Z,
+    KEY_CTRL_BACKSLASH,
 };
 
 void keyboard_init(void);

@@ -6,6 +6,7 @@
 #include <pureunix/icmp.h>
 #include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
+#include <pureunix/signal.h>
 #include <pureunix/stat.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
@@ -17,6 +18,7 @@
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 #include <pureunix/vt.h>
+#include <pureunix/wait.h>
 
 /* fcntl() commands — same numbering as newlib's <sys/_default_fcntl.h> (and
  * Linux), so user/newlib_syscalls.c's fcntl() can pass cmd straight through
@@ -127,6 +129,17 @@ static int tty_fd_check(int fd)
     return f ? -ENOTTY : -EBADF;
 }
 
+/* Which VT `fd` (already tty_fd_check()-validated by the caller) names —
+ * an explicit /dev/ttyN fd (FD_KIND_TTY) names the VT it was opened
+ * against; the fd 0/1/2 default console binding names `caller`'s own
+ * vt_id. Shared by VT_GETACTIVE/TIOCGPGRP/TIOCSPGRP (SYS_IOCTL below). */
+static int fd_to_vt_id(task_t *caller, int fd)
+{
+    open_file_t *of = caller->fds[fd].file;
+    return (of && of->kind == FD_KIND_TTY) ? of->tty_vt_id
+                                            : (caller->vt_id >= 0 ? caller->vt_id : 0);
+}
+
 /* Finds the lowest fd >= start that's free for a *new* allocation
  * (open()/pipe()/dup()/fcntl(F_DUPFD)) — real POSIX "lowest available fd"
  * semantics. A slot is free if it's simply unused, OR it's fd 0/1/2
@@ -168,15 +181,29 @@ static int find_free_fd(task_t *t, int start)
 
 /* ---- Pipes (SYS_PIPE/SYS_DUP/SYS_DUP2) --------------------------------
  * A fixed-size ring buffer (pipe_buf_t, include/pureunix/task.h) shared by
- * both ends' open_file_t. No real blocking/wakeup mechanism exists (this
- * kernel is strictly cooperative — see docs/scheduler.md), so "blocked on
- * a full/empty pipe" is implemented the same way task_waitpid() blocks on
- * a child that hasn't exited yet: spin task_yield() until the condition
- * changes. This only actually accomplishes anything if some other task
- * (typically a forked child on the other end of the pipe) runs in between
- * yields and moves data — a single task written to read its own pipe with
- * nothing else to run would spin forever, same caveat as any other
- * cooperative-blocking call in this kernel. */
+ * both ends' open_file_t. Blocked reads/writes sleep on the pipe_buf_t's
+ * own read_wq/write_wq (kernel/wait.c) rather than spinning — see
+ * include/pureunix/wait.h. This only actually accomplishes anything if
+ * some other task (typically a forked child on the other end of the
+ * pipe) is what wakes it by moving data — a single task written to read
+ * its own pipe with nothing else able to run would block forever, exactly
+ * like a real UNIX pipe in that same situation. */
+
+typedef struct {
+    pipe_buf_t *p;
+} pipe_wait_ctx_t;
+
+static bool pipe_readable(void *ctx)
+{
+    pipe_buf_t *p = ((pipe_wait_ctx_t *)ctx)->p;
+    return p->count > 0 || p->write_ends == 0;
+}
+
+static bool pipe_writable(void *ctx)
+{
+    pipe_buf_t *p = ((pipe_wait_ctx_t *)ctx)->p;
+    return p->count < PUREUNIX_PIPE_SIZE || p->read_ends == 0;
+}
 
 static int pipe_read(open_file_t *f, char *buf, size_t len)
 {
@@ -187,11 +214,19 @@ static int pipe_read(open_file_t *f, char *buf, size_t len)
     if (len == 0) {
         return 0;
     }
-    while (p->count == 0) {
+    if (p->count == 0) {
         if (p->write_ends == 0) {
             return 0; /* EOF: no writers left, nothing buffered */
         }
-        task_yield();
+        /* See include/pureunix/wait.h's invariant — int $0x80 enters with
+         * interrupts masked, and nothing could ever wake this sleeper
+         * otherwise. */
+        arch_enable_interrupts();
+        pipe_wait_ctx_t ctx = { .p = p };
+        wait_queue_sleep(&p->read_wq, pipe_readable, &ctx);
+        if (p->count == 0) {
+            return 0; /* woken because the last writer closed, not by data */
+        }
     }
     size_t to_copy = len < p->count ? len : p->count;
     for (size_t i = 0; i < to_copy; ++i) {
@@ -199,6 +234,8 @@ static int pipe_read(open_file_t *f, char *buf, size_t len)
         p->tail = (p->tail + 1) % PUREUNIX_PIPE_SIZE;
     }
     p->count -= to_copy;
+    /* Freed up ring-buffer space — wake any writer blocked on a full pipe. */
+    wait_queue_wake_all(&p->write_wq);
     return (int)to_copy;
 }
 
@@ -216,11 +253,13 @@ static int pipe_write(open_file_t *f, const char *buf, size_t len)
     }
     size_t written = 0;
     while (written < len) {
-        while (p->count == PUREUNIX_PIPE_SIZE) {
+        if (p->count == PUREUNIX_PIPE_SIZE) {
+            arch_enable_interrupts();
+            pipe_wait_ctx_t ctx = { .p = p };
+            wait_queue_sleep(&p->write_wq, pipe_writable, &ctx);
             if (p->read_ends == 0) {
                 return written ? (int)written : -EPIPE;
             }
-            task_yield();
         }
         size_t space = PUREUNIX_PIPE_SIZE - p->count;
         size_t chunk = (len - written) < space ? (len - written) : space;
@@ -230,6 +269,8 @@ static int pipe_write(open_file_t *f, const char *buf, size_t len)
         }
         p->count += chunk;
         written += chunk;
+        /* New data available — wake any reader blocked on an empty pipe. */
+        wait_queue_wake_all(&p->read_wq);
     }
     return (int)written;
 }
@@ -294,6 +335,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_write(f, buf, len);
+        }
+        if (f->kind == FD_KIND_NULL) {
+            /* /dev/null: every byte is accepted and discarded — see
+             * include/pureunix/task.h's FD_KIND_NULL comment. */
+            return (uint32_t)len;
         }
         if (f->kind == FD_KIND_TTY) {
             /* /dev/ttyN opened explicitly -- see SYS_OPEN's /dev/tty
@@ -364,6 +410,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_read(f, buf, len);
         }
+        if (f->kind == FD_KIND_NULL) {
+            /* /dev/null: always reports EOF — see
+             * include/pureunix/task.h's FD_KIND_NULL comment. */
+            return 0;
+        }
         if (f->kind == FD_KIND_TTY) {
             /* /dev/ttyN opened explicitly (SYS_OPEN's /dev/tty interception
              * below) -- blocks against that specific VT's own input queue,
@@ -410,6 +461,24 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         resolve_path(path_buf, raw_path);
         const char *path = path_buf;
 
+        if (strcmp(path, "/dev/null") == 0) {
+            task_t *t = task_current();
+            int fd = find_free_fd(t, 0);
+            if (fd < 0) {
+                return (uint32_t)-EMFILE;
+            }
+            open_file_t *f = open_file_alloc(FD_KIND_NULL);
+            if (!f) {
+                return (uint32_t)-ENOSPC;
+            }
+            f->flags = flags;
+            t->fds[fd].used = true;
+            t->fds[fd].closed_explicitly = false;
+            t->fds[fd].cloexec = false;
+            t->fds[fd].file = f;
+            return (uint32_t)fd;
+        }
+
         int dev_vt = dev_tty_path_vt(path);
         if (dev_vt >= 0) {
             /* /dev/ttyN / /dev/tty: a real fd bound to a specific VT (see
@@ -429,6 +498,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             f->tty_vt_id = dev_vt;
             t->fds[fd].used = true;
             t->fds[fd].closed_explicitly = false;
+            t->fds[fd].cloexec = false;
             t->fds[fd].file = f;
             return (uint32_t)fd;
         }
@@ -476,6 +546,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
             t->fds[fd].used = true;
             t->fds[fd].closed_explicitly = false;
+            t->fds[fd].cloexec = false;
             t->fds[fd].file = f;
             return (uint32_t)fd;
         }
@@ -524,6 +595,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         t->fds[fd].used = true;
         t->fds[fd].closed_explicitly = false;
+        t->fds[fd].cloexec = false;
         t->fds[fd].file = f;
         return (uint32_t)fd;
     }
@@ -624,9 +696,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         t->fds[read_fd].used = true;
         t->fds[read_fd].closed_explicitly = false;
+        t->fds[read_fd].cloexec = false;
         t->fds[read_fd].file = rf;
         t->fds[write_fd].used = true;
         t->fds[write_fd].closed_explicitly = false;
+        t->fds[write_fd].cloexec = false;
         t->fds[write_fd].file = wf;
 
         fds_out[0] = read_fd;
@@ -646,6 +720,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         t->fds[newfd].used = true;
         t->fds[newfd].closed_explicitly = false;
         t->fds[newfd].file = t->fds[oldfd].file;
+        t->fds[newfd].cloexec = false;
         open_file_ref(t->fds[newfd].file);
         return (uint32_t)newfd;
     }
@@ -668,37 +743,130 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         t->fds[newfd].used = true;
         t->fds[newfd].closed_explicitly = false;
         t->fds[newfd].file = t->fds[oldfd].file;
+        t->fds[newfd].cloexec = false;
         open_file_ref(t->fds[newfd].file);
         return (uint32_t)newfd;
     }
     case SYS_KILL: {
         int pid = (int)regs->ebx;
         int sig = (int)regs->ecx;
-        if (pid <= 0) {
-            return (uint32_t)-EINVAL; /* no process-group support */
-        }
         task_t *t = task_current();
+
+        if (pid == 0) {
+            /* kill(0, sig): every process in the caller's own group. */
+            if (sig != 0) {
+                signal_send_pgrp(t->pgid, sig);
+                task_yield_if_not_running(t);
+            }
+            return 0;
+        }
+        if (pid < 0) {
+            /* kill(-pgid, sig): an explicit process group. */
+            uint32_t pgid = (uint32_t)(-pid);
+            if (!task_pgrp_exists(pgid)) {
+                return (uint32_t)-ESRCH;
+            }
+            if (sig != 0) {
+                signal_send_pgrp(pgid, sig);
+                task_yield_if_not_running(t);
+            }
+            return 0;
+        }
+
+        /* pid > 0: a single target. */
         if (t && (uint32_t)pid == t->id) {
             if (sig == 0) {
                 return 0; /* the null signal: self always "exists" */
             }
-            /* Killing yourself: must actually stop running, not just get
-             * marked a zombie and fall through to this syscall's normal
-             * iret-back-to-ring3 return path — task_exit() (already used
-             * by every other process-termination path in this kernel)
-             * yields away and never comes back. */
-            task_exit(-sig);
+            /* Real delivery (default action / SIG_IGN / a real handler —
+             * kernel/signal.c). If the default action terminates or
+             * stops this same task, task_yield_if_not_running() makes
+             * sure it stops running *right now* rather than falling
+             * through to this syscall's normal iret-back-to-ring3 return
+             * path on a stale assumption that it's still runnable. */
+            signal_send(t, sig);
+            task_yield_if_not_running(t);
+            return 0;
         }
         if (task_kill((uint32_t)pid, sig) != 0) {
             return (uint32_t)-ESRCH;
         }
         return 0;
     }
+    case SYS_SIGACTION: {
+        int sig = (int)regs->ebx;
+        const pu_sigaction_t *act = (const pu_sigaction_t *)regs->ecx;
+        pu_sigaction_t *old = (pu_sigaction_t *)regs->edx;
+        task_t *t = task_current();
+        if (sig <= 0 || sig >= 32) {
+            return (uint32_t)-EINVAL;
+        }
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            /* POSIX: disposition of these two can never be changed. */
+            return (uint32_t)-EINVAL;
+        }
+        if (old) {
+            old->handler = t->sig_handlers[sig];
+        }
+        if (act) {
+            t->sig_handlers[sig] = act->handler;
+        }
+        return 0;
+    }
+    case SYS_SIGPROCMASK: {
+        int how = (int)regs->ebx;
+        const uint32_t *set = (const uint32_t *)regs->ecx;
+        uint32_t *old = (uint32_t *)regs->edx;
+        task_t *t = task_current();
+        if (old) {
+            *old = t->blocked_signals;
+        }
+        if (set) {
+            uint32_t s = *set;
+            /* SIGKILL/SIGSTOP can never be blocked — POSIX. */
+            s &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+            switch (how) {
+            case PU_SIG_BLOCK:   t->blocked_signals |= s; break;
+            case PU_SIG_UNBLOCK: t->blocked_signals &= ~s; break;
+            case PU_SIG_SETMASK: t->blocked_signals = s; break;
+            default: return (uint32_t)-EINVAL;
+            }
+        }
+        return 0;
+    }
+    case SYS_SIGPENDING: {
+        uint32_t *out = (uint32_t *)regs->ebx;
+        if (!out) {
+            return (uint32_t)-EINVAL;
+        }
+        *out = task_current()->pending_signals;
+        return 0;
+    }
+    case SYS_SETPRIORITY: {
+        uint32_t pid = (uint32_t)regs->ebx;
+        int nice = (int)regs->ecx;
+        return (uint32_t)task_setpriority(pid, nice);
+    }
+    case SYS_GETPRIORITY: {
+        uint32_t pid = (uint32_t)regs->ebx;
+        int *out = (int *)regs->ecx;
+        int nice = 0;
+        int rc = task_getpriority(pid, &nice);
+        if (rc != 0) {
+            return (uint32_t)rc;
+        }
+        if (out) {
+            *out = nice;
+        }
+        return 0;
+    }
     case SYS_FCNTL: {
         /* Minimal fcntl(): only the operations BusyBox's dd/ash actually
-         * need. No close-on-exec model exists in this kernel (exec() always
-         * inherits every fd — see task_create_user()/task_fork()), so
-         * F_GETFD/F_SETFD are honest no-ops rather than real bookkeeping. */
+         * need. F_GETFD/F_SETFD are still honest no-ops (nothing sets the
+         * close-on-exec bit through them — see fd_entry_t.cloexec, only
+         * ever set by F_DUPFD_CLOEXEC below and honored by kernel/elf.c's
+         * exec() paths); a real fcntl(fd, F_SETFD, FD_CLOEXEC) caller isn't
+         * exercised by anything in this userland today. */
         int fd  = (int)regs->ebx;
         int cmd = (int)regs->ecx;
         int arg = (int)regs->edx;
@@ -720,18 +888,20 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return 0;
         case PU_F_DUPFD:
         case PU_F_DUPFD_CLOEXEC: {
-            /* No close-on-exec model exists (see comment above), so
-             * F_DUPFD_CLOEXEC is handled identically to F_DUPFD. This
-             * mattered more than it looks: ash's savefd() — called on every
-             * fd it's about to redirect, including a plain interactive
-             * shell's own still-untouched stdout the first time it ever
-             * runs `cmd > file` — unconditionally uses F_DUPFD_CLOEXEC
-             * (newlib defines it as 14, a distinct value from F_DUPFD's 0,
-             * not an alias), and treats any fcntl() failure other than
-             * EBADF as fatal to the whole interpreter. Not recognizing this
-             * command at all used to fall through to -EINVAL below, which
-             * savefd() raises as fatal — killing the shell outright on its
-             * first redirection.
+            /* F_DUPFD_CLOEXEC's close-on-exec bit (fd_entry_t.cloexec) is
+             * real, honored by kernel/elf.c's exec() paths — see that
+             * field's own comment. F_DUPFD leaves it false, matching
+             * POSIX (a plain dup never sets close-on-exec).
+             *
+             * ash's savefd() — called on every fd it's about to redirect,
+             * including a plain interactive shell's own still-untouched
+             * stdout the first time it ever runs `cmd > file` —
+             * unconditionally uses F_DUPFD_CLOEXEC (newlib defines it as
+             * 14, a distinct value from F_DUPFD's 0, not an alias), and
+             * treats any fcntl() failure other than EBADF as fatal to the
+             * whole interpreter. Not recognizing this command at all used
+             * to fall through to -EINVAL below, which savefd() raises as
+             * fatal — killing the shell outright on its first redirection.
              *
              * Also, like SYS_DUP/SYS_DUP2, this must duplicate a NULL file
              * (fd 0/1/2 start out "used" but console-bound, file == NULL —
@@ -744,6 +914,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             t->fds[newfd].used = true;
             t->fds[newfd].closed_explicitly = false;
             t->fds[newfd].file = t->fds[fd].file;
+            t->fds[newfd].cloexec = (cmd == PU_F_DUPFD_CLOEXEC);
             open_file_ref(t->fds[newfd].file);
             return (uint32_t)newfd;
         }
@@ -786,8 +957,16 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     }
     case SYS_GETPPID: {
         task_t *t = task_current();
-        return t && t->parent ? t->parent->id : 0;
+        return t ? t->ppid : 0;
     }
+    case SYS_SETPGID:
+        return (uint32_t)task_setpgid((uint32_t)regs->ebx, (uint32_t)regs->ecx);
+    case SYS_GETPGID:
+        return (uint32_t)task_getpgid((uint32_t)regs->ebx);
+    case SYS_SETSID:
+        return (uint32_t)task_setsid();
+    case SYS_GETSID:
+        return (uint32_t)task_getsid((uint32_t)regs->ebx);
     case SYS_STAT: {
         const char *raw_path = (const char *)regs->ebx;
         struct pureunix_stat *st = (struct pureunix_stat *)regs->ecx;
@@ -853,6 +1032,13 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             st->st_mode = S_IFIFO | 0600;
             st->st_nlink = 1;
             st->st_blksize = 4096;
+            return 0;
+        }
+        if (f->kind == FD_KIND_NULL) {
+            st->st_type = 1;
+            st->st_mode = S_IFCHR | 0666;
+            st->st_nlink = 1;
+            st->st_blksize = 1024;
             return 0;
         }
 
@@ -1122,8 +1308,14 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
     case SYS_WAIT: {
         int pid = (int)regs->ebx;
         int *status = (int *)regs->ecx;
+        int options = (int)regs->edx;
         int st = 0;
-        int rc = task_waitpid(pid, &st);
+        /* task_waitpid() genuinely blocks now (task_t.child_wait) — see
+         * include/pureunix/wait.h's invariant, same as pipe_read() above:
+         * int $0x80 enters with interrupts masked, and nothing could ever
+         * wake this sleeper otherwise. */
+        arch_enable_interrupts();
+        int rc = task_waitpid(pid, &st, options);
         if (rc >= 0 && status) {
             *status = st;
         }
@@ -1194,11 +1386,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             if (!argp) {
                 return (uint32_t)-EINVAL;
             }
-            task_t *t = task_current();
-            open_file_t *of = t->fds[fd].file;
-            int vt_id = (of && of->kind == FD_KIND_TTY) ? of->tty_vt_id
-                                                          : (t->vt_id >= 0 ? t->vt_id : 0);
-            *(int *)argp = vt_id + 1;
+            *(int *)argp = fd_to_vt_id(task_current(), fd) + 1;
             return 0;
         }
         if (request == VT_ACTIVATE) {
@@ -1214,6 +1402,49 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                 return (uint32_t)-EINVAL;
             }
             vt_switch(n - 1);
+            return 0;
+        }
+        if (request == TIOCGPGRP) {
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            int vt_id = fd_to_vt_id(task_current(), fd);
+            int pgid = vt_get_fg_pgid(vt_id);
+            if (pgid == 0) {
+                return (uint32_t)-ENOTTY;
+            }
+            *(int *)argp = pgid;
+            return 0;
+        }
+        if (request == TIOCSPGRP) {
+            /* tcsetpgrp() — how a job-control-aware shell (BusyBox ash)
+             * moves a job into the foreground of its controlling
+             * terminal. Simplified versus full POSIX: requires the
+             * caller's session to be the one that actually owns this VT
+             * (so a background VT's session can't hijack another VT's
+             * foreground group), and the target pgid to belong to some
+             * live task in that same session — but does not otherwise
+             * validate process-group *membership* beyond that (see
+             * docs/process-management.md's scope notes). */
+            if (!argp) {
+                return (uint32_t)-EINVAL;
+            }
+            int vt_id = fd_to_vt_id(task_current(), fd);
+            task_t *caller = task_current();
+            if (vt_get_fg_pgid(vt_id) == 0 || (uint32_t)caller->sid == 0) {
+                return (uint32_t)-ENOTTY;
+            }
+            int pgid = *(int *)argp;
+            if (pgid <= 0) {
+                return (uint32_t)-EINVAL;
+            }
+            task_t *member = task_find((uint32_t)pgid);
+            bool same_session_group = member && member->sid == caller->sid &&
+                                       (uint32_t)pgid == member->pgid;
+            if (!same_session_group) {
+                return (uint32_t)-EPERM;
+            }
+            vt_set_fg_pgid(vt_id, pgid);
             return 0;
         }
         return (uint32_t)-EINVAL;

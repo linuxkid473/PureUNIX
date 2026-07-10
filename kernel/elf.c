@@ -1,23 +1,59 @@
 #include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/memory.h>
+#include <pureunix/signal.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vmm.h>
+#include <pureunix/vt.h>
 
 #define EI_NIDENT 16
 #define ET_EXEC 2
 #define EM_386 3
 #define PT_LOAD 1
 
+/* Packs argv into task_t.cmdline as NUL-separated strings (matching
+ * Linux's /proc/[pid]/cmdline format exactly — see fs/procfs.c),
+ * truncating at the buffer's size if the full argv doesn't fit rather
+ * than failing exec() over it. Falls back to just the program's own path
+ * if argv is empty/NULL (an argc == 0 call is unusual but not invalid). */
+static void pack_cmdline(char *dst, size_t dst_size, const char *path, int argc, char *const argv[])
+{
+    size_t off = 0;
+    if (argc <= 0 || !argv || !argv[0]) {
+        strncpy(dst, path, dst_size - 1);
+        dst[dst_size - 1] = '\0';
+        return;
+    }
+    for (int i = 0; i < argc && argv[i] && off < dst_size; ++i) {
+        size_t len = strlen(argv[i]);
+        size_t remaining = dst_size - off;
+        if (len + 1 > remaining) {
+            len = remaining > 0 ? remaining - 1 : 0;
+        }
+        memcpy(dst + off, argv[i], len);
+        off += len;
+        if (off < dst_size) {
+            dst[off++] = '\0';
+        }
+    }
+    if (off < dst_size) {
+        dst[off] = '\0';
+    } else {
+        dst[dst_size - 1] = '\0';
+    }
+}
+
 /* Ring3 sandbox window: code+data+bss go in the low part, a fixed-size
- * stack (growing down from the top) takes the rest. USER_WINDOW_BASE/END/
- * USER_STACK_SIZE are defined in vmm.h — every process gets its own
+ * stack (growing down from the top) takes the rest, and one page right
+ * below that is reserved for the signal trampoline (SIGNAL_TRAMPOLINE_VA,
+ * vmm.h) — never available to a program's own segments. USER_WINDOW_BASE/
+ * END/USER_STACK_SIZE are defined in vmm.h — every process gets its own
  * private mapping of this same virtual range (see vmm_create_user_
  * directory()/vmm_map_page_in()). */
-#define ELF_CODE_LIMIT   (USER_WINDOW_END - USER_STACK_SIZE)
+#define ELF_CODE_LIMIT   SIGNAL_TRAMPOLINE_VA
 
 typedef struct elf32_ehdr {
     uint8_t e_ident[EI_NIDENT];
@@ -287,6 +323,12 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
         return -E2BIG;
     }
 
+    /* Every process gets the shared signal trampoline (arch/i386/
+     * signal.c) at exec() time — a fork()ed child inherits its own copy
+     * for free via the normal address-space-copy path
+     * (vmm_fork_address_space()), no extra work needed there. */
+    signal_map_trampoline(pd_phys);
+
     *out_entry = entry;
     *out_stack = stack_top;
     return 0;
@@ -312,6 +354,34 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
         vmm_free_user_directory(pd_phys);
         printf("%s: failed to create process\n", path);
         return -ENOMEM;
+    }
+    pack_cmdline(child->cmdline, sizeof(child->cmdline), path, argc, argv);
+
+    /* Starts its own new process group (same session, inherited
+     * unchanged) rather than the caller's — elf_exec_argv() is always
+     * "launch a fresh top-level program and synchronously wait for it"
+     * (the login shell, kernel/main.c; a command from the legacy
+     * in-kernel shell, shell/sh.c), the same role a real getty/login
+     * flow's own session/process-group setup plays for whatever it
+     * execs — never something that should share its caller's group. This
+     * is what keeps a VT's own session-leader task (main_task for VT1,
+     * a vt_session_main() task for VT2..NUM_VTS — kernel/main.c) safe
+     * from a keyboard-generated signal (Ctrl+C/Ctrl+Z/Ctrl+\,
+     * drivers/keyboard.c -> kernel/vt.c's vt_input_push()) aimed at that
+     * VT's foreground job: without this, the login shell (and the task
+     * that launched it) would default to sharing that job's own inherited
+     * group and be signaled right along with it. A job-control-aware
+     * shell (BusyBox ash once M9 enables CONFIG_ASH_JOB_CONTROL) does the
+     * equivalent for itself via its own setpgid(0,0) at startup — this is
+     * the same correct outcome, just established here so it already
+     * holds true before that lands. */
+    child->pgid = child->id;
+    /* ...and, correspondingly, becomes its own VT's foreground process
+     * group — it's the only thing running there synchronously, so it
+     * must be the one that keyboard-generated signals reach (see the
+     * comment above). Same tcsetpgrp()-equivalent reasoning. */
+    if (child->vt_id >= 0) {
+        vt_set_fg_pgid(child->vt_id, (int)child->pgid);
     }
     return task_join(child);
 }
@@ -342,6 +412,15 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
         return rc;
     }
 
+    pack_cmdline(t->cmdline, sizeof(t->cmdline), path, argc, argv);
+
+    /* POSIX close-on-exec: any fd fcntl(F_DUPFD_CLOEXEC)'d (e.g. BusyBox
+     * ash's setjobctl() — see fd_entry_t.cloexec's own comment) must not
+     * survive into the new program image. Every other fd (the common
+     * case — a shell's own stdin/stdout/stderr, redirected fds, pipes)
+     * survives exec() unchanged, same as real Unix. */
+    task_close_cloexec_fds(t);
+
     uint32_t old_pd = t->pd_phys;
     t->pd_phys = new_pd;
     t->user_entry = entry;
@@ -350,6 +429,28 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
     if (old_pd != vmm_kernel_directory_phys()) {
         vmm_free_user_directory(old_pd);
     }
+
+    /* POSIX exec(): any signal disposition that's a real handler function
+     * pointer must reset to SIG_DFL — that code lived in the address
+     * space just replaced, and a stale pointer would jump into whatever
+     * code (if any) now happens to occupy that address in the new image.
+     * SIG_IGN, by contrast, is explicitly preserved across exec() (real
+     * Unix's classic "the shell installs SIG_IGN once for itself, an
+     * exec()'d child normally *doesn't* need it to be re-armed" case
+     * doesn't apply the other way — this is what makes a shell able to
+     * still exec() a completely different program that also wants to
+     * ignore, say, SIGPIPE, but the far more common case is simply that
+     * SIG_IGN dispositions the caller explicitly set are expected to
+     * survive). The blocked-signal mask also persists across exec() —
+     * POSIX. Any already-pending signal for a real (now-reset) handler
+     * is dropped rather than left to hit a stale disposition later. */
+    for (int i = 1; i < 32; ++i) {
+        if (t->sig_handlers[i] != PU_SIG_IGN) {
+            t->sig_handlers[i] = PU_SIG_DFL;
+        }
+    }
+    t->pending_signals = 0;
+    t->active_signal = 0;
 
     /* The generic int $0x80 return path (isr_common_stub) will iret using
      * these fields — redirect it into the freshly loaded program instead

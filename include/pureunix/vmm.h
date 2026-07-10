@@ -59,6 +59,14 @@
 #define USER_WINDOW_END     0x08300000U
 #define USER_STACK_SIZE     0x10000U
 
+/* One page reserved immediately below the stack for kernel/signal.c's
+ * per-process signal trampoline (mapped read+exec, never write, at exec()
+ * time — see arch/i386/signal.c) — never available to a program's own
+ * PT_LOAD segments; kernel/elf.c's ELF_CODE_LIMIT is shrunk by exactly
+ * this one page to guarantee no real program's code/data/bss can ever
+ * extend into it. See docs/process-management.md. */
+#define SIGNAL_TRAMPOLINE_VA (USER_WINDOW_END - USER_STACK_SIZE - PUREUNIX_PAGE_SIZE)
+
 /* Per-process page directory ----------------------------------------------- */
 uint32_t    vmm_create_user_directory(void);
 void        vmm_free_user_directory(uint32_t pd_phys);

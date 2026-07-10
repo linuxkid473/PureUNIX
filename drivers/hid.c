@@ -122,6 +122,8 @@ static int translate_usage(uint8_t usage, bool shift, bool ctrl, bool *caps_lock
         if (ch == 'q' || ch == 'Q') return KEY_CTRL_Q;
         if (ch == 'f' || ch == 'F') return KEY_CTRL_F;
         if (ch == 'c' || ch == 'C') return KEY_CTRL_C;
+        if (ch == 'z' || ch == 'Z') return KEY_CTRL_Z;
+        if (ch == '\\') return KEY_CTRL_BACKSLASH;
     }
     return ch;
 }

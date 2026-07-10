@@ -49,6 +49,7 @@ typedef enum vfs_fs_type {
     VFS_FS_NONE = 0,
     VFS_FS_EXT2,
     VFS_FS_FAT16,
+    VFS_FS_PROCFS,
 } vfs_fs_type_t;
 
 /* The set of operations a filesystem driver exposes to the VFS mount layer.

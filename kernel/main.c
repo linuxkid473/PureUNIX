@@ -17,6 +17,7 @@
 #include <pureunix/memory.h>
 #include <pureunix/panic.h>
 #include <pureunix/pci.h>
+#include <pureunix/procfs.h>
 #include <pureunix/ramdisk.h>
 #include <pureunix/serial.h>
 #include <pureunix/shell.h>
@@ -84,6 +85,30 @@ static void run_login_shell(void)
     shell_run();
 }
 
+/* The dedicated orphan-adoption task (task_set_init_pid(), kernel/task.c) —
+ * not literally PID 1 (main_task, tasking_init(), already holds that,
+ * running VT1's session), so this ends up as PID 2 instead: a small,
+ * honest deviation from strict POSIX PID-1 numbering, not a functional
+ * gap. Does nothing but continuously reap whatever child task_exit() has
+ * re-parented to it, guaranteeing no process is ever a permanent zombie
+ * just because its real parent exited before it did. See
+ * docs/process-management.md. */
+static void init_reaper_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (task_waitpid(-1, NULL, 0) < 0) {
+            /* No children at all right now (the common case — orphans
+             * are the exception, not the rule) — task_waitpid() returns
+             * immediately rather than blocking when it has zero children,
+             * so poll instead of busy-looping. Once it *does* have at
+             * least one live child, task_waitpid() blocks (cooperatively)
+             * on its own until that child exits, no extra sleep needed. */
+            pit_sleep(50);
+        }
+    }
+}
+
 /* Entry point for VT2..NUM_VTS's session tasks (kernel/vt.c, task_create()
  * below) — VT1 keeps running as main_task itself (see kernel_main()'s tail
  * loop) rather than getting a seventh task, since kernel_main() already is
@@ -99,7 +124,12 @@ static void run_login_shell(void)
  * shell launches) — belong to its own VT instead. */
 static void vt_session_main(void *arg)
 {
-    task_current()->vt_id = (int)(uint32_t)arg;
+    int vt_id = (int)(uint32_t)arg;
+    task_current()->vt_id = vt_id;
+    /* Every VT's session task is its own session leader and initial
+     * controlling-terminal owner — see vt_claim_session() and
+     * docs/process-management.md. */
+    vt_claim_session(vt_id);
     for (;;) {
         run_login_shell();
     }
@@ -148,6 +178,14 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     tasking_init();
     syscall_init();
     pit_init(100);
+    /* Spawned as early as possible (right after the PIT it relies on for
+     * its own idle-poll sleep is up) so no real process can possibly
+     * exit — and need an orphan-adoption target — before this exists.
+     * Naturally becomes PID 2, right after main_task's PID 1. */
+    task_t *init_reaper = task_create("init-reaper", init_reaper_main, NULL);
+    if (init_reaper) {
+        task_set_init_pid(init_reaper->id);
+    }
     keyboard_init();
     tty_init();
     vt_init();
@@ -155,6 +193,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
      * VT1's session for the rest of boot -- see the tail loop below and
      * vt_session_main() above for VT2..NUM_VTS. */
     task_current()->vt_id = 0;
+    vt_claim_session(0);
     ata_init();
     pci_scan();
     e1000_init();
@@ -209,6 +248,14 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
             printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
         }
     }
+
+    /* /proc — synthetic, read-only, generated on demand from
+     * kernel/task.c's own live task list (fs/procfs.c). Mounted after
+     * tasking_init() (already true — this runs well after it) so
+     * task_list() always has at least main_task to report. */
+    vfs_mount("/proc", VFS_FS_PROCFS, procfs_vfs_ops(), NULL);
+    printf("procfs mounted on /proc\n");
+
     boot_checkpoint("after filesystem mount");
 
     arch_enable_interrupts();

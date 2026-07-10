@@ -128,6 +128,8 @@ static void keyboard_irq(interrupt_regs_t *regs)
         else if (ch == 'q' || ch == 'Q') ch = KEY_CTRL_Q;
         else if (ch == 'f' || ch == 'F') ch = KEY_CTRL_F;
         else if (ch == 'c' || ch == 'C') ch = KEY_CTRL_C;
+        else if (ch == 'z' || ch == 'Z') ch = KEY_CTRL_Z;
+        else if (ch == '\\') ch = KEY_CTRL_BACKSLASH;
     }
     if (ch) {
         vt_input_push(ch);

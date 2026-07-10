@@ -69,7 +69,7 @@ static int syscall3(int n, int a, int b, int c)
 | 22 | `SYS_SYMLINK` | target pointer | path pointer | — | 0 or negative error |
 | 23 | `SYS_FORK` | — | — | — | child's pid in the parent, `0` in the child, or `-1` |
 | 24 | `SYS_EXEC` | path pointer | `argv[]` pointer, or 0 | `envp[]` pointer, or 0 | only returns (negative error) on failure |
-| 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | — | reaped child's pid, or `-1` if no such child |
+| 25 | `SYS_WAIT` | pid (`-1` = any child) | `int *status` or NULL | options (`PU_WNOHANG`/`PU_WUNTRACED`) | reaped child's pid, a stopped child's pid (`PU_WUNTRACED`), or `-1` if no such child |
 | 26 | `SYS_TCGETATTR` | fd (0, 1, or 2) | `struct termios *` | — | 0 or negative error |
 | 27 | `SYS_TCSETATTR` | fd (0, 1, or 2) | `struct termios *` | actions (`TCSANOW`/`TCSADRAIN`/`TCSAFLUSH`) | 0 or negative error |
 | 28 | `SYS_IOCTL` | fd (0, 1, or 2) | request (`TIOCGWINSZ`) | `struct winsize *` | 0 or negative error |
@@ -432,11 +432,11 @@ Fork before exec (the classic `fork()` + `exec()` pattern) to run a new program 
 
 Blocks (cooperatively, via `task_yield()`) until a child of the caller becomes a zombie, then reaps it. See `docs/scheduler.md`'s "Waiting" section.
 
-**Arguments**: `EBX`: pid to wait for (`-1` = any child of the caller), `ECX`: pointer to an `int` to receive the exit code, or NULL to discard it.
+**Arguments**: `EBX`: pid to wait for (`-1` = any child of the caller), `ECX`: pointer to an `int` to receive the exit code, or NULL to discard it, `EDX`: options bitmask (`PU_WNOHANG=1`, `PU_WUNTRACED=2` — `include/pureunix/task.h`; `PU_WNOHANG` is accepted but not yet implemented, `task_waitpid()` always blocks).
 
-**Returns**: the reaped child's pid, or `-1` if the caller has no child matching `pid` (neither running nor already a zombie).
+**Returns**: the reaped child's pid, or (with `PU_WUNTRACED`) a still-live child's pid the instant it enters `TASK_STOPPED`, or `-1` if the caller has no child matching `pid` (neither running nor already a zombie).
 
-The `int` written to `*status` is the child's bare exit code (e.g. a child that called `pu_exit(7)` leaves `7` there) — not Linux's `(code << 8)`-style encoding, since there's no signal-terminated case to distinguish yet (see this doc's "Unimplemented Syscalls" section's note on `kill`/`signal`). `pu_wait()` and `user/systest.c`'s regression coverage both expect this raw form. Newlib's `wait()`/`waitpid()` (`user/newlib_syscalls.c`) translate it to the Linux-style encoding at the libc boundary — `(code & 0xff) << 8` — purely so newlib's own `<sys/wait.h>` `WIFEXITED`/`WEXITSTATUS` macros (which assume that encoding) work correctly; the kernel ABI itself is unaffected.
+The `int` written to `*status` is one of three raw encodings a caller must distinguish by sign/range: `>= 0` is the child's bare exit code (e.g. a child that called `pu_exit(7)` leaves `7` there); `-1..-127` means the child was killed by signal `-status` (`kernel/task.c`'s `signal_send()`); `<= -1000` means the child was *stopped* by signal `-(status+1000)` (only produced with `PU_WUNTRACED`, and only once per stop — see `task_t.stop_reported`) — the child is still alive and NOT reaped in this case. `pu_wait()` and `user/systest.c`'s regression coverage both expect this raw form. Newlib's `wait()`/`waitpid()` (`user/newlib_syscalls.c`'s `encode_wait_status()`) translate all three cases to the Linux-style encoding at the libc boundary so newlib's own `<sys/wait.h>` `WIFEXITED`/`WEXITSTATUS`/`WIFSIGNALED`/`WTERMSIG`/`WIFSTOPPED`/`WSTOPSIG` macros work correctly; the kernel ABI itself is unaffected. Stopping or resuming (`SIGCONT`) a child also sends its parent a real `SIGCHLD` (`kernel/signal.c`), so a shell blocked in `waitpid(..., WUNTRACED)` wakes up for both transitions, not just exit.
 
 ---
 

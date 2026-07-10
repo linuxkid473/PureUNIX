@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -99,6 +100,15 @@ enum {
     PU_SYS_EXEC   = 24,
     PU_SYS_WAIT   = 25,
     PU_SYS_FSTAT  = 44,
+    PU_SYS_SETPGID = 45,
+    PU_SYS_GETPGID = 46,
+    PU_SYS_SETSID  = 47,
+    PU_SYS_GETSID  = 48,
+    PU_SYS_SIGACTION   = 49,
+    PU_SYS_SIGPROCMASK = 50,
+    PU_SYS_SIGPENDING  = 51,
+    PU_SYS_SETPRIORITY = 52,
+    PU_SYS_GETPRIORITY = 53,
 };
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
@@ -471,6 +481,19 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
     return r < 0 ? fail(r) : 0;
 }
 
+/* usleep(3): microsecond sleep, built directly on the real nanosleep()
+ * above — newlib declares it (sys/unistd.h) but never defines it for
+ * this freestanding target. BusyBox's `top` (M8, once CONFIG_TOP is on)
+ * calls this for its own refresh interval. */
+int usleep(useconds_t usec)
+{
+    struct timespec req = {
+        .tv_sec = (time_t)(usec / 1000000u),
+        .tv_nsec = (long)((usec % 1000000u) * 1000u),
+    };
+    return nanosleep(&req, NULL);
+}
+
 /* No SYS_UNAME — PureUNIX has no version/hostname state to report on, so
  * this reports fixed compile-time strings instead of failing outright
  * (the README's own version banner, "PureUnix 0.1.0 for i686" — see
@@ -815,9 +838,10 @@ int utimes(const char *path, const struct timeval times[2])
     return r < 0 ? fail(r) : 0;
 }
 
-/* Only TIOCGWINSZ is a real request (SYS_IOCTL, docs/syscalls.md) — any
- * other request fails with -EINVAL at the syscall level, same as it would
- * through libpure's pu_ioctl(). */
+/* TIOCGWINSZ/TIOCSFONT/VT_GETACTIVE/VT_ACTIVATE/TIOCGPGRP/TIOCSPGRP are
+ * real requests (SYS_IOCTL, docs/syscalls.md) — any other request fails
+ * with -EINVAL at the syscall level, same as it would through libpure's
+ * pu_ioctl(). */
 int ioctl(int fd, int request, ...)
 {
     va_list ap;
@@ -825,6 +849,24 @@ int ioctl(int fd, int request, ...)
     void *argp = va_arg(ap, void *);
     va_end(ap);
     int r = raw_syscall(PU_SYS_IOCTL, fd, request, (int)argp);
+    return r < 0 ? fail(r) : 0;
+}
+
+/* tcgetpgrp()/tcsetpgrp() — POSIX's controlling-terminal foreground
+ * process group accessors, built on TIOCGPGRP/TIOCSPGRP the same way real
+ * libc implementations are. What BusyBox ash's job control (once
+ * CONFIG_ASH_JOB_CONTROL is on) uses to move a job into/out of the
+ * foreground. See kernel/vt.c's vt_get_fg_pgid()/vt_set_fg_pgid(). */
+pid_t tcgetpgrp(int fd)
+{
+    int pgrp = 0;
+    int r = raw_syscall(PU_SYS_IOCTL, fd, TIOCGPGRP, (int)&pgrp);
+    return r < 0 ? fail(r) : pgrp;
+}
+
+int tcsetpgrp(int fd, pid_t pgrp)
+{
+    int r = raw_syscall(PU_SYS_IOCTL, fd, TIOCSPGRP, (int)&pgrp);
     return r < 0 ? fail(r) : 0;
 }
 
@@ -1196,13 +1238,19 @@ int execvp(const char *file, char *const argv[])
  * 7 bits instead). SYS_KILL (docs/syscalls.md) encodes "died from signal
  * N" as a *negative* raw exit code (-N) — never ambiguous with a real exit
  * code, which is always >= 0 — so translating here is just picking which
- * of the two encodings applies. */
+ * of the two encodings applies. A third case, raw_code <= -1000, means
+ * "stopped by signal -(raw_code+1000)" (kernel/task.c's task_waitpid(),
+ * only ever produced when WUNTRACED is passed) — translated to newlib's
+ * WIFSTOPPED/WSTOPSIG encoding (stop signal in bits 8-15, low byte 0x7f). */
 static void encode_wait_status(int *status, int raw_code)
 {
     if (!status) {
         return;
     }
-    if (raw_code < 0) {
+    if (raw_code <= -1000) {
+        int stop_sig = -(raw_code + 1000);
+        *status = ((stop_sig & 0xff) << 8) | 0x7f;
+    } else if (raw_code < 0) {
         *status = (-raw_code) & 0x7f;
     } else {
         *status = (raw_code & 0xff) << 8;
@@ -1223,9 +1271,8 @@ pid_t wait(int *status)
 
 pid_t waitpid(pid_t pid, int *status, int options)
 {
-    (void)options;
     int raw_code = 0;
-    int r = raw_syscall(PU_SYS_WAIT, pid, (int)&raw_code, 0);
+    int r = raw_syscall(PU_SYS_WAIT, pid, (int)&raw_code, options);
     if (r < 0) {
         errno = ECHILD;
         return -1;
@@ -1249,53 +1296,173 @@ int kill(pid_t pid, int sig)
     return r < 0 ? fail(r) : 0;
 }
 
+/* killpg(pgrp, sig) is exactly kill(-pgrp, sig) — POSIX's own definition —
+ * except pgrp == 0 means "the caller's own process group", which the
+ * kernel's SYS_KILL already treats pid == 0 as (docs/syscalls.md), so no
+ * translation is needed for that case either. Needed for BusyBox ash's
+ * job control (M9): `kill %1` / stopping or backgrounding a whole
+ * pipeline signals every process in the job's group at once. */
+int killpg(pid_t pgrp, int sig)
+{
+    if (pgrp < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return kill(pgrp == 0 ? 0 : -pgrp, sig);
+}
+
 pid_t getppid(void)
 {
     return raw_syscall(PU_SYS_GETPPID, 0, 0, 0);
 }
 
-/* No real asynchronous signal-handler dispatch exists in this kernel (see
- * SYS_KILL's doc in docs/syscalls.md — every delivered signal takes its
- * POSIX default action unconditionally, there is no mechanism to invoke a
- * handler inside a running task). sigaction()/sigprocmask() still need to
- * exist and behave sensibly for ash to link and run at all (it always
- * installs handlers for a few signals at startup, job control or not) —
- * this is honest bookkeeping (record what was asked, report it back
- * correctly on a later query) rather than a stub that silently misbehaves:
- * nothing will actually invoke sa_handler, which is the known, documented
- * limitation, not a bug in this translation layer. */
-static struct sigaction pu_sigactions[32];
-static sigset_t pu_sigmask = 0;
+/* Process groups and sessions — see SYS_SETPGID/SYS_GETPGID/SYS_SETSID/
+ * SYS_GETSID in docs/syscalls.md. */
+int setpgid(pid_t pid, pid_t pgid)
+{
+    int r = raw_syscall(PU_SYS_SETPGID, pid, pgid, 0);
+    return r < 0 ? fail(r) : 0;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    int r = raw_syscall(PU_SYS_GETPGID, pid, 0, 0);
+    return r < 0 ? fail(r) : r;
+}
+
+pid_t getpgrp(void)
+{
+    return getpgid(0);
+}
+
+pid_t setsid(void)
+{
+    int r = raw_syscall(PU_SYS_SETSID, 0, 0, 0);
+    return r < 0 ? fail(r) : r;
+}
+
+pid_t getsid(pid_t pid)
+{
+    int r = raw_syscall(PU_SYS_GETSID, pid, 0, 0);
+    return r < 0 ? fail(r) : r;
+}
+
+/* Real signal delivery — SYS_SIGACTION/SYS_SIGPROCMASK (docs/syscalls.md,
+ * kernel/signal.c, arch/i386/signal.c). This layer's only job is
+ * translating between newlib's own struct sigaction (sa_handler/sa_mask/
+ * sa_flags) and the kernel's much smaller pu_sigaction_t (just a
+ * handler) — sa_mask and every sa_flags bit are accepted (so callers that
+ * set them don't get an error) but not actually honored by the kernel;
+ * see include/pureunix/signal.h's own scope-notes comment for why
+ * (SA_NODEFER-equivalent nesting, additional-signals-blocked-during-
+ * handler beyond the signal itself, etc. are all out of scope for this
+ * kernel's deliberately narrow, boundary-only delivery mechanism). This
+ * is honest, not a silent stub: the handler genuinely does run now. */
+typedef struct pu_sigaction {
+    unsigned int handler;
+} pu_sigaction_t;
 
 int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
 {
-    if (sig <= 0 || (size_t)sig >= sizeof(pu_sigactions) / sizeof(pu_sigactions[0])) {
-        errno = EINVAL;
-        return -1;
+    pu_sigaction_t in, out;
+    pu_sigaction_t *inp = NULL;
+    if (act) {
+        in.handler = (unsigned int)(uintptr_t)act->sa_handler;
+        inp = &in;
+    }
+    int r = raw_syscall(PU_SYS_SIGACTION, sig, (int)inp, (int)&out);
+    if (r < 0) {
+        return fail(r);
     }
     if (oldact) {
-        *oldact = pu_sigactions[sig];
-    }
-    if (act) {
-        pu_sigactions[sig] = *act;
+        memset(oldact, 0, sizeof(*oldact));
+        oldact->sa_handler = (_sig_func_ptr)(uintptr_t)out.handler;
     }
     return 0;
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 {
-    if (oldset) {
-        *oldset = pu_sigmask;
+    unsigned int in = set ? (unsigned int)*set : 0;
+    unsigned int out = 0;
+    int r = raw_syscall(PU_SYS_SIGPROCMASK, how, set ? (int)&in : 0, (int)&out);
+    if (r < 0) {
+        return fail(r);
     }
-    if (set) {
-        switch (how) {
-        case SIG_BLOCK:   pu_sigmask |= *set; break;
-        case SIG_UNBLOCK: pu_sigmask &= ~*set; break;
-        case SIG_SETMASK: pu_sigmask = *set; break;
-        default: errno = EINVAL; return -1;
-        }
+    if (oldset) {
+        *oldset = out;
     }
     return 0;
+}
+
+int sigpending(sigset_t *set)
+{
+    if (!set) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned int out = 0;
+    int r = raw_syscall(PU_SYS_SIGPENDING, (int)&out, 0, 0);
+    if (r < 0) {
+        return fail(r);
+    }
+    *set = out;
+    return 0;
+}
+
+/* nice()/renice() — SYS_SETPRIORITY/SYS_GETPRIORITY (docs/syscalls.md)
+ * only ever target a single process (there's no real notion of "every
+ * process in this group/owned by this user" to iterate — see
+ * user/newlib_compat/sys/resource.h's own comment), matching PRIO_PROCESS.
+ * PRIO_PGRP/PRIO_USER are rejected here rather than silently
+ * misinterpreted. */
+int getpriority(int which, id_t who)
+{
+    if (which != PRIO_PROCESS) {
+        errno = EINVAL;
+        return -1;
+    }
+    int out = 0;
+    int r = raw_syscall(PU_SYS_GETPRIORITY, (int)who, (int)&out, 0);
+    if (r < 0) {
+        return fail(r);
+    }
+    return out;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+    if (which != PRIO_PROCESS) {
+        errno = EINVAL;
+        return -1;
+    }
+    int r = raw_syscall(PU_SYS_SETPRIORITY, (int)who, prio, 0);
+    return r < 0 ? fail(r) : 0;
+}
+
+/* nice(2): adjusts the caller's own niceness by `incr` relative to its
+ * *current* value (not an absolute set like setpriority()) and returns
+ * the new value — or -1 with errno set. Real callers distinguish a
+ * legitimate result of -1 from an error by clearing errno first, exactly
+ * like getpriority() above; this implementation follows the same
+ * convention (only sets errno on a genuine failure). */
+int nice(int incr)
+{
+    errno = 0;
+    int current = getpriority(PRIO_PROCESS, 0);
+    if (current == -1 && errno != 0) {
+        return -1;
+    }
+    int wanted = current + incr;
+    if (wanted < -20) {
+        wanted = -20;
+    } else if (wanted > 19) {
+        wanted = 19;
+    }
+    if (setpriority(PRIO_PROCESS, 0, wanted) != 0) {
+        return -1;
+    }
+    return wanted;
 }
 
 /* Real signal delivery would block the caller until one of the unblocked

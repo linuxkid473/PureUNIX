@@ -674,8 +674,9 @@ static void ps_cb(const task_t *task, void *ctx)
 {
     shell_output_t *out = ctx;
     const char *state = task->state == TASK_RUNNING ? "run" :
-                        task->state == TASK_READY ? "ready" :
-                        task->state == TASK_SLEEPING ? "sleep" : "zombie";
+                        task->state == TASK_RUNNABLE ? "ready" :
+                        task->state == TASK_SLEEPING ? "sleep" :
+                        task->state == TASK_STOPPED ? "stop" : "zombie";
     shell_out_printf(out, "%u\t%s\t%s\n", task->id, state, task->name);
 }
 

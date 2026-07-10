@@ -1,6 +1,7 @@
 #include <pureunix/arch.h>
 #include <pureunix/io.h>
 #include <pureunix/panic.h>
+#include <pureunix/signal.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
@@ -48,6 +49,7 @@ extern void irq8(void); extern void irq9(void); extern void irq10(void); extern 
 extern void irq12(void); extern void irq13(void); extern void irq14(void); extern void irq15(void);
 extern void isr128(void);
 extern void isr129(void);
+extern void isr130(void);
 
 static const char *exception_names[] = {
     "divide by zero", "debug", "non-maskable interrupt", "breakpoint",
@@ -105,13 +107,81 @@ void idt_init(void)
 
     idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE);
     idt_set_gate(0x81, (uint32_t)isr129, 0x08, 0xEE);
+    idt_set_gate(0x82, (uint32_t)isr130, 0x08, 0xEE);
     idt_load((uint32_t)&idtp);
+}
+
+/* The single safe point to act on a pending forced-preemption request
+ * (arch/i386/pit.c's pit_take_need_resched()) or, from M5 on, a pending
+ * signal: right before iret-ing back to ring 3, never mid-kernel-code.
+ * `(regs->cs & 3) == 3` is exactly "this trap is about to return to a
+ * ring-3 task" — the same boundary isr_common_stub's own `sti` already
+ * treats as "safe to leave interrupts enabled from here on". Calling
+ * task_yield() here (ordinary kernel-mode code by this point, not IRQ
+ * context — isr_dispatch() itself is not the raw handler) is exactly how
+ * SYS_NANOSLEEP already blocks, so this is a well-exercised path, not a
+ * new kind of call. */
+/* Ordering contract: forced preemption is checked (and, if it fires, the
+ * yield-away-and-eventually-back-again fully completes) *before* signal
+ * delivery is evaluated on the same return — by the time check_preempt()
+ * returns, task_current() is guaranteed to be this same trap's own task
+ * again (task_yield() only ever resumes a suspended call site once that
+ * exact task is rescheduled), so checking signals second still sees an
+ * up-to-date, correct pending_signals for the task actually about to
+ * resume ring 3. Reversing the order would risk redirecting `regs` into
+ * a signal handler for a task that's about to be preempted away again
+ * immediately, which — while not unsafe — would be a needlessly
+ * confusing interleaving to reason about. */
+static void ring3_return_hook(interrupt_regs_t *regs)
+{
+    if ((regs->cs & 3) != 3) {
+        return;
+    }
+    if (pit_take_need_resched()) {
+        task_yield();
+    }
+    signal_deliver_pending(regs);
+
+    /* Safety net: a signal delivered synchronously — e.g. a default-
+     * terminate/stop action from kernel/signal.c's signal_send()/
+     * signal_send_pgrp() that happened to target this same task (a
+     * keyboard-generated Ctrl+C/Ctrl+Z reaching the interrupted task
+     * itself as a member of the signaled foreground process group —
+     * kernel/vt.c's vt_input_push(), M6) — already changed this task's
+     * own state directly. It must stop running, not fall through to
+     * iret-ing back into ring 3 on a stale assumption that it's still
+     * runnable. Subsumes the same check SYS_KILL's self-target case
+     * (arch/i386/syscall.c) already does explicitly; kept there too as
+     * belt-and-suspenders, this is the generic catch-all. */
+    task_t *t = task_current();
+    if (t && t->state != TASK_RUNNING) {
+        if (regs->int_no == 0x80) {
+            /* Ordinary C code by this point, not a raw IRQ handler —
+             * exactly the SYS_NANOSLEEP-proven-safe context task_yield()
+             * already blocks from. */
+            task_yield();
+            if (t->state == TASK_ZOMBIE) {
+                for (;;) {
+                    arch_halt();
+                }
+            }
+        } else {
+            /* Reached via a raw IRQ's own dispatch (e.g. the keyboard
+             * IRQ delivering a signal straight from vt_input_push()) —
+             * defer the actual yield to the next timer tick rather than
+             * adding a second, unproven task_yield() call site alongside
+             * the one PIT-triggered preemption above already exercises.
+             * See pit_force_resched()'s own comment. */
+            pit_force_resched();
+        }
+    }
 }
 
 void isr_dispatch(interrupt_regs_t *regs)
 {
     if (regs->int_no == 0x80) {
         regs->eax = syscall_dispatch(regs);
+        ring3_return_hook(regs);
         return;
     }
 
@@ -120,6 +190,13 @@ void isr_dispatch(interrupt_regs_t *regs)
          * task_exit() never returns for the exiting task — it context
          * switches away to whoever is waiting in task_join(). */
         task_exit((int)regs->ebx);
+        return;
+    }
+
+    if (regs->int_no == 0x82) {
+        /* Sigreturn trap: not part of the public syscall ABI — see
+         * arch/i386/signal.c. */
+        signal_handle_sigreturn(regs);
         return;
     }
 
@@ -137,4 +214,6 @@ void isr_dispatch(interrupt_regs_t *regs)
     if (regs->int_no >= 32 && regs->int_no < 48) {
         pic_send_eoi((uint8_t)(regs->int_no - 32));
     }
+
+    ring3_return_hook(regs);
 }

@@ -1,11 +1,15 @@
 #include <pureunix/arch.h>
+#include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
 #include <pureunix/memory.h>
+#include <pureunix/signal.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/task.h>
+#include <pureunix/time.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vmm.h>
+#include <pureunix/wait.h>
 
 /* Every syscall — including deep VFS/filesystem call chains — runs on the
  * calling task's own kernel stack (there is no separate per-syscall stack).
@@ -28,6 +32,14 @@ static task_t main_task;
 static task_t *current;
 static task_t *task_list_head;
 static uint32_t next_task_id = 1;
+/* The init-reaper task's pid (kernel/main.c spawns it at boot) —
+ * task_exit() re-parents every orphaned child to this task, which does
+ * nothing but loop task_waitpid(-1, NULL) forever, guaranteeing no
+ * process is ever a permanent zombie just because its real parent exited
+ * first. 0 (never a valid pid) until kernel/main.c calls
+ * task_set_init_pid(), which is early enough in boot that no real
+ * process can exit before it's set. */
+static uint32_t g_init_pid;
 
 static void task_bootstrap(void)
 {
@@ -109,8 +121,18 @@ int open_file_unref(open_file_t *f)
         if (p) {
             if (f->pipe_is_write_end) {
                 p->write_ends--;
+                /* Last writer gone: any reader blocked on an empty pipe
+                 * must wake up to see EOF instead of waiting forever. */
+                if (p->write_ends == 0) {
+                    wait_queue_wake_all(&p->read_wq);
+                }
             } else {
                 p->read_ends--;
+                /* Last reader gone: any writer blocked on a full pipe
+                 * must wake up to see EPIPE instead of waiting forever. */
+                if (p->read_ends == 0) {
+                    wait_queue_wake_all(&p->write_wq);
+                }
             }
             if (p->read_ends == 0 && p->write_ends == 0) {
                 kfree(p);
@@ -139,6 +161,15 @@ void tasking_init(void)
     main_task.gid = 0;
     main_task.vt_id = -1; /* claimed as VT1 once kernel_main() calls vt_init() */
     strcpy(main_task.cwd, "/");
+    /* The boot task has no parent; it's its own process group and session
+     * leader by definition (there's nothing else running yet for it to
+     * inherit either from). */
+    main_task.ppid = 0;
+    main_task.pgid = main_task.id;
+    main_task.sid = main_task.id;
+    main_task.nice = 0;
+    main_task.start_time = time_now();
+    strncpy(main_task.cmdline, main_task.name, sizeof(main_task.cmdline) - 1);
     current = &main_task;
     task_list_head = &main_task;
 }
@@ -156,7 +187,7 @@ static task_t *task_alloc(const char *name)
     }
     task->id = next_task_id++;
     strncpy(task->name, name ? name : "task", sizeof(task->name) - 1);
-    task->state = TASK_READY;
+    task->state = TASK_RUNNABLE;
     reserve_stdio(task);
     /* Credentials propagate from creator to child — the only "process
      * spawning" rule that exists before a real login/setuid model arrives. */
@@ -164,7 +195,15 @@ static task_t *task_alloc(const char *name)
     task->gid = current ? current->gid : 0;
     task->vt_id = current ? current->vt_id : -1;
     strcpy(task->cwd, current && current->cwd[0] ? current->cwd : "/");
-    task->parent = current;
+    task->ppid = current ? current->id : 0;
+    /* A fresh task starts in its creator's process group/session — real
+     * group/session changes only ever happen via an explicit setpgid()/
+     * setsid() call afterwards (see kernel/task.c's task_setpgid()). */
+    task->pgid = current ? current->pgid : task->id;
+    task->sid = current ? current->sid : task->id;
+    task->nice = current ? current->nice : 0;
+    task->start_time = time_now();
+    strncpy(task->cmdline, task->name, sizeof(task->cmdline) - 1);
     task->pd_phys = current ? current->pd_phys : vmm_kernel_directory_phys();
 
     uint32_t *sp = (uint32_t *)(task->stack_base + TASK_STACK_SIZE);
@@ -174,12 +213,19 @@ static task_t *task_alloc(const char *name)
     *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
     task->stack_ptr = sp;
 
+    /* task->next is set *before* splicing the new node into the list
+     * (not after) so an IRQ-context list walk (kernel/vt.c's
+     * vt_input_push() -> kernel/signal.c's signal_send_pgrp() ->
+     * task_list(), M6) can never observe a task whose ->next is still
+     * NULL (kcalloc's zero-fill) — the single `tail->next = task`
+     * pointer write below is what actually makes the new node visible,
+     * and by then it's already fully formed. */
     task_t *tail = task_list_head;
     while (tail->next != task_list_head) {
         tail = tail->next;
     }
-    tail->next = task;
     task->next = task_list_head;
+    tail->next = task;
     return task;
 }
 
@@ -283,23 +329,83 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
         }
         child->fds[i].used = true;
         child->fds[i].closed_explicitly = current->fds[i].closed_explicitly;
+        child->fds[i].cloexec = current->fds[i].cloexec;
         child->fds[i].file = current->fds[i].file;
         open_file_ref(child->fds[i].file);
     }
 
+    /* Signal dispositions and the blocked-signal mask are inherited
+     * as-is across fork() — POSIX. Critically, this is what makes an
+     * interactive shell's own SIGINT/SIGQUIT self-protection (installing
+     * SIG_IGN for itself, standard practice for any POSIX shell so
+     * Ctrl+C on a foreground *job* doesn't also kill the shell, since a
+     * freshly forked job shares the shell's own process group) actually
+     * take effect in the child too — a real handler function pointer is
+     * also inherited here (matches POSIX fork()) but is meaningless
+     * until the child calls exec(), at which point elf_exec_current()
+     * resets it back to SIG_DFL (the code it pointed to no longer exists
+     * once the image is replaced) while preserving SIG_IGN, exactly like
+     * a real exec(). Pending signals are deliberately NOT inherited — a
+     * fresh child starts with none of its own, matching POSIX. */
+    memcpy(child->sig_handlers, current->sig_handlers, sizeof(child->sig_handlers));
+    child->blocked_signals = current->blocked_signals;
+
+    /* task_alloc() already defaulted child->cmdline to just its generic
+     * task name — a fork()ed child should instead start out reporting
+     * the *same* cmdline as its parent (real fork() semantics: argv isn't
+     * touched until the child calls its own exec(), see kernel/elf.c's
+     * pack_cmdline()). */
+    strncpy(child->cmdline, current->cmdline, sizeof(child->cmdline) - 1);
+    child->cmdline[sizeof(child->cmdline) - 1] = '\0';
+
     return child;
 }
 
+/* nice-weighted round robin: a candidate with nice > 0 is skipped
+ * `nice` extra scheduling passes between turns (skip_counter counts
+ * those down), so a heavily-reniced task measurably gets less of the
+ * CPU than its neighbors — a real, observable scheduling difference,
+ * not cosmetic bookkeeping. Deliberately doesn't implement the
+ * opposite (a negative-nice task getting picked *more* often than a
+ * plain round-robin turn) — that needs real accounting (a vruntime-
+ * style scheme) this cooperative scheduler has no other use for; the
+ * de-prioritization side alone is what "nice"/"renice" are almost
+ * always actually used to demonstrate or rely on in practice, and it's
+ * already sufficient to make a low-priority vs. default/high-priority
+ * comparison come out correctly. See docs/process-management.md. */
 static task_t *next_ready_task(void)
 {
     task_t *candidate = current->next;
     while (candidate != current) {
-        if (candidate->state == TASK_READY || candidate->state == TASK_RUNNING) {
+        if (candidate->state == TASK_RUNNABLE || candidate->state == TASK_RUNNING) {
+            if (candidate->nice > 0 && candidate->skip_counter > 0) {
+                candidate->skip_counter--;
+                candidate = candidate->next;
+                continue;
+            }
+            if (candidate->nice > 0) {
+                candidate->skip_counter = candidate->nice;
+            }
             return candidate;
         }
         candidate = candidate->next;
     }
     return current;
+}
+
+bool task_other_runnable_exists(void)
+{
+    if (!current) {
+        return false;
+    }
+    task_t *candidate = current->next;
+    while (candidate != current) {
+        if (candidate->state == TASK_RUNNABLE) {
+            return true;
+        }
+        candidate = candidate->next;
+    }
+    return false;
 }
 
 void task_yield(void)
@@ -310,9 +416,12 @@ void task_yield(void)
         return;
     }
     if (prev->state == TASK_RUNNING) {
-        prev->state = TASK_READY;
+        prev->state = TASK_RUNNABLE;
     }
     next->state = TASK_RUNNING;
+    /* Fresh quantum for whichever task is about to actually run — see
+     * arch/i386/pit.c's minimal-preemption check. */
+    next->quantum_ticks = 0;
     current = next;
     /* main_task runs on the boot stack (no stack_base) and never executes
      * in ring 3, so it has nothing to install here. */
@@ -325,10 +434,41 @@ void task_yield(void)
     context_switch(&prev->stack_ptr, next->stack_ptr);
 }
 
+void task_set_init_pid(uint32_t pid)
+{
+    g_init_pid = pid;
+}
+
 void task_exit(int code)
 {
     current->exit_code = code;
     current->state = TASK_ZOMBIE;
+
+    /* Re-parent every child of the exiting task to the init-reaper
+     * *before* signaling anyone or yielding away, so no orphan is ever
+     * left with a ppid pointing at a task_t that's about to be reaped out
+     * from under it — see g_init_pid's comment above. */
+    if (g_init_pid != 0) {
+        task_t *t = task_list_head;
+        do {
+            if (t->ppid == current->id) {
+                t->ppid = g_init_pid;
+            }
+            t = t->next;
+        } while (t != task_list_head);
+    }
+
+    task_t *parent = task_find(current->ppid);
+    signal_send(parent, SIGCHLD);
+    /* Wake a parent genuinely blocked in task_waitpid()'s wait_queue_sleep()
+     * (see task_t.child_wait's own comment) — signal_send() above only
+     * ever sets a pending-signal bit or, for a real SIGCHLD handler,
+     * defers to the ring3-return boundary; neither actually reschedules
+     * a parent that's parked here waiting for exactly this transition. */
+    if (parent) {
+        wait_queue_wake_all(&parent->child_wait);
+    }
+
     task_yield();
     for (;;) {
         arch_halt();
@@ -356,6 +496,27 @@ static void close_all_fds(task_t *t)
     }
 }
 
+/* exec()'s close-on-exec pass (kernel/elf.c's elf_exec_current(), the only
+ * exec() path that keeps the calling task's own fd table — elf_exec_argv()
+ * always creates a brand-new task_t with a fresh, empty one instead, so
+ * close-on-exec is meaningless there). Only ever closes a real fd (>= 3
+ * with a real open_file_t); fd_entry_t.cloexec is only ever set true by
+ * fcntl(F_DUPFD_CLOEXEC) (arch/i386/syscall.c), which never targets a
+ * console-bound 0/1/2 slot in practice (find_free_fd() always finds a real
+ * fd >= 3 first), but the fd>=3 guard here keeps that assumption from
+ * ever silently reverting 0/1/2 to the console binding if it somehow did. */
+void task_close_cloexec_fds(task_t *t)
+{
+    for (int i = 3; i < MAX_OPEN_FILES; i++) {
+        if (t->fds[i].used && t->fds[i].cloexec) {
+            open_file_unref(t->fds[i].file);
+            t->fds[i].file = NULL;
+            t->fds[i].used = false;
+            t->fds[i].cloexec = false;
+        }
+    }
+}
+
 int task_join(task_t *t)
 {
     if (!t) {
@@ -376,13 +537,44 @@ int task_join(task_t *t)
     return code;
 }
 
-int task_waitpid(int pid, int *status)
+typedef struct {
+    task_t *parent;
+    int pid;
+    int options;
+} waitpid_ctx_t;
+
+/* True the instant *some* matching child has a state task_waitpid() would
+ * act on — never mutates anything (unlike task_waitpid()'s own scan,
+ * which reaps/marks as a side effect), so it's safe to call repeatedly
+ * from wait_queue_sleep()'s check-and-block loop. */
+static bool waitpid_predicate(void *ctx_)
+{
+    waitpid_ctx_t *ctx = ctx_;
+    task_t *t = task_list_head;
+    if (!t) {
+        return false;
+    }
+    do {
+        if (t->ppid == ctx->parent->id && (ctx->pid == -1 || (int)t->id == ctx->pid)) {
+            if (t->state == TASK_ZOMBIE) {
+                return true;
+            }
+            if ((ctx->options & PU_WUNTRACED) && t->state == TASK_STOPPED && !t->stop_reported) {
+                return true;
+            }
+        }
+        t = t->next;
+    } while (t != task_list_head);
+    return false;
+}
+
+int task_waitpid(int pid, int *status, int options)
 {
     for (;;) {
         bool have_child = false;
         task_t *t = task_list_head;
         do {
-            if (t->parent == current && (pid == -1 || (int)t->id == pid)) {
+            if (t->ppid == current->id && (pid == -1 || (int)t->id == pid)) {
                 have_child = true;
                 if (t->state == TASK_ZOMBIE) {
                     int code = t->exit_code;
@@ -401,6 +593,20 @@ int task_waitpid(int pid, int *status)
                     }
                     return (int)reaped_id;
                 }
+                /* See task_t.stop_signal/stop_reported (task.h) and
+                 * kernel/signal.c's transitions into/out of TASK_STOPPED —
+                 * this sentinel (raw_code <= -1000) is disjoint from both
+                 * the normal-exit (>=0) and killed-by-signal (-127..-1)
+                 * ranges task_waitpid() already returns, so callers can
+                 * always tell the three apart. See docs/syscalls.md. */
+                if ((options & PU_WUNTRACED) && t->state == TASK_STOPPED &&
+                    !t->stop_reported) {
+                    t->stop_reported = true;
+                    if (status) {
+                        *status = -1000 - t->stop_signal;
+                    }
+                    return (int)t->id;
+                }
             }
             t = t->next;
         } while (t != task_list_head);
@@ -408,13 +614,35 @@ int task_waitpid(int pid, int *status)
         if (!have_child) {
             return -1;
         }
-        task_yield();
+        /* Real block on current->child_wait — see that field's own
+         * comment for why the old task_yield()-only loop this replaced
+         * was a real, user-visible bug (a busy-spin at 100% CPU for the
+         * entire lifetime of every foreground job), not just style.
+         * Woken by task_exit() and signal_send()'s TASK_STOPPED/
+         * TASK_ZOMBIE-producing transitions. */
+        waitpid_ctx_t ctx = { .parent = current, .pid = pid, .options = options };
+        wait_queue_sleep(&current->child_wait, waitpid_predicate, &ctx);
     }
 }
 
 task_t *task_current(void)
 {
     return current;
+}
+
+task_t *task_find(uint32_t id)
+{
+    if (!task_list_head) {
+        return NULL;
+    }
+    task_t *t = task_list_head;
+    do {
+        if (t->id == id) {
+            return t;
+        }
+        t = t->next;
+    } while (t && t != task_list_head);
+    return NULL;
 }
 
 uid_t current_uid(void)
@@ -461,27 +689,140 @@ void task_list(void (*cb)(const task_t *task, void *ctx), void *ctx)
     } while (task && task != task_list_head);
 }
 
+int task_setpgid(uint32_t pid, uint32_t pgid)
+{
+    task_t *target = pid == 0 ? current : task_find(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    if (target != current && target->ppid != current->id) {
+        return -EPERM;
+    }
+    /* A session leader's own group can never be changed — it would leave
+     * the group it currently leads (which may still have other members)
+     * leaderless while conflating its identity with a different group. */
+    if (target->pgid == target->sid && target->id == target->sid) {
+        return -EPERM;
+    }
+    uint32_t new_pgid = pgid == 0 ? target->id : pgid;
+    /* setpgid() only ever moves a process within its own session — never
+     * across sessions (POSIX). */
+    target->pgid = new_pgid;
+    return 0;
+}
+
+int task_getpgid(uint32_t pid)
+{
+    task_t *target = pid == 0 ? current : task_find(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    return (int)target->pgid;
+}
+
+int task_setsid(void)
+{
+    if (current->pgid == current->id) {
+        /* Already a process group leader — POSIX forbids setsid() here
+         * (see include/pureunix/task.h). */
+        return -EPERM;
+    }
+    current->sid = current->id;
+    current->pgid = current->id;
+    return (int)current->id;
+}
+
+int task_getsid(uint32_t pid)
+{
+    task_t *target = pid == 0 ? current : task_find(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    return (int)target->sid;
+}
+
+int task_setpriority(uint32_t pid, int nice)
+{
+    task_t *target = pid == 0 ? current : task_find(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    if (nice < -20) {
+        nice = -20;
+    } else if (nice > 19) {
+        nice = 19;
+    }
+    /* No privilege check — every task in this kernel effectively runs as
+     * root today (see include/pureunix/task.h's uid/gid comment), so
+     * there's no real distinction to enforce yet between "lower my own
+     * niceness" (POSIX: requires privilege) and any other renice. */
+    target->nice = nice;
+    /* Takes effect starting the *next* time this task is considered, not
+     * mid-cooldown from whatever its old nice value had already counted
+     * down. */
+    target->skip_counter = 0;
+    return 0;
+}
+
+int task_getpriority(uint32_t pid, int *out_nice)
+{
+    task_t *target = pid == 0 ? current : task_find(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    if (out_nice) {
+        *out_nice = target->nice;
+    }
+    return 0;
+}
+
 int task_kill(uint32_t id, int sig)
 {
-    task_t *task = task_list_head;
+    task_t *target = task_find(id);
+    if (!target || target == &main_task) {
+        return -1;
+    }
+    if (sig != 0) {
+        /* Real signal delivery — default action, SIG_IGN, or a real
+         * handler (kernel/signal.c). exit_code < 0 (when a default action
+         * terminates the target) means "killed by signal -exit_code",
+         * never ambiguous with a real exit code (always >= 0) — see
+         * task_exit()/SYS_WAIT in docs/syscalls.md. */
+        signal_send(target, sig);
+    }
+    /* sig == 0: the POSIX "null signal" — probe whether the pid exists
+     * and is killable, without actually sending anything. */
+    return 0;
+}
+
+bool task_pgrp_exists(uint32_t pgid)
+{
+    if (!task_list_head) {
+        return false;
+    }
+    task_t *t = task_list_head;
     do {
-        if (task->id == id && task != &main_task) {
-            if (sig != 0) {
-                /* No handler-dispatch mechanism exists (that would mean
-                 * injecting a call frame into a running ring-3 task's own
-                 * stack and trampolining back — a much larger feature);
-                 * every signal takes its POSIX *default* action instead.
-                 * exit_code < 0 means "killed by signal -exit_code" (never
-                 * ambiguous with a real exit code, which is always >= 0 —
-                 * see task_exit()/SYS_WAIT in docs/syscalls.md). */
-                task->exit_code = -sig;
-                task->state = TASK_ZOMBIE;
-            }
-            /* sig == 0: the POSIX "null signal" — probe whether the pid
-             * exists and is killable, without actually sending anything. */
-            return 0;
+        if (t->pgid == pgid && t->state != TASK_ZOMBIE) {
+            return true;
         }
-        task = task->next;
-    } while (task && task != task_list_head);
-    return -1;
+        t = t->next;
+    } while (t != task_list_head);
+    return false;
+}
+
+void task_yield_if_not_running(task_t *t)
+{
+    if (!t || t->state == TASK_RUNNING) {
+        return;
+    }
+    task_yield();
+    if (t->state == TASK_ZOMBIE) {
+        /* Never let a self-killed task's own code path resume executing
+         * real logic if task_yield() found nothing else ready and just
+         * no-op'd — mirrors task_exit()'s own halt-loop for that exact
+         * situation. */
+        for (;;) {
+            arch_halt();
+        }
+    }
 }

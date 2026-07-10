@@ -176,6 +176,53 @@ int pu_wait(int pid, int *status)
     return syscall3(SYS_WAIT, pid, (int)status, 0);
 }
 
+int pu_setpgid(int pid, int pgid)
+{
+    return syscall3(SYS_SETPGID, pid, pgid, 0);
+}
+
+int pu_getpgid(int pid)
+{
+    return syscall3(SYS_GETPGID, pid, 0, 0);
+}
+
+int pu_setsid(void)
+{
+    return syscall3(SYS_SETSID, 0, 0, 0);
+}
+
+int pu_getsid(int pid)
+{
+    return syscall3(SYS_GETSID, pid, 0, 0);
+}
+
+int pu_sigaction(int sig, const pu_sigaction_t *act, pu_sigaction_t *old)
+{
+    return syscall3(SYS_SIGACTION, sig, (int)act, (int)old);
+}
+
+int pu_sigprocmask(int how, const uint32_t *set, uint32_t *old)
+{
+    return syscall3(SYS_SIGPROCMASK, how, (int)set, (int)old);
+}
+
+uint32_t pu_sigpending(void)
+{
+    uint32_t out = 0;
+    syscall3(SYS_SIGPENDING, (int)&out, 0, 0);
+    return out;
+}
+
+int pu_setpriority(int pid, int nice)
+{
+    return syscall3(SYS_SETPRIORITY, pid, nice, 0);
+}
+
+int pu_getpriority(int pid, int *out_nice)
+{
+    return syscall3(SYS_GETPRIORITY, pid, (int)out_nice, 0);
+}
+
 int pu_tcgetattr(int fd, struct termios *out)
 {
     return syscall3(SYS_TCGETATTR, fd, (int)out, 0);

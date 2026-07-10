@@ -120,6 +120,30 @@ enum {
      * yet. Returns 0 or a negative error. See arch/i386/syscall.c and
      * docs/syscalls.md. */
     SYS_FSTAT = 44,
+
+    /* Process groups and sessions (POSIX setpgid()/getpgid()/setsid()/
+     * getsid()) — see kernel/task.c's task_setpgid()/task_getpgid()/
+     * task_setsid()/task_getsid() and docs/process-management.md.
+     * tcgetpgrp()/tcsetpgrp() are deliberately *not* separate syscalls —
+     * they ride on the existing SYS_IOCTL (TIOCGPGRP/TIOCSPGRP, see
+     * include/pureunix/ioctl.h), the same way VT_GETACTIVE/VT_ACTIVATE
+     * do, rather than growing the syscall table for what's really just
+     * another device-control request against a tty fd. */
+    SYS_SETPGID = 45, /* EBX: pid (0 == caller), ECX: pgid (0 == "use pid") */
+    SYS_GETPGID = 46, /* EBX: pid (0 == caller) */
+    SYS_SETSID  = 47, /* no args */
+    SYS_GETSID  = 48, /* EBX: pid (0 == caller) */
+
+    /* Signals — see include/pureunix/signal.h's pu_sigaction_t,
+     * kernel/signal.c, arch/i386/signal.c, and docs/process-management.md. */
+    SYS_SIGACTION   = 49, /* EBX: sig, ECX: const pu_sigaction_t *, EDX: pu_sigaction_t * (old, may be NULL) */
+    SYS_SIGPROCMASK = 50, /* EBX: how (SIG_BLOCK/UNBLOCK/SETMASK), ECX: const uint32_t *, EDX: uint32_t * (old, may be NULL) */
+    SYS_SIGPENDING  = 51, /* EBX: uint32_t * (out) */
+
+    /* nice()/renice() — kernel/task.c's task_setpriority()/
+     * task_getpriority(), docs/process-management.md. */
+    SYS_SETPRIORITY = 52, /* EBX: pid (0 == caller), ECX: nice value (clamped to [-20,19]) */
+    SYS_GETPRIORITY = 53, /* EBX: pid (0 == caller), ECX: int * (out) */
 };
 
 #endif

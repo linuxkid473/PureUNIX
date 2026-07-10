@@ -1,0 +1,12 @@
+# Full regression sweep: runs the entire user/systest.c suite from a
+# freshly booted VT1 shell and waits for its final "Tests:/PASS:/FAIL:"
+# summary line. tools/vt-inject-test.py's check_systest_summary() parses
+# that line from the transcript. Two pre-existing, unrelated
+# console-geometry failures are expected (see project memory) — this
+# script's job is just to make the summary line observable; the actual
+# pass/fail judgment against the known-good count is made by whoever
+# reads the printed summary.
+WAIT #\s*$
+TYPE /bin/systest.elf
+WAIT Tests:\s*\d+
+SLEEP 1

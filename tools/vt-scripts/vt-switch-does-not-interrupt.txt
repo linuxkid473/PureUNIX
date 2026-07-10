@@ -1,0 +1,14 @@
+# Regression test: switching the active VT (Alt+F<n>) must never
+# interrupt a job running on the VT being switched *away from* — VT
+# switching only changes which console is rendered/receives keystrokes
+# (kernel/vt.c's vt_switch()), it must never touch any task's state.
+# `sleep 5`'s completion (the "&&" marker only prints if sleep actually
+# exits 0, not if something aborted it) is timed to span the Alt+F2 ->
+# Alt+F1 round trip below.
+WAIT #\s*$
+TYPE sleep 5 && echo vt-switch-did-not-interrupt
+SLEEP 1
+KEY alt+f2
+SLEEP 1
+KEY alt+f1
+WAIT vt-switch-did-not-interrupt

@@ -26,6 +26,15 @@
 #define VT_GETACTIVE 3 /* argp: int * (out) — the caller's current VT number */
 #define VT_ACTIVATE  4 /* argp: const int * (in) — VT number to switch to */
 
+/* Foreground process group of the VT `fd` names — the job-control-aware
+ * shell's tcgetpgrp()/tcsetpgrp() (POSIX), used by BusyBox ash to know
+ * (and move) which job currently owns keyboard-generated signals
+ * (Ctrl+C/Ctrl+Z/Ctrl+\) and read access on that terminal. See
+ * kernel/vt.c's vt_get_fg_pgid()/vt_set_fg_pgid() and SYS_IOCTL in
+ * arch/i386/syscall.c. */
+#define TIOCGPGRP 5 /* argp: pid_t * (out) */
+#define TIOCSPGRP 6 /* argp: const pid_t * (in) */
+
 struct winsize {
     unsigned short ws_row;
     unsigned short ws_col;

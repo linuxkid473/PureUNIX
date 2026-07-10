@@ -39,4 +39,18 @@ struct rlimit {
 int getrlimit(int resource, struct rlimit *rlim);
 int setrlimit(int resource, const struct rlimit *rlim);
 
+/* nice()/renice() — unlike getrlimit()/setrlimit() above, this is real:
+ * SYS_SETPRIORITY/SYS_GETPRIORITY (docs/syscalls.md) genuinely bias
+ * kernel/task.c's scheduler (see next_ready_task()'s own comment for the
+ * exact, deliberately simple scheme). Only PRIO_PROCESS is implemented —
+ * PRIO_PGRP/PRIO_USER are accepted (so BusyBox's renice still links and
+ * runs) but rejected at the syscall level with -EINVAL, same as a real
+ * kernel would for a `which` it doesn't support for a given call. */
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
+
+int getpriority(int which, id_t who);
+int setpriority(int which, id_t who, int prio);
+
 #endif

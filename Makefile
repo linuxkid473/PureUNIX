@@ -241,7 +241,7 @@ TCC_SYSROOT_FILES := $(TCC_SYSROOT)/lib/crt1.o $(TCC_SYSROOT)/lib/crti.o \
 
 tcc-sysroot: $(TCC_SYSROOT_FILES)
 
-.PHONY: all run iso clean disk docs tcc-sysroot
+.PHONY: all run run-test iso clean disk docs tcc-sysroot
 
 all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(DISK) $(DISK2)
 
@@ -329,6 +329,14 @@ run: $(ISO)
 	$(QEMU) -m 128M -cdrom $(ISO) -boot d \
 		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
+
+# Headless, scripted boot for regression tests that need real keystrokes
+# (Ctrl+C/Ctrl+Z, VT switching, login) — see tools/vt-inject-test.py's own
+# header comment for the whole design (QEMU has no usable stdin for this;
+# it drives a QMP socket instead) and tools/vt-scripts/*.txt for the
+# actual test scripts. Each script boots its own fresh QEMU instance.
+run-test: $(ISO)
+	$(PYTHON) tools/vt-inject-test.py --iso $(ISO) tools/vt-scripts/*.txt
 
 # Self-contained: fat.img/root.img are embedded as GRUB modules (see
 # boot/grub.cfg's `module2` lines) rather than passed to QEMU as separate

@@ -1,0 +1,25 @@
+# Same regression as ctrl-c-foreground-sleep.txt, for Ctrl+\ (SIGQUIT)
+# instead of Ctrl+C (SIGINT) — a second, independently-mapped keyboard
+# path (drivers/keyboard.c's KEY_CTRL_BACKSLASH) exercising the same
+# kernel/vt.c vt_input_push() interception and kernel/signal.c default
+# action (terminate).
+#
+# Deliberately uses the *full path* /bin/sleep, not the bare word
+# `sleep` — BusyBox ash has a real shell builtin named "sleep"
+# (BUILTIN_REGULAR in shell/ash.c) that bare-word command lookup finds
+# first, running entirely in-process within ash itself with *ash's own*
+# signal dispositions (which, matching real bash, is to explicitly
+# ignore SIGQUIT for itself — "In all cases, bash ignores SIGQUIT", the
+# bash manual). A path-qualified command bypasses builtin lookup
+# entirely (POSIX), forcing a real fork()+exec() of the external /bin/
+# sleep binary, which correctly gets SIGQUIT's real default disposition
+# back (ash's own forkchild() resets it for any freshly forked child —
+# see shell/ash.c). This is what actually exercises the process-group
+# broadcast reaching a *different* task than the shell itself.
+WAIT #\s*$
+TYPE /bin/sleep 100
+SLEEP 1
+KEY ctrl+backslash
+WAIT #\s*$
+TYPE echo alive-after-ctrlquit
+WAIT alive-after-ctrlquit
