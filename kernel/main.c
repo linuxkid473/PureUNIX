@@ -14,6 +14,7 @@
 #include <pureunix/ip.h>
 #include <pureunix/kernel.h>
 #include <pureunix/keyboard.h>
+#include <pureunix/mbr.h>
 #include <pureunix/memory.h>
 #include <pureunix/panic.h>
 #include <pureunix/pci.h>
@@ -27,6 +28,7 @@
 #include <pureunix/task.h>
 #include <pureunix/tty.h>
 #include <pureunix/users.h>
+#include <pureunix/usb_msd.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 #include <pureunix/vt.h>
@@ -150,6 +152,53 @@ static void boot_checkpoint(const char *label)
     heap_dump(label);
 }
 
+/* Persistent-root search: a real disk (a flashed USB stick -- via
+ * drivers/usb_msd.c, enumerated by xhci_enumerate() just above this call in
+ * kernel_main() -- or a real/emulated ATA/IDE disk, or in QEMU a plain
+ * `-drive`) carries a real MBR partition table written at build time
+ * (tools/mkdiskimg.py) with one Linux-native (0x83) partition holding the
+ * EXT2 root filesystem, GRUB having booted straight off it with no ramdisk
+ * modules declared. Tries ATA master/slave then every attached USB Mass
+ * Storage device; a trial ext2_mount() (cheap: just a superblock+BGDT read,
+ * non-fatal on bad magic) confirms the partition is really EXT2 rather than
+ * some other 0x83 use. Returns NULL if nothing has a matching, mountable
+ * partition — kernel_main() falls back to the pre-existing
+ * ata_primary_slave() whole-disk behavior in that case, so the hand-built
+ * two-raw-disk dev/test workflow (fat.img on master, unpartitioned
+ * ext2.img on slave — no MBR signature, so this probe always and safely
+ * misses) is completely unaffected. */
+static disk_device_t *find_persistent_root_disk(void)
+{
+    disk_device_t *candidates[2 + USB_MSD_MAX_DEVICES];
+    int n = 0;
+    candidates[n++] = ata_primary_master();
+    candidates[n++] = ata_primary_slave();
+    for (int i = 0; i < USB_MSD_MAX_DEVICES; ++i) {
+        disk_device_t *usb_disk = usb_msd_disk(i);
+        if (usb_disk) {
+            candidates[n++] = usb_disk;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        uint32_t start_lba, sector_count;
+        if (!mbr_find_partition(candidates[i], MBR_PART_TYPE_LINUX, &start_lba, &sector_count)) {
+            continue;
+        }
+
+        disk_device_t *part = mbr_partition_disk(candidates[i], start_lba, sector_count);
+        if (ext2_mount(part) == 0) {
+            printf("Root partition found on %s (LBA %u, %u sectors)\n",
+                   candidates[i]->name, (unsigned)start_lba, (unsigned)sector_count);
+            return part;
+        }
+        /* Wrong contents for a 0x83 partition on this disk (bad EXT2 magic,
+         * etc.) — ext2_super_read() already printed why; keep looking. */
+    }
+
+    return NULL;
+}
+
 void kernel_main(uint32_t magic, uint32_t mbi_addr)
 {
     serial_init();
@@ -199,6 +248,20 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     e1000_init();
     xhci_init();
     boot_checkpoint("after xhci init");
+
+    /* Enabled here (rather than just before the network self-tests, where
+     * this used to live) and xhci_enumerate() run immediately after, so
+     * any USB Mass Storage disk is registered *before* the EXT2 root
+     * search below runs — needed so find_persistent_root_disk() can find
+     * a real, flashed USB stick, not just ata_primary_master/slave().
+     * Everything below here already ran fine with interrupts enabled in
+     * the old ordering (network self-tests, right after this originally),
+     * so moving the toggle earlier changes nothing about what those
+     * relied on — xHCI/e1000's own interrupt handlers are already
+     * registered by this point (xhci_init()/e1000_init(), just above). */
+    arch_enable_interrupts();
+    xhci_enumerate();
+
     eth_init();
     arp_init();
     ip_init();
@@ -238,14 +301,33 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
         printf("No FAT16 disk found; /fat will be unavailable.\n");
     }
 
-    /* EXT2 — primary root filesystem */
-    disk_device_t *disk2 = root_disk ? root_disk : ata_primary_slave();
-    if (disk2->present) {
-        if (ext2_mount(disk2) == 0) {
+    /* EXT2 — primary root filesystem. Priority: (1) a GRUB ramdisk module
+     * (live/ISO boot, unchanged); (2) a real disk carrying a partitioned,
+     * persistent EXT2 root (find_persistent_root_disk() — the flashed-USB
+     * / installed-disk case this boot path exists for); (3) the pre-
+     * existing unpartitioned ata_primary_slave() fallback, byte-for-byte
+     * unchanged, for the hand-built two-raw-disk dev/test QEMU workflow. */
+    if (root_disk) {
+        if (ext2_mount(root_disk) == 0) {
             vfs_mount("/", VFS_FS_EXT2, ext2_vfs_ops(), NULL);
             printf("EXT2 mounted on /\n");
         } else {
-            printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
+            printf("EXT2 mount failed on %s; root filesystem unavailable.\n", root_disk->name);
+        }
+    } else if (find_persistent_root_disk()) {
+        /* find_persistent_root_disk() already performed the real mount as
+         * part of its own trial-mount probe — just register it. */
+        vfs_mount("/", VFS_FS_EXT2, ext2_vfs_ops(), NULL);
+        printf("EXT2 mounted on /\n");
+    } else {
+        disk_device_t *disk2 = ata_primary_slave();
+        if (disk2->present) {
+            if (ext2_mount(disk2) == 0) {
+                vfs_mount("/", VFS_FS_EXT2, ext2_vfs_ops(), NULL);
+                printf("EXT2 mounted on /\n");
+            } else {
+                printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
+            }
         }
     }
 
@@ -257,10 +339,6 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     printf("procfs mounted on /proc\n");
 
     boot_checkpoint("after filesystem mount");
-
-    arch_enable_interrupts();
-
-    xhci_enumerate();
 
     e1000_selftest();
     arp_selftest();

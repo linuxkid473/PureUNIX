@@ -50,6 +50,8 @@
  * (bmRequestType), USB 2.0 spec sec 9.4 --------------------------------- */
 #define USB_REQ_GET_DESCRIPTOR    6U
 #define USB_REQ_SET_CONFIGURATION 9U
+#define USB_REQ_CLEAR_FEATURE     1U /* used to clear ENDPOINT_HALT after a bulk STALL */
+#define USB_FEATURE_ENDPOINT_HALT 0U
 
 #define USB_REQUEST_TYPE_DEVICE_TO_HOST 0x80U
 #define USB_REQUEST_TYPE_HOST_TO_DEVICE 0x00U
@@ -57,6 +59,15 @@
 #define USB_REQUEST_TYPE_CLASS          0x20U
 #define USB_REQUEST_TYPE_RECIPIENT_DEVICE    0x00U
 #define USB_REQUEST_TYPE_RECIPIENT_INTERFACE 0x01U
+#define USB_REQUEST_TYPE_RECIPIENT_ENDPOINT  0x02U
+
+/* Mass Storage class (drivers/usb_msd.c): Bulk-Only Transport + the SCSI
+ * transparent command set -- the near-universal combination real USB flash
+ * drives implement (the alternative, CBI, is legacy/floppy-only and out of
+ * scope). */
+#define USB_CLASS_MASS_STORAGE        0x08U
+#define USB_MSD_SUBCLASS_SCSI         0x06U
+#define USB_MSD_PROTOCOL_BULK_ONLY    0x50U
 
 /* String descriptor language ID: US English -- the only one this driver
  * ever requests (manufacturer/product strings, when present). */
@@ -114,6 +125,7 @@ typedef struct __attribute__((packed)) usb_endpoint_descriptor {
 #define USB_ENDPOINT_ADDRESS_NUMBER(addr) ((uint8_t)(addr) & 0x0FU)
 #define USB_ENDPOINT_ADDRESS_IS_IN(addr)  (((uint8_t)(addr) & 0x80U) != 0)
 #define USB_ENDPOINT_ATTR_TYPE(attr)      ((uint8_t)(attr) & 0x03U)
+#define USB_ENDPOINT_TYPE_BULK      2U
 #define USB_ENDPOINT_TYPE_INTERRUPT 3U
 
 typedef struct __attribute__((packed)) usb_string_descriptor_header {
@@ -156,6 +168,19 @@ typedef struct usb_device {
     uint8_t endpoint_address;
     uint16_t endpoint_max_packet_size;
     uint8_t endpoint_interval;
+
+    /* First Bulk IN + first Bulk OUT endpoint found on a Mass-Storage-class
+     * (USB_CLASS_MASS_STORAGE) interface, if any -- additive, independent of
+     * the interrupt-endpoint fields above (drivers/usb_msd.c, not
+     * drivers/hid.c, is what acts on these). Both must be found on the same
+     * interface for has_bulk_endpoints to be set -- see parse_configuration()
+     * (drivers/usb.c). */
+    bool    has_bulk_endpoints;
+    uint8_t msd_interface_number;
+    uint8_t bulk_in_addr;
+    uint16_t bulk_in_max_packet;
+    uint8_t bulk_out_addr;
+    uint16_t bulk_out_max_packet;
 } usb_device_t;
 
 /* Host-controller-interface vtable: everything the generic enumeration
@@ -224,6 +249,52 @@ typedef struct usb_hc_ops {
     bool (*submit_interrupt_transfer)(uint32_t slot_id, uint8_t endpoint_address, void *buf,
                                        uint16_t length, usb_interrupt_callback_t callback,
                                        void *ctx);
+
+    /* Configures one Bulk IN and one Bulk OUT endpoint on an already-
+     * addressed slot in a single Configure Endpoint command (both DCIs
+     * added via the same Input Control Context, structurally identical to
+     * configure_endpoint() adding one) -- Bulk-Only Transport is inherently
+     * sequential (CBW -> data -> CSW, one at a time on one LUN at a time),
+     * so both pipes are always needed together and configuring them
+     * together is both simpler and matches how a real device's endpoints
+     * are actually used. `*_addr`/`*_max_packet` come straight from the
+     * device's own endpoint descriptors (usb_device_t.bulk_in_addr etc.,
+     * see drivers/usb.c's parse_configuration()). */
+    bool (*configure_bulk_endpoints)(uint32_t slot_id, uint8_t in_addr, uint16_t in_max_packet,
+                                      uint8_t out_addr, uint16_t out_max_packet);
+
+    /* One-shot, blocking bulk transfer on an endpoint already set up by
+     * configure_bulk_endpoints() -- unlike submit_interrupt_transfer()'s
+     * "arm once, keep re-firing forever" model, this submits exactly one
+     * Normal TRB and waits (boundedly -- see XHCI_BULK_TRANSFER_TIMEOUT_MS)
+     * for its own completion, matching how drivers/usb_msd.c's Bulk-Only
+     * Transport state machine needs to submit-and-wait for each of a CBW,
+     * a data stage, and a CSW in turn. `*out_bytes` (may be NULL) receives
+     * the actual byte count transferred (length minus any residual --
+     * useful since ISP means a short transfer is not itself a failure).
+     * Returns false on timeout or a real (non-short-packet) failure
+     * completion code, both logged by the implementation; callers should
+     * treat false as "this endpoint may now be Halted or wedged" and route
+     * through reset_endpoint() before retrying, exactly as a real STALL
+     * would require. */
+    bool (*bulk_transfer)(uint32_t slot_id, uint8_t endpoint_address, void *buf, uint16_t length,
+                           uint32_t *out_bytes);
+
+    /* Host-controller-side recovery for a bulk endpoint that STALLed or
+     * whose last transfer simply never completed (bulk_transfer() timed
+     * out or reported a real failure) -- reads the endpoint's *live* state
+     * from the Device Context and issues whichever command is actually
+     * legal from that state (Halted -> Reset Endpoint; Running -> Stop
+     * Endpoint first; Stopped/Error -> neither), then always finishes with
+     * Set TR Dequeue Pointer to un-wedge the ring regardless of which path
+     * was taken. This is purely the xHCI-side half of recovery -- callers
+     * (drivers/usb_msd.c) are still responsible for the USB-level
+     * CLEAR_FEATURE(ENDPOINT_HALT) control request a real STALL also
+     * requires; the two are independent (one fixes the device, one fixes
+     * the host controller's own ring state) and both are needed together
+     * after a real STALL, while only this one is needed after a plain
+     * timeout (nothing on the device side is actually wrong then). */
+    bool (*reset_endpoint)(uint32_t slot_id, uint8_t endpoint_address);
 } usb_hc_ops_t;
 
 /* GET_DESCRIPTOR convenience wrapper over hc->control_transfer(), used by

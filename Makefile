@@ -6,12 +6,33 @@ AR := $(CROSS)ar
 QEMU ?= qemu-system-i386
 PYTHON ?= python3
 GRUB_MKRESCUE ?= i686-elf-grub-mkrescue
+GRUB_MKIMAGE  ?= i686-elf-grub-mkimage
 
 BUILD := build
 KERNEL := $(BUILD)/pureunix.elf
+# $(ISO) is now the persistent, USB-flashable hybrid disk image (real MBR +
+# GRUB core.img + a writable EXT2 root partition — see tools/mkdiskimg.py)
+# that `make iso` is documented to produce: dd it straight onto a USB stick
+# and it boots on real hardware as-is, no separate install step. Despite
+# the name/extension (kept for a stable, familiar `make iso` -> flash
+# workflow — see the task this came from), it is NOT an ISO9660 image.
+# $(LIVE_ISO) is the original grub-mkrescue ISO9660-plus-ramdisk-module
+# image (kernel + fat.img + root.img loaded straight into RAM, root
+# discarded on reboot) — kept, unchanged, purely so run-test's scripted
+# regression suite (tools/vt-inject-test.py, 339/341 systest baseline)
+# keeps working exactly as it always has; see `run-live` below.
 ISO := $(BUILD)/pureunix.iso
+LIVE_ISO := $(BUILD)/pureunix-live.iso
 DISK  := $(BUILD)/pureunix.img
 DISK2 := $(BUILD)/ext2.img
+# Persistent-disk-only artifacts (tools/mkdiskimg.py's inputs): a second
+# EXT2 image built with --persistent-boot (embeds /boot/pureunix.elf +
+# /boot/grub/grub.cfg, and uses the PUREUNIX_ROOT label boot/grub-
+# embedded.cfg's `search` looks for), plus a build-time GRUB core.img
+# embedding that search script as its prefix config.
+DISK_PERSISTENT := $(BUILD)/ext2-persistent.img
+CORE_IMG := $(BUILD)/grub/core.img
+GRUB_BOOT_IMG := $(BUILD)/grub/boot.img
 
 COMMON_CFLAGS := -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Wno-unused-parameter \
 	-fno-stack-protector -fno-pic -fno-pie -m32 -march=i686 -Iinclude
@@ -241,7 +262,7 @@ TCC_SYSROOT_FILES := $(TCC_SYSROOT)/lib/crt1.o $(TCC_SYSROOT)/lib/crti.o \
 
 tcc-sysroot: $(TCC_SYSROOT_FILES)
 
-.PHONY: all run run-test iso clean disk docs tcc-sysroot
+.PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
 all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(DISK) $(DISK2)
 
@@ -317,16 +338,56 @@ $(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FI
 
 disk: $(DISK) $(DISK2)
 
+# Persistent-disk EXT2 root: same builder, same content, plus /boot/
+# pureunix.elf + a real /boot/grub/grub.cfg (see tools/mkext2.py's
+# add_persistent_boot_files()) and the PUREUNIX_ROOT volume label
+# boot/grub-embedded.cfg's `search` command looks for — this is what
+# actually ends up as the writable root partition in $(ISO) below, as
+# opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
+# ramdisk module in $(LIVE_ISO).
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL)
+
+# Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
+# embedded.cfg as its prefix config, which just `search`es for the
+# PUREUNIX_ROOT-labeled partition and hands off to the real, on-disk
+# /boot/grub/grub.cfg $(DISK_PERSISTENT) ships — so the actual boot menu
+# lives as an ordinary file on the root filesystem, not baked into
+# core.img. boot.img is GRUB's own prebuilt, unmodified 512-byte MBR
+# bootstrap; both live under $(BUILD)/grub so tools/mkdiskimg.py has a
+# stable place to find them. No -d flag: grub-mkimage already knows its
+# own installed module directory (confirmed — see the module list below).
+$(CORE_IMG): boot/grub-embedded.cfg
+	@command -v $(GRUB_MKIMAGE) >/dev/null 2>&1 || { \
+		echo "$(GRUB_MKIMAGE) is required for make iso. Install GRUB tools (e.g. 'brew install i686-elf-grub') and retry."; \
+		exit 1; \
+	}
+	@mkdir -p $(BUILD)/grub
+	$(GRUB_MKIMAGE) -O i386-pc -o $@ -c boot/grub-embedded.cfg -p /boot/grub \
+		biosdisk part_msdos ext2 search fshelp normal configfile multiboot2
+
+$(GRUB_BOOT_IMG):
+	@mkdir -p $(BUILD)/grub
+	@GRUB_BIN=$$($(PYTHON) -c "import os,shutil; print(os.path.realpath(shutil.which('$(GRUB_MKIMAGE)')))"); \
+	cp "$$(dirname "$$(dirname "$$GRUB_BIN")")/lib/i686-elf/grub/i386-pc/boot.img" $@
+
 # Boots through real GRUB (not QEMU's built-in -kernel multiboot1 loader,
 # which never sets up a graphics mode) so the multiboot2 framebuffer request
-# in boot/multiboot2.S actually takes effect. $(ISO) is a fully standalone
-# boot image (kernel + both disk images travel inside it as GRUB modules —
-# see boot/grub.cfg and kernel_main's ramdisk_attach() calls), so -cdrom is
-# the entire boot media; no separate -drive flags needed here, and this is
-# the same ISO a real machine or VirtualBox/VMware would boot from a USB
-# stick or CD.
+# in boot/multiboot2.S actually takes effect. $(ISO) is a real, self-
+# contained MBR disk image (tools/mkdiskimg.py — GRUB bootstrap + core.img
+# in the MBR gap + a writable EXT2 root partition), so -drive+-boot c boots
+# it exactly the way a real BIOS boots a flashed USB stick — no -cdrom, no
+# separate module files, no ramdisk.
 run: $(ISO)
-	$(QEMU) -m 128M -cdrom $(ISO) -boot d \
+	$(QEMU) -m 128M -drive file=$(ISO),format=raw -boot c \
+		-netdev user,id=net0 -device e1000,netdev=net0 \
+		-serial stdio -no-reboot -no-shutdown
+
+# The original ISO9660+ramdisk-module boot, preserved unchanged for anyone
+# who wants the old fast/ephemeral dev loop (root discarded every boot).
+run-live: $(LIVE_ISO)
+	$(QEMU) -m 128M -cdrom $(LIVE_ISO) -boot d \
 		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 
@@ -335,16 +396,21 @@ run: $(ISO)
 # header comment for the whole design (QEMU has no usable stdin for this;
 # it drives a QMP socket instead) and tools/vt-scripts/*.txt for the
 # actual test scripts. Each script boots its own fresh QEMU instance.
-run-test: $(ISO)
-	$(PYTHON) tools/vt-inject-test.py --iso $(ISO) tools/vt-scripts/*.txt
+# Deliberately still $(LIVE_ISO), not $(ISO): every existing script assumes
+# a fresh, ephemeral first-boot on every single run (see that file's own
+# header comment) — unrelated to and unaffected by the new persistent-disk
+# boot path, which has its own dedicated test (tools/test-persistent-boot.py).
+run-test: $(LIVE_ISO)
+	$(PYTHON) tools/vt-inject-test.py --iso $(LIVE_ISO) tools/vt-scripts/*.txt
 
 # Self-contained: fat.img/root.img are embedded as GRUB modules (see
 # boot/grub.cfg's `module2` lines) rather than passed to QEMU as separate
 # -drive files, so the resulting ISO boots into the identical environment
-# on its own — in QEMU, VirtualBox/VMware, or dd'd to a real USB stick.
-$(ISO): $(KERNEL) $(DISK) $(DISK2) boot/grub.cfg
+# on its own. Kept exactly as before (see $(LIVE_ISO)'s own comment above)
+# purely for run-test's regression suite.
+$(LIVE_ISO): $(KERNEL) $(DISK) $(DISK2) boot/grub.cfg
 	@command -v $(GRUB_MKRESCUE) >/dev/null 2>&1 || { \
-		echo "$(GRUB_MKRESCUE) is required for make iso/run. Install GRUB tools (e.g. 'brew install i686-elf-grub') and retry."; \
+		echo "$(GRUB_MKRESCUE) is required for make run-live/run-test. Install GRUB tools (e.g. 'brew install i686-elf-grub') and retry."; \
 		exit 1; \
 	}
 	@rm -rf $(BUILD)/iso
@@ -353,9 +419,28 @@ $(ISO): $(KERNEL) $(DISK) $(DISK2) boot/grub.cfg
 	cp $(DISK) $(BUILD)/iso/boot/fat.img
 	cp $(DISK2) $(BUILD)/iso/boot/root.img
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(ISO) $(BUILD)/iso
+	$(GRUB_MKRESCUE) -o $(LIVE_ISO) $(BUILD)/iso
+
+live-iso: $(LIVE_ISO)
+
+# The real, USB-flashable deliverable: dd $(ISO) onto a USB stick, boot it
+# on real hardware, and it's already a persistent PureUnix install — no
+# separate `install` step. See tools/mkdiskimg.py's own header comment for
+# the exact on-disk layout and why it hand-implements GRUB's boot.img/
+# core.img embedding protocol instead of shelling out to grub-bios-setup.
+$(ISO): $(GRUB_BOOT_IMG) $(CORE_IMG) $(DISK_PERSISTENT) tools/mkdiskimg.py
+	$(PYTHON) tools/mkdiskimg.py $@ --boot-img $(GRUB_BOOT_IMG) --core-img $(CORE_IMG) --ext2-img $(DISK_PERSISTENT)
 
 iso: $(ISO)
+
+# Boots $(ISO) twice (fresh QEMU process each time, against a scratch copy
+# so the real deliverable stays pristine) proving root password + real
+# filesystem writes survive an actual reboot — see tools/test-persistent-
+# boot.py's own header comment for exactly what this does and why a false
+# pass is essentially impossible.
+test-persistent: $(ISO)
+	cp $(ISO) $(BUILD)/persist-test.img
+	$(PYTHON) tools/test-persistent-boot.py $(BUILD)/persist-test.img
 
 clean:
 	rm -rf $(BUILD)

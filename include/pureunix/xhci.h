@@ -90,6 +90,16 @@
  * logged failure with xHCI left disabled rather than a boot hang. */
 #define XHCI_POLL_ITERATIONS 1000000U
 
+/* Bound on usb_hc_ops_t.bulk_transfer()'s wait for a single bulk transfer's
+ * completion (pit_sleep()-based, unlike the pre-interrupt polling loops
+ * above -- see bulk_transfer()'s own comment in xhci.c). Unlike EP0 control
+ * transfers (an already-proven, effectively-never-removable-mid-transfer
+ * endpoint, hence wait_transfer_irq()'s unbounded wait), a real USB storage
+ * device can be yanked or simply stop responding mid-transfer, and this
+ * kernel is cooperatively scheduled with no preemption -- an unbounded wait
+ * here would hang the entire kernel forever on a lost completion. */
+#define XHCI_BULK_TRANSFER_TIMEOUT_MS 5000U
+
 /* ---- Operational register offsets, relative to (MMIO base + CAPLENGTH)
  * (xHCI 1.2 sec 5.4) -------------------------------------------------------- */
 #define XHCI_OP_USBCMD        0x00U
@@ -197,10 +207,28 @@ typedef struct __attribute__((packed)) xhci_trb {
 #define XHCI_TRB_TYPE_ADDRESS_DEVICE_CMD         11U
 #define XHCI_TRB_TYPE_CONFIGURE_ENDPOINT_CMD     12U
 #define XHCI_TRB_TYPE_EVALUATE_CONTEXT_CMD       13U
+/* Used by bulk-transfer error recovery (drivers/usb_msd.c via
+ * usb_hc_ops_t.reset_endpoint()) -- Reset Endpoint is only legal from the
+ * Halted state (a real STALL), Stop Endpoint is required first from Running
+ * (e.g. a software timeout, where the controller never reported any error
+ * so the endpoint is still Running), and Set TR Dequeue Pointer is what
+ * actually un-wedges the ring afterward in both cases. See
+ * XHCI_EP_STATE_* below and reset_endpoint()'s own comment. */
+#define XHCI_TRB_TYPE_RESET_ENDPOINT_CMD         14U
+#define XHCI_TRB_TYPE_STOP_ENDPOINT_CMD          15U
+#define XHCI_TRB_TYPE_SET_TR_DEQUEUE_POINTER_CMD 16U
 #define XHCI_TRB_TYPE_NOOP_CMD                   23U
 #define XHCI_TRB_TYPE_TRANSFER_EVENT             32U
 #define XHCI_TRB_TYPE_COMMAND_COMPLETION_EVENT   33U
 #define XHCI_TRB_TYPE_PORT_STATUS_CHANGE_EVENT   34U
+
+/* Command TRBs that target a specific endpoint (Reset Endpoint, Stop
+ * Endpoint, Set TR Dequeue Pointer -- unlike Configure Endpoint, which
+ * targets whichever DCIs the Input Context's add/drop flags name) carry
+ * Slot ID in Control bits 31:24 (same position Command Completion Events
+ * report it at, XHCI_TRB_GET_SLOT_ID) and Endpoint ID (DCI) in bits 20:16. */
+#define XHCI_TRB_SLOT_ID_SHIFT     24U
+#define XHCI_TRB_ENDPOINT_ID_SHIFT 16U
 
 /* Enable Slot Command TRB's Control dword carries the Slot Type (from the
  * matching Supported Protocol Capability's own Protocol Slot Type field --
@@ -229,7 +257,10 @@ typedef struct __attribute__((packed)) xhci_trb {
 /* Completion Code field (Status dword, bits 31:24) values this driver checks
  * for explicitly; every other nonzero value is treated as "some failure",
  * logged with its raw numeric code rather than named individually. */
-#define XHCI_COMPLETION_SUCCESS 1U
+#define XHCI_COMPLETION_SUCCESS       1U
+#define XHCI_COMPLETION_STALL_ERROR   6U  /* real device STALL */
+#define XHCI_COMPLETION_SHORT_PACKET  13U /* fewer bytes than requested -- not itself an error (ISP) */
+#define XHCI_COMPLETION_CONTEXT_STATE_ERROR 19U /* wrong EP State for the command issued */
 #define XHCI_TRB_GET_COMPLETION_CODE(status) (((uint32_t)(status) >> 24) & 0xFFU)
 /* Command Completion Event's Control dword carries the Slot ID (for
  * commands that allocate/target one, e.g. Enable Slot) in bits 31:24. A
@@ -348,10 +379,12 @@ typedef struct __attribute__((packed)) xhci_endpoint_context {
 } xhci_endpoint_context_t;
 
 /* EP Type field values (Table 6-9) this driver uses -- Control (bidirectional)
- * for EP0, Interrupt IN for a Boot Protocol HID keyboard's report endpoint.
- * Bulk/Isoch types are unused (no bulk/isochronous device support; see
- * docs/usb.md's known limitations). */
+ * for EP0, Interrupt IN for a Boot Protocol HID keyboard's report endpoint,
+ * Bulk IN/OUT for a Mass Storage device's data pipes (drivers/usb_msd.c).
+ * Isoch types remain unused. */
+#define XHCI_EP_TYPE_BULK_OUT             2U
 #define XHCI_EP_TYPE_CONTROL              4U
+#define XHCI_EP_TYPE_BULK_IN              6U
 #define XHCI_EP_TYPE_INTERRUPT_IN         7U
 #define XHCI_EP_TYPE_SHIFT                3U
 #define XHCI_EP_CERR_SHIFT                1U
@@ -359,6 +392,18 @@ typedef struct __attribute__((packed)) xhci_endpoint_context {
 #define XHCI_EP_MAX_PACKET_SIZE_SHIFT     16U
 #define XHCI_EP_MAX_PACKET_SIZE_MASK      0xFFFFU
 #define XHCI_EP_DEQUEUE_CYCLE_STATE       (1U << 0)
+
+/* Endpoint Context dword0 bits 2:0 (sec 6.2.3) -- live endpoint state, read
+ * from the *Device* Context (not the Input Context, which is only ever a
+ * staging area for commands) to decide how reset_endpoint() must recover a
+ * wedged bulk endpoint: see XHCI_TRB_TYPE_RESET_ENDPOINT_CMD's comment. */
+#define XHCI_EP_STATE_MASK     0x7U
+#define XHCI_EP_STATE_DISABLED 0U
+#define XHCI_EP_STATE_RUNNING  1U
+#define XHCI_EP_STATE_HALTED   2U
+#define XHCI_EP_STATE_STOPPED  3U
+#define XHCI_EP_STATE_ERROR    4U
+#define XHCI_EP_GET_STATE(dword0) ((uint32_t)(dword0) & XHCI_EP_STATE_MASK)
 /* Average TRB Length has no "correct" value known in advance; the spec
  * explicitly recommends 8 for Control endpoints (sec 4.14.1). For an
  * Interrupt endpoint carrying small fixed-size reports (an 8-byte HID boot

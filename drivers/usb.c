@@ -103,6 +103,29 @@ static void parse_configuration(const uint8_t *buf, uint16_t total_length, usb_d
                 dev->endpoint_max_packet_size = (uint16_t)(ep->wMaxPacketSize & 0x7FFU);
                 dev->endpoint_interval = ep->bInterval;
             }
+            /* Independent of the interrupt-IN capture above (sibling `if`,
+             * not `else if`) -- a device can only ever be one or the other
+             * in practice, but nothing here assumes that. First Bulk IN and
+             * first Bulk OUT found on a Mass-Storage-class interface become
+             * the pipes drivers/usb_msd.c's Bulk-Only Transport uses; a
+             * bEndpointAddress of 0 is never valid for a real bulk
+             * endpoint (EP0 is always Control), so it doubles as the
+             * "not yet captured" sentinel below. */
+            if (current_class == USB_CLASS_MASS_STORAGE
+                && USB_ENDPOINT_ATTR_TYPE(ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK) {
+                if (USB_ENDPOINT_ADDRESS_IS_IN(ep->bEndpointAddress) && dev->bulk_in_addr == 0) {
+                    dev->bulk_in_addr = ep->bEndpointAddress;
+                    dev->bulk_in_max_packet = (uint16_t)(ep->wMaxPacketSize & 0x7FFU);
+                    dev->msd_interface_number = current_interface;
+                } else if (!USB_ENDPOINT_ADDRESS_IS_IN(ep->bEndpointAddress)
+                           && dev->bulk_out_addr == 0) {
+                    dev->bulk_out_addr = ep->bEndpointAddress;
+                    dev->bulk_out_max_packet = (uint16_t)(ep->wMaxPacketSize & 0x7FFU);
+                }
+                if (dev->bulk_in_addr != 0 && dev->bulk_out_addr != 0) {
+                    dev->has_bulk_endpoints = true;
+                }
+            }
         }
 
         offset = (uint16_t)(offset + b_length);
@@ -221,6 +244,21 @@ bool usb_enumerate_port(const usb_hc_ops_t *hc, uint32_t port, uint32_t speed, u
         } else {
             printf("usb: slot %u: failed to configure interrupt endpoint %02x\n", slot_id,
                    dev.endpoint_address);
+        }
+    }
+
+    if (dev.has_bulk_endpoints) {
+        if (hc->configure_bulk_endpoints(slot_id, dev.bulk_in_addr, dev.bulk_in_max_packet,
+                                          dev.bulk_out_addr, dev.bulk_out_max_packet)) {
+            printf("usb: slot %u: bulk endpoints configured (in=%02x out=%02x, interface %u)\n",
+                   slot_id, dev.bulk_in_addr, dev.bulk_out_addr, dev.msd_interface_number);
+        } else {
+            printf("usb: slot %u: failed to configure bulk endpoints (in=%02x out=%02x)\n",
+                   slot_id, dev.bulk_in_addr, dev.bulk_out_addr);
+            /* So a class driver checking has_bulk_endpoints later (e.g.
+             * usb_msd_try_attach()) doesn't try to use pipes that were
+             * never actually set up. */
+            dev.has_bulk_endpoints = false;
         }
     }
 

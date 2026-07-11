@@ -5,6 +5,7 @@
 #include <pureunix/string.h>
 #include <pureunix/hid.h>
 #include <pureunix/usb.h>
+#include <pureunix/usb_msd.h>
 #include <pureunix/vmm.h>
 #include <pureunix/xhci.h>
 
@@ -23,6 +24,27 @@ typedef struct xhci_pending_transfer {
 } xhci_pending_transfer_t;
 
 static xhci_pending_transfer_t pending_xfer;
+
+/* Same shape as pending_xfer, but for usb_hc_ops_t.bulk_transfer()
+ * (drivers/usb_msd.c) rather than control_transfer() -- kept as its own
+ * global rather than reusing pending_xfer because the two are matched
+ * differently in principle (bulk transfers run on a per-endpoint transfer
+ * ring the same way interrupt transfers do, not the shared EP0 ring
+ * control_transfer() always uses) even though, like pending_xfer, only one
+ * bulk transfer is ever outstanding at a time in this driver (Bulk-Only
+ * Transport is inherently sequential -- CBW, then data, then CSW, never
+ * overlapped), so a single global slot is sufficient here too. Also
+ * records the completed TRB's residual length (bytes NOT transferred, low
+ * 24 bits of the Transfer Event's Status dword) so bulk_transfer() can
+ * report actual bytes moved even on a short (but not failed) transfer. */
+typedef struct xhci_pending_bulk_xfer {
+    phys_addr_t trb_phys;
+    volatile bool done;
+    volatile uint32_t completion_code;
+    volatile uint32_t residual_length;
+} xhci_pending_bulk_xfer_t;
+
+static xhci_pending_bulk_xfer_t pending_bulk_xfer;
 
 /* One entry per (slot, DCI) with a repeating interrupt-IN transfer armed
  * via submit_interrupt_transfer() -- unlike pending_cmd/pending_xfer (each
@@ -526,9 +548,18 @@ static void process_event_ring(void)
             } else if (pending_xfer.trb_phys != 0 && completed_trb == pending_xfer.trb_phys) {
                 pending_xfer.completion_code = completion_code;
                 pending_xfer.done = true;
+            } else if (pending_bulk_xfer.trb_phys != 0
+                       && completed_trb == pending_bulk_xfer.trb_phys) {
+                /* Status dword bits 23:0 are "TRB Transfer Length" on a
+                 * Transfer Event -- for a Normal TRB this is the residual
+                 * (bytes NOT transferred), not the total, per sec 6.4.2.1. */
+                pending_bulk_xfer.completion_code = completion_code;
+                pending_bulk_xfer.residual_length = trb->status & 0xFFFFFFU;
+                pending_bulk_xfer.done = true;
             } else {
-                usb_debugf("xhci: event: Transfer Event unmatched (no pending control transfer, "
-                           "no active interrupt listener for slot=%u dci=%u) -- event dropped\n",
+                usb_debugf("xhci: event: Transfer Event unmatched (no pending control/bulk "
+                           "transfer, no active interrupt listener for slot=%u dci=%u) -- event "
+                           "dropped\n",
                            event_slot_id, event_dci);
             }
         } else if (type == XHCI_TRB_TYPE_PORT_STATUS_CHANGE_EVENT) {
@@ -1146,12 +1177,232 @@ static bool submit_interrupt_transfer(uint32_t slot_id, uint8_t endpoint_address
     return true;
 }
 
+/* usb_hc_ops_t.configure_bulk_endpoints -- adds one Bulk IN and one Bulk OUT
+ * endpoint to an already-addressed slot in a single Configure Endpoint
+ * command, exactly like configure_endpoint() but for two DCIs at once (the
+ * Input Control Context's add_flags simply gets both bits set -- legal and
+ * exactly what the xHCI spec expects for "configure everything a device
+ * needs in one command"). No Interval field is meaningful for bulk
+ * endpoints (sec 6.2.3.6 -- Interval "shall be 0" for FS/HS/SS bulk), unlike
+ * configure_endpoint()'s compute_interval() for the interrupt case. */
+static bool configure_bulk_endpoints(uint32_t slot_id, uint8_t in_addr, uint16_t in_max_packet,
+                                      uint8_t out_addr, uint16_t out_max_packet)
+{
+    if (slot_id == 0 || slot_id > ctrl.slots_enabled || !ctrl.slots[slot_id].in_use) {
+        printf("xhci: configure_bulk_endpoints: slot %u not addressed\n", slot_id);
+        return false;
+    }
+    if (!USB_ENDPOINT_ADDRESS_IS_IN(in_addr) || USB_ENDPOINT_ADDRESS_IS_IN(out_addr)) {
+        printf("xhci: configure_bulk_endpoints: slot %u: in_addr=%02x/out_addr=%02x have the "
+               "wrong direction bits\n",
+               slot_id, in_addr, out_addr);
+        return false;
+    }
+
+    xhci_slot_state_t *st = &ctrl.slots[slot_id];
+    uint32_t in_dci = USB_ENDPOINT_ADDRESS_NUMBER(in_addr) * 2U + 1U;
+    uint32_t out_dci = USB_ENDPOINT_ADDRESS_NUMBER(out_addr) * 2U;
+    if (in_dci >= XHCI_MAX_DCI || out_dci == 0 || out_dci >= XHCI_MAX_DCI) {
+        printf("xhci: configure_bulk_endpoints: slot %u: endpoints %02x/%02x map to "
+               "out-of-range DCIs %u/%u\n",
+               slot_id, in_addr, out_addr, in_dci, out_dci);
+        return false;
+    }
+
+    if (!ring_alloc(&st->rings[in_dci]) || !ring_alloc(&st->rings[out_dci])) {
+        printf("xhci: configure_bulk_endpoints: slot %u: failed to allocate transfer ring(s)\n",
+               slot_id);
+        return false;
+    }
+
+    xhci_input_control_context_t *icc = (xhci_input_control_context_t *)st->input_ctx;
+    icc->drop_flags = 0;
+    icc->add_flags =
+        XHCI_INPUT_CONTROL_ADD_SLOT | XHCI_INPUT_CONTROL_ADD_EP(in_dci) | XHCI_INPUT_CONTROL_ADD_EP(out_dci);
+
+    uint32_t highest_dci = (in_dci > out_dci) ? in_dci : out_dci;
+    xhci_slot_context_t *slot_ctx = (xhci_slot_context_t *)input_context_entry(st->input_ctx, 0);
+    slot_ctx->dword0 = (slot_ctx->dword0 & ~(0x1FU << XHCI_SLOT_CONTEXT_ENTRIES_SHIFT))
+        | (highest_dci << XHCI_SLOT_CONTEXT_ENTRIES_SHIFT);
+
+    xhci_endpoint_context_t *in_ctx = (xhci_endpoint_context_t *)input_context_entry(st->input_ctx, in_dci);
+    in_ctx->dword0 = 0; /* Interval = 0 for bulk */
+    in_ctx->dword1 = (XHCI_EP_TYPE_BULK_IN << XHCI_EP_TYPE_SHIFT) | (3U << XHCI_EP_CERR_SHIFT)
+        | ((uint32_t)in_max_packet << XHCI_EP_MAX_PACKET_SIZE_SHIFT);
+    in_ctx->tr_dequeue_lo = (st->rings[in_dci].phys & ~0xFU) | XHCI_EP_DEQUEUE_CYCLE_STATE;
+    in_ctx->tr_dequeue_hi = 0;
+    in_ctx->dword4 = in_max_packet;
+
+    xhci_endpoint_context_t *out_ctx = (xhci_endpoint_context_t *)input_context_entry(st->input_ctx, out_dci);
+    out_ctx->dword0 = 0;
+    out_ctx->dword1 = (XHCI_EP_TYPE_BULK_OUT << XHCI_EP_TYPE_SHIFT) | (3U << XHCI_EP_CERR_SHIFT)
+        | ((uint32_t)out_max_packet << XHCI_EP_MAX_PACKET_SIZE_SHIFT);
+    out_ctx->tr_dequeue_lo = (st->rings[out_dci].phys & ~0xFU) | XHCI_EP_DEQUEUE_CYCLE_STATE;
+    out_ctx->tr_dequeue_hi = 0;
+    out_ctx->dword4 = out_max_packet;
+    xhci_barrier();
+
+    usb_debugf("xhci: slot %u: bulk endpoints built: in_dci=%u ep=%02x max_packet=%u, "
+               "out_dci=%u ep=%02x max_packet=%u\n",
+               slot_id, in_dci, in_addr, in_max_packet, out_dci, out_addr, out_max_packet);
+
+    submit_command(st->input_ctx_phys, 0, 0,
+                   XHCI_TRB_TYPE(XHCI_TRB_TYPE_CONFIGURE_ENDPOINT_CMD) | (slot_id << XHCI_TRB_SLOT_ID_SHIFT));
+    uint32_t completion_code = 0;
+    if (!wait_command_irq(&completion_code, NULL) || completion_code != XHCI_COMPLETION_SUCCESS) {
+        printf("xhci: slot %u: Configure Endpoint (bulk) failed (completion code=%u)\n", slot_id,
+               completion_code);
+        return false;
+    }
+    return true;
+}
+
+/* usb_hc_ops_t.bulk_transfer -- submits one Normal TRB on the target
+ * endpoint's own transfer ring (direction is inherent to which endpoint's
+ * ring it's placed on, unlike a Data Stage TRB on the shared bidirectional
+ * EP0 ring -- no XHCI_TRB_DIR_IN needed here, matching arm_interrupt_
+ * transfer()'s identical Normal-TRB construction) and waits, boundedly, for
+ * its own Transfer Event. See XHCI_BULK_TRANSFER_TIMEOUT_MS's comment for
+ * why this must be bounded rather than the unbounded arch_halt() wait
+ * every command/control-transfer helper above uses. */
+static bool bulk_transfer(uint32_t slot_id, uint8_t endpoint_address, void *buf, uint16_t length,
+                           uint32_t *out_bytes)
+{
+    if (out_bytes) {
+        *out_bytes = 0;
+    }
+    if (slot_id == 0 || slot_id > ctrl.slots_enabled || !ctrl.slots[slot_id].in_use) {
+        printf("xhci: bulk_transfer: slot %u not addressed\n", slot_id);
+        return false;
+    }
+    bool is_in = USB_ENDPOINT_ADDRESS_IS_IN(endpoint_address);
+    uint32_t dci = USB_ENDPOINT_ADDRESS_NUMBER(endpoint_address) * 2U + (is_in ? 1U : 0U);
+    if (dci == 0 || dci >= XHCI_MAX_DCI || ctrl.slots[slot_id].rings[dci].trbs == NULL) {
+        printf("xhci: bulk_transfer: slot %u: endpoint %02x has no configured ring (call "
+               "configure_bulk_endpoints() first)\n",
+               slot_id, endpoint_address);
+        return false;
+    }
+
+    xhci_ring_t *ring = &ctrl.slots[slot_id].rings[dci];
+    phys_addr_t buf_phys = (phys_addr_t)(uintptr_t)buf;
+    phys_addr_t trb_phys = ring_enqueue(ring, buf_phys, 0, length,
+                                         XHCI_TRB_TYPE(XHCI_TRB_TYPE_NORMAL) | XHCI_TRB_CONTROL_ISP
+                                             | XHCI_TRB_CONTROL_IOC);
+
+    pending_bulk_xfer.trb_phys = trb_phys;
+    pending_bulk_xfer.done = false;
+    pending_bulk_xfer.residual_length = 0;
+    xhci_barrier();
+    doorbell_ring((uint8_t)slot_id, (uint8_t)dci);
+
+    bool completed = false;
+    for (uint32_t waited = 0; waited < XHCI_BULK_TRANSFER_TIMEOUT_MS; waited += 10U) {
+        pit_sleep(10);
+        if (pending_bulk_xfer.done) {
+            completed = true;
+            break;
+        }
+    }
+    if (!completed) {
+        printf("xhci: bulk transfer timed out waiting for completion (slot %u, ep %02x)\n",
+               slot_id, endpoint_address);
+        pending_bulk_xfer.trb_phys = 0;
+        return false;
+    }
+
+    uint32_t completion_code = pending_bulk_xfer.completion_code;
+    uint32_t residual = pending_bulk_xfer.residual_length;
+    pending_bulk_xfer.trb_phys = 0;
+    if (out_bytes) {
+        *out_bytes = (length >= residual) ? (uint32_t)length - residual : 0U;
+    }
+    if (completion_code != XHCI_COMPLETION_SUCCESS && completion_code != XHCI_COMPLETION_SHORT_PACKET) {
+        printf("xhci: bulk transfer failed (slot %u, ep %02x, completion code=%u)\n", slot_id,
+               endpoint_address, completion_code);
+        return false;
+    }
+    return true;
+}
+
+/* usb_hc_ops_t.reset_endpoint -- see usb_hc_ops_t's own comment on this
+ * function for the overall contract. Reads the endpoint's live EP State
+ * directly from the Device Context (not the Input Context, which this
+ * function never touches) to pick the only command that's actually legal
+ * from that state, then always finishes with Set TR Dequeue Pointer so the
+ * ring is genuinely un-wedged regardless of which path was taken -- see
+ * XHCI_TRB_TYPE_RESET_ENDPOINT_CMD's comment for why a single
+ * unconditional Reset Endpoint (this driver's original, simpler attempt)
+ * is wrong: it's a Context State Error (completion code 19) on anything
+ * other than a Halted endpoint, e.g. a plain software timeout where the
+ * controller never reported any error at all and the endpoint is still
+ * Running. */
+static bool reset_endpoint(uint32_t slot_id, uint8_t endpoint_address)
+{
+    if (slot_id == 0 || slot_id > ctrl.slots_enabled || !ctrl.slots[slot_id].in_use) {
+        printf("xhci: reset_endpoint: slot %u not addressed\n", slot_id);
+        return false;
+    }
+    xhci_slot_state_t *st = &ctrl.slots[slot_id];
+    bool is_in = USB_ENDPOINT_ADDRESS_IS_IN(endpoint_address);
+    uint32_t dci = USB_ENDPOINT_ADDRESS_NUMBER(endpoint_address) * 2U + (is_in ? 1U : 0U);
+    if (dci == 0 || dci >= XHCI_MAX_DCI || st->rings[dci].trbs == NULL) {
+        printf("xhci: reset_endpoint: slot %u: endpoint %02x has no configured ring\n", slot_id,
+               endpoint_address);
+        return false;
+    }
+
+    xhci_endpoint_context_t *ep_ctx =
+        (xhci_endpoint_context_t *)device_context_entry(st->device_ctx, dci);
+    uint32_t ep_state = XHCI_EP_GET_STATE(ep_ctx->dword0);
+    uint32_t cmd_control = (slot_id << XHCI_TRB_SLOT_ID_SHIFT) | (dci << XHCI_TRB_ENDPOINT_ID_SHIFT);
+    uint32_t completion_code = 0;
+
+    if (ep_state == XHCI_EP_STATE_HALTED) {
+        submit_command(0, 0, 0, XHCI_TRB_TYPE(XHCI_TRB_TYPE_RESET_ENDPOINT_CMD) | cmd_control);
+        if (!wait_command_irq(&completion_code, NULL) || completion_code != XHCI_COMPLETION_SUCCESS) {
+            printf("xhci: slot %u: Reset Endpoint (dci=%u) failed (completion code=%u)\n", slot_id,
+                   dci, completion_code);
+            return false;
+        }
+    } else if (ep_state == XHCI_EP_STATE_RUNNING) {
+        submit_command(0, 0, 0, XHCI_TRB_TYPE(XHCI_TRB_TYPE_STOP_ENDPOINT_CMD) | cmd_control);
+        if (!wait_command_irq(&completion_code, NULL) || completion_code != XHCI_COMPLETION_SUCCESS) {
+            printf("xhci: slot %u: Stop Endpoint (dci=%u) failed (completion code=%u)\n", slot_id,
+                   dci, completion_code);
+            return false;
+        }
+    }
+    /* Stopped/Error/Disabled: neither command is legal or needed; Set TR
+     * Dequeue Pointer alone (below) is already legal from any of these. */
+
+    /* Reset the software ring state to match: enqueue back at slot 0, PCS
+     * back to true, matching a freshly ring_alloc()'d ring -- the physical
+     * page itself is reused, not reallocated. */
+    xhci_ring_t *ring = &st->rings[dci];
+    ring->enqueue_index = 0;
+    ring->cycle_state = true;
+
+    uint32_t deq_lo = (uint32_t)(ring->phys & 0xFFFFFFFFU & ~0xFU) | XHCI_EP_DEQUEUE_CYCLE_STATE;
+    submit_command(deq_lo, 0, 0,
+                   XHCI_TRB_TYPE(XHCI_TRB_TYPE_SET_TR_DEQUEUE_POINTER_CMD) | cmd_control);
+    if (!wait_command_irq(&completion_code, NULL) || completion_code != XHCI_COMPLETION_SUCCESS) {
+        printf("xhci: slot %u: Set TR Dequeue Pointer (dci=%u) failed (completion code=%u)\n",
+               slot_id, dci, completion_code);
+        return false;
+    }
+    return true;
+}
+
 static const usb_hc_ops_t xhci_hc_ops = {
     .enable_slot = enable_slot,
     .address_device = address_device,
     .control_transfer = control_transfer,
     .configure_endpoint = configure_endpoint,
     .submit_interrupt_transfer = submit_interrupt_transfer,
+    .configure_bulk_endpoints = configure_bulk_endpoints,
+    .bulk_transfer = bulk_transfer,
+    .reset_endpoint = reset_endpoint,
 };
 
 /* Walks the extended capabilities list for a Supported Protocol Capability
@@ -1289,6 +1540,10 @@ void xhci_enumerate(void)
          * protocol) -- future class drivers (mice, storage) would get
          * their own hid_try_attach()-shaped hook called here too. */
         hid_try_attach(&xhci_hc_ops, &dev);
+        /* Same shape, for Mass Storage (checked internally via
+         * dev.has_bulk_endpoints, already gated on interface class 0x08 by
+         * parse_configuration()). */
+        usb_msd_try_attach(&xhci_hc_ops, &dev);
     }
 }
 

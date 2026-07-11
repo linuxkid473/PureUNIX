@@ -75,7 +75,15 @@ def le32(v): return struct.pack('<I', v & 0xFFFFFFFF)
 
 
 class Ext2Builder:
-    def __init__(self):
+    def __init__(self, volume_label: str = 'PureUnixEXT2'):
+        # Only the persistent-disk build (tools/mkdiskimg.py, via
+        # --persistent-boot) overrides this to 'PUREUNIX_ROOT' — it's the
+        # exact label boot/grub-embedded.cfg's `search --label` looks for
+        # to find this partition after the MBR/core.img handoff. The
+        # ordinary ISO+ramdisk build's label is unused by anything today,
+        # left at its original value to keep that image byte-for-byte
+        # unchanged.
+        self.volume_label = volume_label
         self.image        = bytearray(TOTAL_BLOCKS * BLOCK_SIZE)
         self.next_block   = FIRST_FREE_BLOCK
         self.next_inode   = ROOT_INO + 1   # inode 2 is root; 3+ are free
@@ -425,8 +433,9 @@ class Ext2Builder:
         put32(100, 0)                         # s_feature_ro_compat
         # UUID: fixed non-zero value so the FS can be identified
         sb[104:120] = b'\x50\x55\x52\x45\x55\x4e\x49\x58\x45\x58\x54\x32\x00\x00\x00\x01'
-        # Volume name
-        sb[120:136] = b'PureUnixEXT2\x00\x00\x00\x00'
+        # Volume name (16 bytes, null-padded/truncated)
+        label_bytes = self.volume_label.encode('ascii')[:16]
+        sb[120:120 + len(label_bytes)] = label_bytes
 
         # Write to disk — the superblock occupies the SECOND 1 KB block
         # (byte offset 1024 = block 1 × 1024)
@@ -630,6 +639,32 @@ def ensure_dir(fs, dir_cache: dict, path: str) -> int:
     return ino
 
 
+def add_persistent_boot_files(fs, dir_cache: dict, kernel_elf_path: str):
+    """Embeds /boot/pureunix.elf and a real /boot/grub/grub.cfg into the
+    image, for the persistent-disk build (tools/mkdiskimg.py) — GRUB's own
+    ext2 module reads both straight off this filesystem after the MBR/
+    core.img handoff, with no multiboot2 modules declared (unlike
+    boot/grub.cfg's ISO+ramdisk menuentry): the kernel finds and mounts this
+    same partition as / itself once it's running (kernel_main()'s
+    find_persistent_root_disk(), kernel/main.c) — no separate root.img
+    ramdisk. Opt-in (only called when --persistent-boot is passed) so the
+    ordinary $(DISK2)/ext2.img build used by the existing ISO+ramdisk boot
+    path (boot/grub.cfg, make run/run-test) is completely unaffected."""
+    boot_ino = ensure_dir(fs, dir_cache, 'boot')
+    with open(kernel_elf_path, 'rb') as f:
+        fs.add_file(boot_ino, 'pureunix.elf', f.read())
+
+    grub_ino = ensure_dir(fs, dir_cache, 'boot/grub')
+    fs.add_file(grub_ino, 'grub.cfg',
+        b'set timeout=1\n'
+        b'set default=0\n'
+        b'\n'
+        b'menuentry "PureUnix" {\n'
+        b'    multiboot2 /boot/pureunix.elf\n'
+        b'    boot\n'
+        b'}\n')
+
+
 def add_tree(fs, dir_cache: dict, dest_path: str, host_dir: str):
     """Recursively install a host directory tree onto the image at
     dest_path (an absolute path), preserving its directory structure —
@@ -685,7 +720,8 @@ def add_tcc(fs, dir_cache: dict, tcc_elf: str, tcc_sysroot: str):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] [program.elf ...]", file=sys.stderr)
+        print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] "
+              "[--persistent-boot KERNEL.elf] [program.elf ...]", file=sys.stderr)
         return 2
 
     out = argv[1]
@@ -694,6 +730,7 @@ def main(argv):
     docs_dir = None
     tcc_elf = None
     tcc_sysroot = None
+    persistent_boot_kernel = None
     programs = []
     i = 0
     while i < len(rest):
@@ -706,11 +743,14 @@ def main(argv):
         elif rest[i] == '--tcc-sysroot' and i + 1 < len(rest):
             tcc_sysroot = rest[i + 1]
             i += 2
+        elif rest[i] == '--persistent-boot' and i + 1 < len(rest):
+            persistent_boot_kernel = rest[i + 1]
+            i += 2
         else:
             programs.append(rest[i])
             i += 1
 
-    fs  = Ext2Builder()
+    fs  = Ext2Builder(volume_label='PUREUNIX_ROOT' if persistent_boot_kernel else 'PureUnixEXT2')
     dir_cache = {}   # absolute path -> inode, shared by ensure_dir() callers
                       # (add_bin/add_tcc) so e.g. /bin is only created once
 
@@ -905,6 +945,10 @@ def main(argv):
             b'first line here\n'
             b'needle line has target text\n'
             b'last line here\n')
+
+    # ---------------------------------------------------------- /boot (persistent disk only)
+    if persistent_boot_kernel:
+        add_persistent_boot_files(fs, dir_cache, persistent_boot_kernel)
 
     # ------------------------------------------------------------------ build
     fs.build(out)
