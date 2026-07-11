@@ -250,6 +250,14 @@ The Makefile just copies the vendored ELF into `$(BUILD)/user/busybox.elf` (`$(B
 
 ---
 
+## Lua
+
+**Source**: `third_party/lua/lua-5.4.7` (vendored source, unmodified upstream — see that directory's `README.md`), built directly by the top-level Makefile using Lua's own `CORE_O`/`LIB_O` object lists against the same newlib + `newlib_syscalls.o` + `newlib_crt0` glue every `NEWLIB_PROGRAMS`/TinyCC entry uses.
+
+[Lua](https://www.lua.org) 5.4.7 runs natively as `/bin/lua` (interactive REPL and script runner) and `/bin/luac` (bytecode compiler) — real, unmodified upstream Lua, not a stripped-down or embedded-only build. `-DLUA_USE_POSIX` takes it down Lua's own POSIX configuration branch: real `popen()`/`pclose()` (backed by real `fork()`/`pipe()`/`execve()` — see `docs/lua-port.md`), `fseeko`/`ftello`, `flockfile`/`funlockfile`, `sigaction`-based Ctrl-C handling, and real `isatty()`-based interactive-session detection. No dynamic linker exists, so `require()` of a compiled C module fails cleanly with Lua's own upstream "dynamic libraries not enabled" message; `require()` of ordinary `.lua` source modules from `/usr/local/share/lua/5.4/` (`LUA_LDIR`, populated by `tools/mkext2.py`'s `add_lua()`) works fully. See `docs/lua-port.md` for the full architecture, every platform gap found and fixed (real `system()`/`popen()`/`pclose()`, `_setjmp`/`_longjmp`, `flockfile`/`funlockfile`, a real `isatty()`, and the pre-existing missing `/root`/`/home/guest` home directories), and the memory budget.
+
+---
+
 ## Programs
 
 ### hello.c

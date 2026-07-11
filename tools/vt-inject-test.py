@@ -175,18 +175,14 @@ class QemuSession:
 
 
 def boot_to_shell(qemu, password):
-    qemu.wait_for(r"Set a password for the 'root' account", 60)
-    time.sleep(0.5)
-    qemu.type_text(password + "\n")
-    time.sleep(0.5)
-    qemu.type_text(password + "\n")
-    qemu.wait_for(r"login:", 30)
-    time.sleep(0.3)
-    qemu.type_text("root\n")
-    time.sleep(0.3)
-    qemu.wait_for(r"Password:", 15)
-    time.sleep(0.3)
-    qemu.type_text(password + "\n")
+    # kernel/main.c now auto-logs in as root unconditionally ("Auto-login
+    # as root -- no first-boot wizard, no login prompt. BusyBox ash starts
+    # immediately on every boot.") -- the password-wizard/login-prompt
+    # flow this used to drive no longer exists on any current build.
+    # `password` is accepted but unused; kept so callers/CLI flags don't
+    # need to change.
+    del password
+    qemu.wait_for(r"Enter 'help'", 60)
     time.sleep(1.5)
 
 

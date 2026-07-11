@@ -82,6 +82,22 @@ raw `int $0x80` syscall ABI (`docs/syscalls.md`):
   - `fnmatch()` — a real glob-matching implementation (needed by BusyBox's
     `find -name`/`-path`), since newlib ships the header but not the
     implementation for this target.
+  - `system()`/`popen()`/`pclose()` — real, added for the Lua port
+    (`docs/lua-port.md`): the vendored `libc.a`'s own `system()` was an
+    unconditional `errno=ENOSYS` dummy, and `popen()`/`pclose()` didn't
+    exist at all. All three now spawn a real `/bin/sh -c "..."` child via
+    `fork()`/`pipe()`/`dup2()`/`execve()`/`waitpid()` — genuine child
+    processes, not stubs.
+  - `isatty()` — real, not a guess: issues a `TIOCGWINSZ` `ioctl()` probe
+    and lets `arch/i386/syscall.c`'s `tty_fd_check()` (which already
+    distinguishes a real console binding from a redirected-to-file/pipe
+    fd) answer, instead of the previous `fd >= 0 && fd <= 2` shortcut that
+    was wrong for a redirected fd 0/1/2. Found via the Lua port
+    (`docs/lua-port.md`) but a generic correctness fix.
+  - `flockfile()`/`funlockfile()`/`ftrylockfile()` — real no-ops: newlib
+    declares these but never built them for this single-task,
+    cooperatively-scheduled target, so there's genuinely nothing for a
+    per-`FILE*` lock to exclude.
 - **Honest stubs (accepted, no enforcement model exists to back them)**:
   `sigaction()`/`sigprocmask()`/`sigsuspend()`/`signal()` (record/report
   only — no real signal delivery, see `docs/syscalls.md`'s `SYS_KILL`),
@@ -95,7 +111,9 @@ Some headers newlib never shipped for a generic bare-metal target at all
 (`sys/mman.h`, `sys/wait.h`, `sys/utsname.h`, `dirent.h`'s real struct
 instead of the "no host support configured" `#error` fallback, ...), and a
 few of newlib's own headers are missing individual declarations real
-programs need (`signal.h`'s `SA_RESTART` and friends). `user/newlib_compat/`
+programs need (`signal.h`'s `SA_RESTART` and friends, `setjmp.h`'s
+`_setjmp`/`_longjmp` macros needed by Lua's `LUA_USE_POSIX` build — see
+`docs/lua-port.md`). `user/newlib_compat/`
 holds PureUNIX's own versions of these, found *first* on the include path
 (`NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include`
 in the Makefile) so they shadow newlib's own without needing to patch

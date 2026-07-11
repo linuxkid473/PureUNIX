@@ -262,9 +262,57 @@ TCC_SYSROOT_FILES := $(TCC_SYSROOT)/lib/crt1.o $(TCC_SYSROOT)/lib/crti.o \
 
 tcc-sysroot: $(TCC_SYSROOT_FILES)
 
+# Lua 5.4.7 (vendored source under third_party/lua/ -- see that dir's
+# README.md for the vendoring rationale) -- real, unmodified upstream Lua,
+# built the same way as TCC above: PureUNIX's own top-level Makefile
+# compiles it directly rather than Lua's own src/Makefile (which assumes a
+# hosted `cc`/`ar`/PLAT-guessing toolchain this cross build doesn't have),
+# using the exact CORE_O/LIB_O object lists Lua's own Makefile defines.
+# -DLUA_USE_POSIX takes Lua down its already-existing POSIX configuration
+# branch (luaconf.h) -- real popen()/pclose(), fseeko/ftello, getc_unlocked/
+# flockfile, sigaction-based Ctrl-C handling in the lua.c CLI -- all now
+# backed by real PureUNIX syscalls/newlib glue (user/newlib_syscalls.c).
+# LUA_USE_DLOPEN is deliberately left undefined: PureUNIX has no dynamic
+# linker at all (same reasoning as TCC_PUREUNIX's CONFIG_TCC_STATIC
+# default above), so loadlib.c compiles its own upstream "dynamic
+# libraries not enabled" fallback (a real, complete branch of loadlib.c,
+# not a patch) -- require() of pure-Lua modules from LUA_LDIR/LUA_CDIR
+# (luaconf.h's default /usr/local/share|lib/lua/5.4/, installed below)
+# still works fully; only requiring a compiled .so C module would fail,
+# cleanly, with that upstream message. No Lua source files are patched.
+LUA_SRC := third_party/lua/lua-5.4.7/src
+LUA_CORE_SRCS := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c \
+	lgc.c llex.c lmem.c lobject.c lopcodes.c lparser.c lstate.c \
+	lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c
+LUA_LIB_SRCS := lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c \
+	lmathlib.c loadlib.c loslib.c lstrlib.c ltablib.c lutf8lib.c linit.c
+LUA_BASE_OBJS := $(addprefix $(BUILD)/user/lua/,$(LUA_CORE_SRCS:.c=.o) $(LUA_LIB_SRCS:.c=.o))
+LUA_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(LUA_SRC) -DLUA_USE_POSIX -DLUA_COMPAT_5_3
+
+$(BUILD)/user/lua/%.o: $(LUA_SRC)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(LUA_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(LUA_BASE_OBJS:.o=.d) $(BUILD)/user/lua/lua.d $(BUILD)/user/lua/luac.d
+
+LUA_ELF := $(BUILD)/user/lua.elf
+LUAC_ELF := $(BUILD)/user/luac.elf
+
+$(LUA_ELF): $(BUILD)/user/lua/lua.o $(LUA_BASE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/lua/lua.o $(LUA_BASE_OBJS) \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
+$(LUAC_ELF): $(BUILD)/user/lua/luac.o $(LUA_BASE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/lua/luac.o $(LUA_BASE_OBJS) \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -332,8 +380,8 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) \
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT)
 
 disk: $(DISK) $(DISK2)
@@ -345,8 +393,8 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) \
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-

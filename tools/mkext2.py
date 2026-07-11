@@ -603,6 +603,14 @@ def add_bin(fs, programs, dir_cache: dict):
         for applet in BUSYBOX_APPLETS:
             fs.add_symlink(bin_ino, applet, 'busybox.elf')
 
+    # Same idea for Lua/luac (third_party/lua/, docs/lua-port.md) -- plain
+    # name-without-.elf symlinks so `lua`/`luac` work as ordinary PATH
+    # commands from BusyBox ash, matching every other standalone ELF above.
+    if any(os.path.basename(p).lower() == 'lua.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'lua', 'lua.elf')
+    if any(os.path.basename(p).lower() == 'luac.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'luac', 'luac.elf')
+
 
 def add_dev(fs, dir_cache: dict, num_vts: int = 6):
     """Add /dev/tty1../ttyN and /dev/tty -- see include/pureunix/vt.h and
@@ -718,6 +726,32 @@ def add_tcc(fs, dir_cache: dict, tcc_elf: str, tcc_sysroot: str):
             fs.add_file(usr_lib_ino, name, f.read())
 
 
+def add_lua(fs, dir_cache: dict):
+    """Create Lua's default module search directories (luaconf.h's
+    LUA_LDIR/LUA_CDIR, unmodified upstream default: LUA_ROOT "/usr/local/"
+    -> /usr/local/share/lua/5.4/ for pure-Lua modules, /usr/local/lib/lua/
+    5.4/ for C modules -- see docs/lua-port.md) so `require("modname")`
+    finds real on-disk modules with zero LUA_PATH/LUA_CPATH configuration,
+    the same way a conventional Unix Lua install works. Seeded with one
+    real, tiny pure-Lua module (greet.lua) so require() has something
+    genuine to find and the whole chain (package.path search, loadfile,
+    dofile-as-part-of-require) is exercised by simply booting the image,
+    not just by a test script written after the fact. Also creates /tmp
+    (newlib's P_tmpdir, stdio.h) -- needed by os.tmpname()/tmpfile(),
+    unrelated to Lua specifically but nothing created it before this."""
+    lua_ldir_ino = ensure_dir(fs, dir_cache, '/usr/local/share/lua/5.4')
+    ensure_dir(fs, dir_cache, '/usr/local/lib/lua/5.4')
+    ensure_dir(fs, dir_cache, '/tmp')
+    fs.add_file(lua_ldir_ino, 'greet.lua',
+        b'-- A real installed Lua module (docs/lua-port.md) --\n'
+        b"-- exercises require()'s on-disk package.path search.\n"
+        b'local greet = {}\n\n'
+        b'function greet.hello(name)\n'
+        b'  return "Hello, " .. (name or "world") .. ", from a real Lua module!"\n'
+        b'end\n\n'
+        b'return greet\n')
+
+
 def main(argv):
     if len(argv) < 2:
         print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] "
@@ -799,6 +833,9 @@ def main(argv):
     if tcc_elf and tcc_sysroot:
         add_tcc(fs, dir_cache, tcc_elf, tcc_sysroot)
 
+    # --------------------------------------------------------------- Lua
+    add_lua(fs, dir_cache)
+
     # ------------------------------------------------------------------ /docs
     if docs_dir and os.path.isdir(docs_dir):
         add_docs(fs, docs_dir)
@@ -806,10 +843,24 @@ def main(argv):
     # ------------------------------------------------------------------ /home
     home_ino = fs.mkdir(ROOT_INO, 'home')
     user_ino = fs.mkdir(home_ino, 'user')
+    fs.mkdir(home_ino, 'guest')
 
     fs.add_file(user_ino, 'notes.txt',
         b'EXT2 nested directory test file.\n'
         b'If you can read this, path traversal works!\n')
+
+    # /root -- /etc/passwd's root:...:/root:/bin/sh already names this as
+    # root's home directory, and kernel/main.c's auto-login path sets
+    # $HOME=/root and calls shell_set_home_cwd("/root") on every boot, but
+    # nothing ever created the directory itself -- shell_set_home_cwd()
+    # silently no-ops if vfs_stat() doesn't find a real directory there
+    # (shell/sh.c), so ash was actually starting in / the whole time, not
+    # /root as HOME/the password database both claim. Found while testing
+    # the Lua port (writing a script to "$HOME/test.lua" failed with
+    # "nonexistent directory") but this is a pre-existing gap unrelated to
+    # Lua specifically -- fixing it here so every account's home directory
+    # genuinely exists, matching /etc/passwd.
+    fs.mkdir(ROOT_INO, 'root')
 
     # ----------------------------------------------------------------- /testdir (for readdir test)
     testdir_ino = fs.mkdir(ROOT_INO, 'testdir')

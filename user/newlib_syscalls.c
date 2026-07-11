@@ -34,6 +34,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -441,9 +442,20 @@ int mknod(const char *path, mode_t mode, dev_t dev)
     return -1;
 }
 
+/* Real, not "any of fd 0/1/2" — asks the kernel via the same TIOCGWINSZ
+ * probe a real libc's isatty() would use an ioctl for. tty_fd_check()
+ * (arch/i386/syscall.c) already distinguishes a genuine console binding
+ * (fd 0/1/2 with no open_file_t, or an explicit FD_KIND_TTY /dev/ttyN)
+ * from a redirected-to-a-file/pipe fd, returning -ENOTTY for the latter —
+ * this just surfaces that distinction instead of guessing from the fd
+ * number alone. Matters for anything that checks "am I interactive"
+ * before deciding whether to print prompts, e.g. Lua's REPL
+ * (lua_stdin_is_tty(), LUA_USE_POSIX) under `lua < script.lua`. */
 int isatty(int fd)
 {
-    return fd >= 0 && fd <= 2;
+    struct winsize ws;
+    int r = raw_syscall(PU_SYS_IOCTL, fd, TIOCGWINSZ, (int)&ws);
+    return r == 0;
 }
 
 /* One console, no /dev tree — "/dev/console" is as real a name as this
@@ -469,6 +481,31 @@ char *ttyname(int fd)
         return NULL;
     }
     return buf;
+}
+
+/* flockfile()/funlockfile()/ftrylockfile() are declared in newlib's own
+ * <stdio.h> (getc_unlocked()'s companions) but never *defined* in the
+ * vendored libc.a — this newlib was never configured with a threading
+ * model, so the reentrant-locking half of stdio was left out entirely.
+ * PureUNIX has no threads (one task, one stack, cooperative scheduling —
+ * docs/scheduler.md), so genuine per-FILE* locks would have nothing to
+ * exclude; honest no-ops are the correct implementation here, not a
+ * placeholder. liolib.c's l_lockfile/l_unlockfile (LUA_USE_POSIX) are the
+ * motivating caller. */
+void flockfile(FILE *file)
+{
+    (void)file;
+}
+
+int ftrylockfile(FILE *file)
+{
+    (void)file;
+    return 0;
+}
+
+void funlockfile(FILE *file)
+{
+    (void)file;
 }
 
 /* struct timespec is layout-compatible with PureUNIX's own
@@ -1227,6 +1264,127 @@ int execvp(const char *file, char *const argv[])
     }
     errno = ENOENT;
     return -1;
+}
+
+/* ---- system()/popen()/pclose() ----
+ * The vendored libc.a's own system() (libc/stdlib/system.c) is an
+ * unconditional dummy for this target — no host support was ever
+ * configured, so it just sets errno=ENOSYS and returns -1; popen()/
+ * pclose() don't exist in libc.a at all (no host popen.c was ever built
+ * either). Real fork()/pipe()/dup2()/execve()/waitpid() already exist
+ * above, so — same as this file's dirname()/realpath()/fnmatch()
+ * additions — these are implemented for real rather than left stubbed.
+ * Defining `system` here (rather than in the archive) wins at link time
+ * purely through ordinary archive-member laziness: this object is given
+ * to the linker directly, ahead of -lc, so libc.a's own lib_a-system.o is
+ * never even pulled in to resolve the symbol. Both spawn a real BusyBox
+ * ash (`/bin/sh -c "..."`) child, matching the standard POSIX contract —
+ * Lua's os.execute()/io.popen() (LUA_USE_POSIX) are the motivating
+ * callers, but this is generic libc functionality, not Lua-specific. */
+int system(const char *command)
+{
+    if (!command) {
+        return 1; /* a shell is always available */
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        char *argv[] = { (char *)"sh", (char *)"-c", (char *)command, NULL };
+        execve("/bin/sh", argv, environ);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        /* retry on signal-interrupted wait */
+    }
+    return status;
+}
+
+/* popen()/pclose() need to remember which child pid a given FILE* stream
+ * belongs to, so pclose() waits on the right process — a small fixed
+ * table, matching this codebase's general "fixed-size pool, not
+ * kmalloc'd" style (e.g. kernel/task.c's g_open_files[]) rather than a
+ * linked list. 16 concurrent popen() streams is far more than anything in
+ * this userland (ash, Lua) opens at once. */
+#define POPEN_MAX 16
+static struct { FILE *fp; pid_t pid; } popen_table[POPEN_MAX];
+
+FILE *popen(const char *command, const char *type)
+{
+    if (!type || (type[0] != 'r' && type[0] != 'w') || type[1] != '\0') {
+        errno = EINVAL;
+        return NULL;
+    }
+    int fds[2];
+    if (pipe(fds) < 0) {
+        return NULL;
+    }
+    bool reading = (type[0] == 'r');
+    int parent_fd = reading ? fds[0] : fds[1];
+    int child_fd  = reading ? fds[1] : fds[0];
+    int child_std = reading ? 1 : 0; /* child's stdout for "r", stdin for "w" */
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int saved = errno;
+        close(fds[0]);
+        close(fds[1]);
+        errno = saved;
+        return NULL;
+    }
+    if (pid == 0) {
+        close(parent_fd);
+        dup2(child_fd, child_std);
+        close(child_fd);
+        char *argv[] = { (char *)"sh", (char *)"-c", (char *)command, NULL };
+        execve("/bin/sh", argv, environ);
+        _exit(127);
+    }
+    close(child_fd);
+    FILE *fp = fdopen(parent_fd, type);
+    if (!fp) {
+        int saved = errno;
+        close(parent_fd);
+        waitpid(pid, NULL, 0);
+        errno = saved;
+        return NULL;
+    }
+    for (int slot = 0; slot < POPEN_MAX; slot++) {
+        if (!popen_table[slot].fp) {
+            popen_table[slot].fp = fp;
+            popen_table[slot].pid = pid;
+            break;
+        }
+    }
+    /* No free slot (>16 concurrent popen()s): pclose() below just won't
+     * find this stream and will fclose() it without reaping the child,
+     * leaving a zombie — the same degraded-but-safe failure mode classic
+     * fixed-table popen() implementations have always had. */
+    return fp;
+}
+
+int pclose(FILE *stream)
+{
+    pid_t pid = -1;
+    for (int i = 0; i < POPEN_MAX; i++) {
+        if (popen_table[i].fp == stream) {
+            pid = popen_table[i].pid;
+            popen_table[i].fp = NULL;
+            break;
+        }
+    }
+    fclose(stream);
+    if (pid < 0) {
+        errno = ECHILD;
+        return -1;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        /* retry on signal-interrupted wait */
+    }
+    return status;
 }
 
 /* PureUNIX's SYS_WAIT (docs/syscalls.md) writes the child's bare exit code
