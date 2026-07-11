@@ -27,24 +27,17 @@
 #include <pureunix/syscall.h>
 #include <pureunix/task.h>
 #include <pureunix/tty.h>
-#include <pureunix/users.h>
 #include <pureunix/usb_msd.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 #include <pureunix/vt.h>
 #include <pureunix/xhci.h>
 
-/* The real login shell for an interactive session — BusyBox ash by default
- * (/etc/passwd's shell field, seeded "/bin/sh" — see kernel/users.c),
- * launched as a genuine ring-3 process via elf_exec_argv() exactly the way
- * the (now-secondary) in-kernel shell launches any other external program
- * (shell/sh.c's exec_external()); kernel_main() itself is "current" here
- * (tasking_init()'s main_task, not a user task) — see task_create_user()'s
- * fd/uid/gid/cwd inheritance, which works the same regardless. Blocks
- * (elf_exec_argv() only returns once its child has exited — see
- * kernel/elf.c) until the login shell itself exits, then kernel_main()'s
- * own for(;;) loop calls users_login() again, i.e. exiting the shell logs
- * you out back to a fresh login prompt, real-getty style.
+/* The login shell for an interactive session — BusyBox ash by default
+ * (set via SHELL="/bin/sh" at boot), launched as a genuine ring-3 process
+ * via elf_exec_argv(). Blocks until the shell exits, then kernel_main()'s
+ * own for(;;) loop restarts it immediately — no login prompt between
+ * sessions, just a fresh shell.
  *
  * If the configured shell can't be exec'd at all (a stripped-down disk
  * image, or /etc/passwd pointing somewhere that no longer exists), falls
@@ -348,26 +341,17 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     if (crypto_ready()) {
         printf("Crypto OK\n");
     } else {
-        /* Every login is verified cryptographically (see kernel/users.c) —
-         * without a working CoreCrypto there is no safe way to check a
-         * password, so refuse to boot into a login prompt at all. */
-        panic("CoreCrypto self-test failed; refusing to start login.");
+        printf("Warning: CoreCrypto self-test failed — continuing without password auth\n");
     }
 
-    if (users_first_boot()) {
-        users_first_boot_setup();
-    }
-
-    /* One interactive login on VT1 (the only VT actually on screen at boot)
-     * establishes the credentials (task_set_creds(), kernel/users.c) and
-     * env (USER/HOME/SHELL, shell/builtins.c) every VT's session shares --
-     * PureUnix has no multi-user, login-per-tty model yet (see docs/vt.md),
-     * so VT2..NUM_VTS start pre-authenticated as that same identity rather
-     * than each prompting its own login (which would mean NUM_VTS-1
-     * password prompts all fighting over the one physical keyboard before
-     * any of them are even visible). */
-    users_login();
-    boot_checkpoint("after login");
+    /* Auto-login as root — no first-boot wizard, no login prompt.
+     * BusyBox ash starts immediately on every boot. */
+    task_set_creds(0, 0);
+    shell_setenv("USER", "root");
+    shell_setenv("HOME", "/root");
+    shell_setenv("SHELL", "/bin/sh");
+    shell_set_home_cwd("/root");
+    boot_checkpoint("after auto-login");
 
     for (int i = 1; i < NUM_VTS; ++i) {
         if (!task_create("vt-session", vt_session_main, (void *)(uint32_t)i)) {
@@ -377,12 +361,5 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 
     for (;;) {
         run_login_shell();
-        /* Exiting the login shell logs back out, getty-style -- but only
-         * VT1 (the interactively logged-in one) re-prompts; VT2..NUM_VTS's
-         * vt_session_main() above just starts another pre-authenticated
-         * session on its own VT, matching how it started in the first
-         * place. */
-        users_login();
-        boot_checkpoint("after login");
     }
 }
