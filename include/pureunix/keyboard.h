@@ -10,7 +10,23 @@ enum {
     KEY_ENTER = 10,
     KEY_ESCAPE = 27,
     KEY_BASE = 0x100,
-    KEY_UP,
+    /* Explicit "= KEY_BASE" is load-bearing, not decorative: KEY_BASE is
+     * itself a real enum member here (unlike user/pureunix_gfx.h's
+     * PU_KEY_BASE, a plain #define that never consumes a value), so
+     * without this, KEY_UP would silently become KEY_BASE+1 (0x101) and
+     * every constant below it would drift one further from its PU_KEY_*
+     * counterpart — exactly the bug this once was: Chocolate Doom's
+     * Right arrow (KEY_RIGHT, raw-queue-only) silently became
+     * SDL_SCANCODE_HOME once it crossed into user/pureunix_gfx.h's
+     * independently-numbered PU_KEY_* constants (see SDL_puevents.c),
+     * while Left became SDL_SCANCODE_RIGHT, Down became SDL_SCANCODE_LEFT,
+     * and Up became SDL_SCANCODE_DOWN. Invisible to every ASCII/escape-
+     * sequence consumer (drivers/tty.c's key_to_escape_seq() compares
+     * against these same symbolic constants directly, never crossing into
+     * PU_KEY_* land), which is why ncurses/vi/htop's arrow keys were never
+     * affected and this went unnoticed until Chocolate Doom's raw SDL
+     * input path exposed it. */
+    KEY_UP = KEY_BASE,
     KEY_DOWN,
     KEY_LEFT,
     KEY_RIGHT,
@@ -46,6 +62,17 @@ enum {
     KEY_F10,
     KEY_F11,
     KEY_F12,
+    /* Modifier keys as raw events (include/pureunix/input.h) -- these never
+     * flow through vt_input_push()'s ASCII queue (modifiers alone produce
+     * no character), only through vt_raw_input_push_key(), so SDL can track
+     * shift/ctrl/alt state directly instead of inferring it from which
+     * shifted character arrived. */
+    KEY_LSHIFT,
+    KEY_RSHIFT,
+    KEY_LCTRL,
+    KEY_RCTRL,
+    KEY_LALT,
+    KEY_RALT,
 };
 
 void keyboard_init(void);

@@ -20,6 +20,7 @@
 #define HID_CLASS               3U
 #define HID_SUBCLASS_BOOT       1U
 #define HID_PROTOCOL_KEYBOARD   1U
+#define HID_PROTOCOL_MOUSE      2U
 
 /* HID class-specific request (bRequest) and protocol values (USB HID spec
  * sec 7.2.6). */
@@ -54,5 +55,12 @@
  * if `dev` isn't a Boot Protocol keyboard at all; logs and returns false if
  * it is one but attachment fails. */
 bool hid_try_attach(const usb_hc_ops_t *hc, const usb_device_t *dev);
+
+/* Same shape as hid_try_attach(), for a Boot Protocol mouse (HID class,
+ * Boot subclass, Mouse protocol): decodes the standard 3/4-byte boot mouse
+ * report (buttons bitmap, signed dx, signed dy, optional wheel) and feeds
+ * include/pureunix/vt.h's vt_raw_input_push_mouse_motion()/
+ * vt_raw_input_push_mouse_button(). Silently a no-op for any other device. */
+bool hid_mouse_try_attach(const usb_hc_ops_t *hc, const usb_device_t *dev);
 
 #endif

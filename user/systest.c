@@ -1658,7 +1658,7 @@ static void test_ext2_specifics(void)
 {
     section("EXT2-specific: allocator reuse, ENOSPC, cross-fs EPERM");
 
-    /* Fill the 4 MiB filesystem's remaining free space with separate,
+    /* Fill the filesystem's remaining free space with separate,
        modest-sized files (each its own fresh write buffer) until the block
        allocator runs out at close() time (when a buffered write is
        actually flushed to disk — see docs/syscalls.md's SYS_WRITE
@@ -1667,8 +1667,17 @@ static void test_ext2_specifics(void)
        kernel's write-buffer growth (every SYS_WRITE on the same fd
        reallocates and re-zeroes the *entire* accumulated buffer from
        scratch, so repeatedly growing one fd to several MiB is drastically
-       more expensive than writing the same total spread over many fds). */
-    enum { FILLER_SIZE = 65536, MAX_FILLERS = 128 };
+       more expensive than writing the same total spread over many fds).
+       MAX_FILLERS is just a safety backstop (the loop actually exits via
+       enospc_seen as soon as ENOSPC really happens, so a generous bound
+       costs nothing at runtime) — deliberately far above any current disk
+       image size (tools/mkext2.py's TOTAL_BLOCKS, currently 24 MiB across
+       3 block groups — see that file's "Why 3 block groups") so this test
+       doesn't need retuning every time the image grows again, the way the
+       old MAX_FILLERS=128 (exactly the old single-group 8 MiB image's
+       size) silently stopped exercising ENOSPC at all once the image grew
+       to 24 MiB without ever failing loudly. */
+    enum { FILLER_SIZE = 65536, MAX_FILLERS = 4096 };
     static char filler[FILLER_SIZE];
     for (int i = 0; i < FILLER_SIZE; i++) filler[i] = 'z';
 

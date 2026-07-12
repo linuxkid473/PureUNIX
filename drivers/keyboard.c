@@ -93,8 +93,11 @@ static void keyboard_irq(interrupt_regs_t *regs)
     sc &= 0x7F;
 
     if (extended) {
+        int key = extended_key(sc);
+        if (key != KEY_NONE) {
+            vt_raw_input_push_key(key, !released);
+        }
         if (!released) {
-            int key = extended_key(sc);
             if (shift_down && (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) {
                 /* Shift+PageUp/PageDown browses the active VT's scrollback
                  * (see drivers/vga.c's console_t.sb_view) rather than
@@ -108,17 +111,37 @@ static void keyboard_irq(interrupt_regs_t *regs)
         return;
     }
 
-    if (sc == 0x2A || sc == 0x36) {
+    if (sc == 0x2A) {
         shift_down = !released;
+        vt_raw_input_push_key(KEY_LSHIFT, !released);
+        return;
+    }
+    if (sc == 0x36) {
+        shift_down = !released;
+        vt_raw_input_push_key(KEY_RSHIFT, !released);
         return;
     }
     if (sc == 0x1D) {
         ctrl_down = !released;
+        vt_raw_input_push_key(KEY_LCTRL, !released);
         return;
     }
     if (sc == 0x38) {
         alt_down = !released;
+        vt_raw_input_push_key(KEY_LALT, !released);
         return;
+    }
+    /* Raw press/release for every plain (non-modifier, non-extended) key,
+     * identified by its unshifted mapping regardless of the actual shift
+     * state -- see vt.h's vt_raw_input_push_key() comment on why "which key"
+     * and "what character" are deliberately kept distinct. Function keys
+     * and Caps Lock get their own raw events further below/above; this
+     * covers the plain alphanumeric/punctuation block. */
+    {
+        int rawcode = (uint8_t)normal_map[sc] ? (int)(uint8_t)normal_map[sc] : function_key(sc);
+        if (rawcode != KEY_NONE) {
+            vt_raw_input_push_key(rawcode, !released);
+        }
     }
     if (released) {
         return;

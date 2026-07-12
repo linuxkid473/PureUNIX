@@ -61,6 +61,16 @@ void vga_console_repaint(console_t *cs);
  * policy half (keyboard routing, termios, ...). */
 void vga_bind_active(console_t *cs);
 
+/* SDL2 platform support (docs/sdl-port.md, kernel/vt.c's
+ * vt_set_graphics_mode()) -- suppresses every hardware-paint gate above
+ * for cs even while it's the active console, so an SDL app's own
+ * framebuffer writes (SYS_FB_BLIT) aren't overwritten by console repaints.
+ * Does not itself repaint on disable -- call vga_console_repaint(cs)
+ * afterward if cs is still active and should show its console content
+ * again. */
+void vga_console_set_graphics_mode(console_t *cs, bool enable);
+bool vga_console_is_graphics_mode(const console_t *cs);
+
 /* Per-console output — updates cs's own buffer, only touches real hardware
  * if cs is the active console. Used by kernel/vt.c to route a background
  * VT's writes without disturbing the foreground screen. */

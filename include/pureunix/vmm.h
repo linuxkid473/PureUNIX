@@ -44,19 +44,43 @@
  *                          points at these exact same page tables (pd[0..31]
  *                          are copied by reference, never duplicated).
  *
- * 0x08000000 – 0x082FFFFF  per-process user window (pd[32], private):
- *   0x08000000 – (stack)     code / data / bss (see user/linker.ld)
+ * 0x08000000 – 0x0BFFFFFF  per-process user window (pd[32..47], private):
+ *   0x08000000 – (heap)      code / data / bss (see user/linker.ld) --
+ *                            every program installed on the image today is
+ *                            well under 1.5 MiB of this
+ *   HEAP_VA (below)          real, incrementally-grown sbrk() heap
+ *                            (SYS_SBRK, arch/i386/syscall.c) -- pages are
+ *                            mapped one at a time as the break actually
+ *                            grows, up to HEAP_MAX, not eagerly reserved
+ *                            up front (see HEAP_VA's own comment for why)
+ *   FB_SHADOW_VA (below)     SDL2 port's window-surface pixel buffer
+ *                            (docs/sdl-port.md), mapped on demand by
+ *                            SYS_FB_MMAP -- also real per-process pages,
+ *                            not part of the ELF image or the heap
  *   USER_WINDOW_END-64KiB    fixed-size stack, growing down
  *
- * 0x08300000 – 0xFFFFFFFF  unmapped
+ * 0x0C000000 – 0xFFFFFFFF  unmapped
  *
- * pd[32] is the only PDE that differs between processes: vmm_create_user_
- * directory() clones the kernel's own page_directory (so pd[0..31] alias
- * the shared kernel tables) and leaves pd[32] absent, to be populated
- * per-process by vmm_map_page_in().
+ * pd[32..47] are the only PDEs that differ between processes: vmm_create_
+ * user_directory() clones the kernel's own page_directory (so pd[0..31]
+ * alias the shared kernel tables) and leaves pd[32..47] absent, to be
+ * populated per-process by vmm_map_page_in(). Widened progressively as
+ * real applications needed more room -- 3 MiB (pd[32] only) originally,
+ * then 16 MiB for the SDL2 port's FB_SHADOW_VA (docs/sdl-port.md), now
+ * 64 MiB for the Chocolate Doom port (docs/chocolate-doom-port.md): Doom's
+ * own zone allocator (src/z_zone.c) mallocs up to 16-32 MiB in one shot
+ * for its private memory pool, on top of SDL's own window-surface mapping,
+ * neither of which fit in the previous 16 MiB total. Virtual address space
+ * this size costs nothing by itself -- vmm_map_page_in() only spends a
+ * real physical frame for a page some process actually touches, whether
+ * via HEAP_VA's incremental growth or FB_SHADOW_VA's one-shot mapping --
+ * so widening this is not the same kind of cost the eager-bss-array
+ * design HEAP_VA replaced was (see that comment). vmm_free_user_
+ * directory() and vmm_fork_address_space() (kernel/vmm.c) both loop over
+ * every PDE in [USER_WINDOW_BASE, USER_WINDOW_END), not a fixed count.
  */
 #define USER_WINDOW_BASE    0x08000000U
-#define USER_WINDOW_END     0x08300000U
+#define USER_WINDOW_END     0x0C000000U
 #define USER_STACK_SIZE     0x10000U
 
 /* One page reserved immediately below the stack for kernel/signal.c's
@@ -66,6 +90,31 @@
  * this one page to guarantee no real program's code/data/bss can ever
  * extend into it. See docs/process-management.md. */
 #define SIGNAL_TRAMPOLINE_VA (USER_WINDOW_END - USER_STACK_SIZE - PUREUNIX_PAGE_SIZE)
+
+/* Real, incrementally-grown sbrk() heap (SYS_SBRK, arch/i386/syscall.c;
+ * user/newlib_syscalls.c's sbrk() is now a thin wrapper around it) --
+ * replaces what used to be a fixed-size static array in every newlib
+ * program's own bss (NEWLIB_HEAP_SIZE), eagerly costing every single
+ * program that many real physical MiB at exec() time regardless of
+ * whether it ever used that much heap (kernel/elf.c's PT_LOAD loader has
+ * no demand paging -- see docs/sdl-port.md's "eager bss physical
+ * allocation" note, the exact lesson this generalizes). SYS_SBRK instead
+ * maps one real page at a time as task_t.heap_used actually grows past
+ * task_t.heap_mapped, up to HEAP_MAX -- a tiny program that barely
+ * touches malloc() now costs only what it actually touches, while a
+ * program that needs Chocolate Doom's ~16-32 MiB zone allocation
+ * (docs/chocolate-doom-port.md) can still get it. Placed well clear of
+ * any real program's ELF-loaded code/data/bss (4 MiB in) and, at its own
+ * maximum extent, well clear of FB_SHADOW_VA below. */
+#define HEAP_VA  (USER_WINDOW_BASE + 0x400000U)
+#define HEAP_MAX 0x2000000U /* 32 MiB */
+
+/* SDL2 port (docs/sdl-port.md): fixed VA, within the user window but well
+ * clear of HEAP_VA's own maximum extent (HEAP_VA + HEAP_MAX) and of the
+ * stack at the opposite end, where SYS_FB_MMAP (arch/i386/syscall.c) maps
+ * a process's on-demand window-surface pixel buffer. Not part of any ELF
+ * segment and not backed by the heap. */
+#define FB_SHADOW_VA (HEAP_VA + HEAP_MAX)
 
 /* Per-process page directory ----------------------------------------------- */
 uint32_t    vmm_create_user_directory(void);

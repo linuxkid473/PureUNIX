@@ -6,15 +6,42 @@ Creates a read-only EXT2 image suitable for testing the Stage 1 EXT2
 driver.  Only the structures needed for reading are populated; journal,
 extended attributes, and resize metadata are not used.
 
-Layout (1 KB blocks, single block group):
+Layout (1 KB blocks, 3 block groups -- see "Why 3 block groups" below):
   Block 0  : boot block / padding (first 1024 bytes, before the superblock)
   Block 1  : superblock
-  Block 2  : block group descriptor table (BGDT)
-  Block 3  : block bitmap
-  Block 4  : inode bitmap
-  Block 5  : inode table (128 blocks for 1024 inodes × 128 bytes/inode)
+  Block 2  : block group descriptor table (BGDT) -- one 32-byte entry per
+             group, all 3 in this single block (3*32 = 96 bytes)
+  Block 3  : group 0's block bitmap
+  Block 4  : group 0's inode bitmap
+  Block 5  : group 0's inode table (128 blocks for 1024 inodes x 128
+             bytes/inode)
    ...
-  Block 133: first data block
+  Block 133: first free (data) block in group 0
+   ...
+  Block 8193 (group 1's first block): group 1's block bitmap
+  Block 8194: group 1's inode bitmap
+  Block 8195: group 1's inode table (128 blocks)
+   ...
+  Block 8323: first free (data) block in group 1
+   ... (group 2 the same shape, starting at block 16385)
+
+Why 3 block groups: a single block group's block bitmap is exactly one
+block, so BLOCKS_PER_GROUP is capped at block_size * 8 -- a real EXT2
+format constraint (also true of Linux's own ext2), not a shortcut this
+generator takes. At 1 KB blocks that's an 8 MiB ceiling per group. Group 0's
+on-disk layout/offsets are kept byte-for-byte identical to every previous
+version of this file (nothing here was renumbered) specifically so the
+regression suite's existing fixed-offset fixtures (bigfile.bin/hugefile.bin
+block-boundary reads in user/ext2test.c and user/systest.c) keep passing
+unmodified; groups 1 and 2 are purely additive extra capacity, added
+because a real statically-linked SDL2 app (docs/sdl-port.md's
+sdltest.elf) no longer fit in the old single-group 8 MiB image alongside
+everything already installed. fs/ext2/alloc.c's block/inode allocator was
+already fully group-generic (iterates fs->num_groups, indexes fs->bgdt[g])
+before this file ever needed more than one group -- multi-group support
+existed and was reachable via the write path (e.g. SQLite/ash creating new
+files at runtime) even though no image had ever exercised more than group 0
+until now.
 """
 import struct, sys, os, time
 
@@ -32,23 +59,68 @@ EXT2_MAGIC        = 0xEF53
 INODE_SIZE        = 128
 INODES_PER_GROUP  = 1024
 BLOCKS_PER_GROUP  = 8192          # max for 1 KB blocks (1 bitmap block = 8192 bits)
-TOTAL_BLOCKS      = 8192          # 8 MB image — bumped from 4 MB (still the
-                                   # max a single block group supports at
-                                   # this 1 KB block size, see BLOCKS_PER_GROUP
-                                   # above) to fit the TinyCC port's sysroot
-                                   # (crt objects, libtcc1.a, a merged libc.a,
-                                   # and newlib's ~140-header tree — see
-                                   # docs/tcc-port.md) alongside everything
-                                   # already installed.
+NUM_GROUPS        = 3             # see the module docstring's "Why 3 block
+                                   # groups" -- 24 MB total, comfortably
+                                   # fitting the SDL2 port's sdltest.elf
+                                   # alongside everything else installed.
 FIRST_DATA_BLOCK  = 1             # for 1 KB blocks the SB lives in block 1
 
-# Block layout for group 0
+# Block layout for group 0 -- unchanged from every previous single-group
+# version of this file (see the module docstring).
 BGDT_BLOCK        = 2
 BLOCK_BITMAP_BLOCK= 3
 INODE_BITMAP_BLOCK= 4
 INODE_TABLE_BLOCK = 5
 INODE_TABLE_BLOCKS= (INODES_PER_GROUP * INODE_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE  # 128
 FIRST_FREE_BLOCK  = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS  # 133
+
+# Reserved (metadata) blocks at the start of any group *other* than group 0:
+# just its own block bitmap + inode bitmap + inode table (no per-group
+# superblock/BGDT backup copies -- see the module docstring: this
+# generator and PureUNIX's own fs/ext2/ reader are the only two things that
+# ever look at this image, and the reader only ever consults the *primary*
+# superblock/BGDT, so the redundant backup copies real e2fsck-compatible
+# ext2 would require in every group are simply not needed here).
+EXTRA_GROUP_RESERVED_BLOCKS = 2 + INODE_TABLE_BLOCKS  # 130
+
+def group_first_block(g):
+    """Absolute block number of group g's first block (its own bitmap, for
+    every group but 0 -- group 0's first block is the boot block)."""
+    return FIRST_DATA_BLOCK + g * BLOCKS_PER_GROUP
+
+def group_meta_blocks(g):
+    """(block_bitmap, inode_bitmap, inode_table_start) absolute block
+    numbers for group g."""
+    if g == 0:
+        return BLOCK_BITMAP_BLOCK, INODE_BITMAP_BLOCK, INODE_TABLE_BLOCK
+    base = group_first_block(g)
+    return base, base + 1, base + 2
+
+def group_first_free_block(g):
+    """First block in group g available for file data (i.e. not this
+    group's own bitmaps/inode table)."""
+    if g == 0:
+        return FIRST_FREE_BLOCK
+    return group_first_block(g) + EXTRA_GROUP_RESERVED_BLOCKS
+
+# NOTE: deliberately NUM_GROUPS * BLOCKS_PER_GROUP, *not*
+# group_first_block(NUM_GROUPS) (= FIRST_DATA_BLOCK + NUM_GROUPS *
+# BLOCKS_PER_GROUP). fs/ext2/super.c's own num_groups computation is
+# `ceil(s_blocks_count / s_blocks_per_group)` — it does not subtract
+# s_first_data_block first the way the real EXT2 spec's formula does. With
+# FIRST_DATA_BLOCK=1 added in, s_blocks_count would be one more than an
+# exact multiple of BLOCKS_PER_GROUP, and the kernel's ceiling division
+# would then compute NUM_GROUPS+1 groups — a phantom extra group whose
+# BGDT entry this generator never wrote (all-zero), which
+# fs/ext2/alloc.c's allocator would then try to use as if it were real,
+# corrupting allocation immediately (this was caught by SDL_GetWindowSurface
+# failing with "Out of memory" during the SDL2 port's first QEMU boot test
+# — docs/sdl-port.md). Using an exact multiple here instead means group
+# NUM_GROUPS-1 ends up exactly one block short of a "full" BLOCKS_PER_GROUP
+# (its last theoretical block, at group_first_block(NUM_GROUPS)-1
+# overall, is simply never allocated) — harmless, and still matches the
+# kernel's own group-count formula exactly.
+TOTAL_BLOCKS = NUM_GROUPS * BLOCKS_PER_GROUP
 
 # EXT2 inode mode bits
 S_IFDIR = 0x4000
@@ -87,8 +159,12 @@ class Ext2Builder:
         self.image        = bytearray(TOTAL_BLOCKS * BLOCK_SIZE)
         self.next_block   = FIRST_FREE_BLOCK
         self.next_inode   = ROOT_INO + 1   # inode 2 is root; 3+ are free
-        # Track usage for bitmaps
+        # Track usage for bitmaps — group 0's reserved range, plus groups
+        # 1..NUM_GROUPS-1's own (bitmap + inode bitmap + inode table) range.
         self.used_blocks  = set(range(FIRST_FREE_BLOCK))
+        for g in range(1, NUM_GROUPS):
+            base = group_first_block(g)
+            self.used_blocks |= set(range(base, base + EXTRA_GROUP_RESERVED_BLOCKS))
         self.used_inodes  = {1, ROOT_INO}  # 1=bad-blocks, 2=root
 
         # Directory entries per inode: inode_no -> list of (name, ino, ft)
@@ -111,15 +187,25 @@ class Ext2Builder:
     # ------------------------------------------------------------------
     def _alloc_block(self):
         b = self.next_block
+        # Jump over any group's own reserved (bitmap/inode-table) range —
+        # next_block increments linearly across group boundaries, so once
+        # it lands inside group g's metadata (blocks
+        # [group_first_block(g), group_first_free_block(g))) it must skip
+        # straight to that group's first free block instead of handing out
+        # a metadata block as if it were file data.
+        for g in range(1, NUM_GROUPS):
+            if group_first_block(g) <= b < group_first_free_block(g):
+                b = group_first_free_block(g)
+                break
         if b >= TOTAL_BLOCKS:
             raise RuntimeError("EXT2 image full")
-        self.next_block += 1
+        self.next_block = b + 1
         self.used_blocks.add(b)
         return b
 
     def _alloc_inode(self):
         i = self.next_inode
-        if i > INODES_PER_GROUP:
+        if i > NUM_GROUPS * INODES_PER_GROUP:
             raise RuntimeError("inode table full")
         self.next_inode += 1
         self.used_inodes.add(i)
@@ -363,11 +449,13 @@ class Ext2Builder:
 
     def _write_inode_table(self):
         for ino, info in self._inodes.items():
-            local_idx    = ino - 1
+            g            = (ino - 1) // INODES_PER_GROUP
+            local_idx    = (ino - 1) % INODES_PER_GROUP
             byte_off     = local_idx * INODE_SIZE
             blk_off      = byte_off // BLOCK_SIZE
             off_in_blk   = byte_off % BLOCK_SIZE
-            abs_blk      = INODE_TABLE_BLOCK + blk_off
+            _, _, inode_table_block = group_meta_blocks(g)
+            abs_blk      = inode_table_block + blk_off
             raw          = self._pack_inode(info)
             start        = abs_blk * BLOCK_SIZE + off_in_blk
             self.image[start : start + INODE_SIZE] = raw
@@ -386,11 +474,11 @@ class Ext2Builder:
     # Superblock + BGDT
     # ------------------------------------------------------------------
     def _write_superblock(self):
+        total_inodes     = NUM_GROUPS * INODES_PER_GROUP
         num_used_inodes  = len(self.used_inodes)
         num_used_blocks  = len(self.used_blocks)
         free_blocks      = TOTAL_BLOCKS - num_used_blocks
-        free_inodes      = INODES_PER_GROUP - num_used_inodes
-        used_dirs        = sum(1 for i in self._dirs)
+        free_inodes      = total_inodes - num_used_inodes
 
         # Superblock is 1024 bytes; pad with zeros to fill
         sb = bytearray(BLOCK_SIZE)
@@ -399,7 +487,7 @@ class Ext2Builder:
         def put16(off, v): struct.pack_into('<H', sb, off, v & 0xFFFF)
         def put8 (off, v): sb[off] = v & 0xFF
 
-        put32(0,   INODES_PER_GROUP)          # s_inodes_count
+        put32(0,   total_inodes)              # s_inodes_count
         put32(4,   TOTAL_BLOCKS)              # s_blocks_count
         put32(8,   0)                         # s_r_blocks_count
         put32(12,  free_blocks)               # s_free_blocks_count
@@ -443,21 +531,35 @@ class Ext2Builder:
         self.image[start : start + BLOCK_SIZE] = sb
 
     def _write_bgdt(self):
-        num_free_blocks = TOTAL_BLOCKS - len(self.used_blocks)
-        num_free_inodes = INODES_PER_GROUP - len(self.used_inodes)
-        used_dirs       = len(self._dirs)
-
-        # Single group descriptor (32 bytes)
-        entry = struct.pack('<IIIHHHI',
-            BLOCK_BITMAP_BLOCK,   # bg_block_bitmap
-            INODE_BITMAP_BLOCK,   # bg_inode_bitmap
-            INODE_TABLE_BLOCK,    # bg_inode_table
-            num_free_blocks,      # bg_free_blocks_count
-            num_free_inodes,      # bg_free_inodes_count
-            used_dirs,            # bg_used_dirs_count
-            0,                    # bg_pad + bg_reserved (combined as one I)
-        )
-        buf = entry + b'\x00' * (BLOCK_SIZE - len(entry))
+        # One 32-byte descriptor per group (real ext2_group_desc layout:
+        # 3 x uint32 + 4 x uint16 + 3 x uint32 reserved = 32 bytes exactly —
+        # see fs/ext2/ext2.h's ext2_bgdt_entry_t, which fs/ext2/alloc.c
+        # indexes as fs->bgdt[g], so every entry must land at exactly
+        # g*32, not the 22-byte stride a plain '<IIIHHHI' pack produces).
+        entries = bytearray()
+        for g in range(NUM_GROUPS):
+            base = group_first_block(g)
+            bbitmap_blk, ibitmap_blk, itable_blk = group_meta_blocks(g)
+            used_blocks_in_group = sum(
+                1 for blk in self.used_blocks if base <= blk < base + BLOCKS_PER_GROUP)
+            free_blocks_in_group = BLOCKS_PER_GROUP - used_blocks_in_group
+            ino_base = g * INODES_PER_GROUP
+            used_inodes_in_group = sum(
+                1 for i in self.used_inodes if ino_base < i <= ino_base + INODES_PER_GROUP)
+            free_inodes_in_group = INODES_PER_GROUP - used_inodes_in_group
+            used_dirs_in_group = sum(
+                1 for ino in self._dirs if ino_base < ino <= ino_base + INODES_PER_GROUP)
+            entries += struct.pack('<IIIHHHHIII',
+                bbitmap_blk,             # bg_block_bitmap
+                ibitmap_blk,             # bg_inode_bitmap
+                itable_blk,              # bg_inode_table
+                free_blocks_in_group,    # bg_free_blocks_count
+                free_inodes_in_group,    # bg_free_inodes_count
+                used_dirs_in_group,      # bg_used_dirs_count
+                0,                       # bg_pad
+                0, 0, 0,                 # bg_reserved[3]
+            )
+        buf = bytes(entries) + b'\x00' * (BLOCK_SIZE - len(entries))
         self._write_block(BGDT_BLOCK, buf)
 
     # ------------------------------------------------------------------
@@ -467,14 +569,44 @@ class Ext2Builder:
         self._finalise_dirs()
         self._write_inode_table()
 
-        # Block bitmap: blocks 0..FIRST_FREE_BLOCK-1 are used, plus whatever
-        # data blocks were allocated during finalise/file creation
-        self._write_bitmap(BLOCK_BITMAP_BLOCK, self.used_blocks, TOTAL_BLOCKS)
+        # Group 0: block bitmap bit N is set directly for absolute block N
+        # (not group-0-relative, i.e. NOT subtracting FIRST_DATA_BLOCK) —
+        # kept byte-for-byte identical to every previous single-group
+        # version of this file (see the module docstring): blocks
+        # 0..FIRST_FREE_BLOCK-1 are used, plus whatever data blocks were
+        # allocated during finalise/file creation that landed in group 0's
+        # own range. max_bits=BLOCKS_PER_GROUP (not the old TOTAL_BLOCKS,
+        # now larger than one group) both keeps this identical to before
+        # and keeps group 1/2's higher block numbers from being (incorrectly
+        # and out-of-bounds) written into group 0's own bitmap block.
+        self._write_bitmap(BLOCK_BITMAP_BLOCK, self.used_blocks, BLOCKS_PER_GROUP)
 
-        # Inode bitmap: inode N is bit N (1-based, but the bitmap is 0-indexed
-        # from the start of the group, so inode 1 → bit 0)
+        # Group 0's inode bitmap: inode N is bit N-1 (1-based inode numbers,
+        # 0-indexed bitmap) — again unchanged from every previous version;
+        # max_bits=INODES_PER_GROUP already excludes group 1/2's inodes.
         inode_bits = {i - 1 for i in self.used_inodes}
         self._write_bitmap(INODE_BITMAP_BLOCK, inode_bits, INODES_PER_GROUP)
+
+        # Groups 1..NUM_GROUPS-1: real, group-relative bitmaps (bit i ↔
+        # absolute block/inode group_first_block(g)+i — the same convention
+        # fs/ext2/alloc.c's kernel-side allocator already assumes for every
+        # group). These groups didn't exist before this file supported
+        # multiple groups, so there's no prior byte layout to preserve here.
+        for g in range(1, NUM_GROUPS):
+            base = group_first_block(g)
+            bbitmap_blk, ibitmap_blk, _ = group_meta_blocks(g)
+            group_block_bits = {
+                blk - base for blk in self.used_blocks
+                if base <= blk < base + BLOCKS_PER_GROUP
+            }
+            self._write_bitmap(bbitmap_blk, group_block_bits, BLOCKS_PER_GROUP)
+
+            ino_base = g * INODES_PER_GROUP
+            group_inode_bits = {
+                (i - 1) - ino_base for i in self.used_inodes
+                if ino_base < i <= ino_base + INODES_PER_GROUP
+            }
+            self._write_bitmap(ibitmap_blk, group_inode_bits, INODES_PER_GROUP)
 
         self._write_superblock()
         self._write_bgdt()
@@ -628,6 +760,14 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'htop.elf' for p in programs):
         fs.add_symlink(bin_ino, 'htop', 'htop.elf')
 
+    # Same idea for Chocolate Doom (third_party/chocolate-doom/,
+    # docs/chocolate-doom-port.md) -- a plain name-without-.elf symlink so
+    # `chocolate-doom` works as an ordinary PATH command with no ".elf" to
+    # type, matching the task's "type the command directly, no PATH setup"
+    # requirement.
+    if any(os.path.basename(p).lower() == 'chocolate-doom.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'chocolate-doom', 'chocolate-doom.elf')
+
 
 def add_dev(fs, dir_cache: dict, num_vts: int = 6):
     """Add /dev/tty1../ttyN and /dev/tty -- see include/pureunix/vt.h and
@@ -651,7 +791,18 @@ def ensure_dir(fs, dir_cache: dict, path: str) -> int:
     missing components along the way (like `mkdir -p`) and caching every
     inode created so a later call for a path sharing a prefix (e.g. both
     /lib/tcc/include and /lib/tcc/lib under /lib/tcc) reuses it instead of
-    creating the same directory twice."""
+    creating the same directory twice.
+
+    Also checks the real directory-entry list of an already-built parent
+    (fs._dirs), not just dir_cache, before creating -- dir_cache only ever
+    sees paths *this function* has created; several well-known top-level
+    directories (/root, /home, /etc, ...) are created directly via
+    fs.mkdir() elsewhere in main() and never registered in dir_cache, so
+    without this check ensure_dir() would silently create a second,
+    same-named-but-different-inode directory entry that shadows the real
+    one (found the hard way: --extra-file /root/doom1.wad landed in an
+    orphaned duplicate "root" directory, invisible at the real /root
+    path — see docs/chocolate-doom-port.md's Testing section)."""
     path = path.strip('/')
     if not path:
         return ROOT_INO
@@ -659,6 +810,10 @@ def ensure_dir(fs, dir_cache: dict, path: str) -> int:
         return dir_cache[path]
     parent_path, _, name = path.rpartition('/')
     parent_ino = ensure_dir(fs, dir_cache, parent_path) if parent_path else ROOT_INO
+    for entry_name, entry_ino, entry_ft in fs._dirs[parent_ino]:
+        if entry_name == name and entry_ft == FT_DIR:
+            dir_cache[path] = entry_ino
+            return entry_ino
     ino = fs.mkdir(parent_ino, name)
     dir_cache[path] = ino
     return ino
@@ -769,10 +924,26 @@ def add_lua(fs, dir_cache: dict):
         b'return greet\n')
 
 
+def add_extra_file(fs, dir_cache: dict, host_path: str, dest_path: str):
+    """Copies one arbitrary host file onto the image at an arbitrary
+    absolute path, creating any missing parent directories -- a generic
+    escape hatch for content that isn't a program (add_bin) or a doc
+    (add_docs), e.g. an IWAD placed for Chocolate Doom testing
+    (docs/chocolate-doom-port.md's Testing section: "an IWAD ... on the
+    persistent filesystem must remain available across reboot" --
+    verified by placing one this way, not by hand-editing the image)."""
+    dest_path = dest_path.strip('/')
+    parent, _, name = dest_path.rpartition('/')
+    parent_ino = ensure_dir(fs, dir_cache, '/' + parent) if parent else ROOT_INO
+    with open(host_path, 'rb') as f:
+        fs.add_file(parent_ino, name, f.read())
+
+
 def main(argv):
     if len(argv) < 2:
         print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] "
-              "[--persistent-boot KERNEL.elf] [program.elf ...]", file=sys.stderr)
+              "[--persistent-boot KERNEL.elf] [--extra-file HOST:DEST ...] [program.elf ...]",
+              file=sys.stderr)
         return 2
 
     out = argv[1]
@@ -782,6 +953,7 @@ def main(argv):
     tcc_elf = None
     tcc_sysroot = None
     persistent_boot_kernel = None
+    extra_files = []  # list of (host_path, dest_path)
     programs = []
     i = 0
     while i < len(rest):
@@ -796,6 +968,10 @@ def main(argv):
             i += 2
         elif rest[i] == '--persistent-boot' and i + 1 < len(rest):
             persistent_boot_kernel = rest[i + 1]
+            i += 2
+        elif rest[i] == '--extra-file' and i + 1 < len(rest):
+            host_path, _, dest_path = rest[i + 1].partition(':')
+            extra_files.append((host_path, dest_path))
             i += 2
         else:
             programs.append(rest[i])
@@ -890,16 +1066,17 @@ def main(argv):
     fs.add_symlink(testdir_ino, 'uplink', '../README.TXT')
 
     # ------------------------------------------------------------------ bigfile.bin
-    # 5 KB = 5 direct blocks — tests multi-block direct reads.
-    big_data = b'B' * (5 * BLOCK_SIZE)   # 5120 bytes, all 0x42
-    assert len(big_data) == 5120
+    # 5 blocks, all direct — tests multi-block direct reads. Sized off
+    # BLOCK_SIZE (not a hardcoded byte count) so this scales correctly
+    # whether the image uses 1 KB or 4 KB blocks.
+    big_data = b'B' * (5 * BLOCK_SIZE)
     fs.add_file(ROOT_INO, 'bigfile.bin', big_data)
 
     # ------------------------------------------------------------------ hugefile.bin
-    # A file that exceeds 12 direct blocks (>12 KB) and requires the
-    # singly-indirect block pointer (i_block[12]).
-    # 14 KB = 14 blocks → first 12 are direct, last 2 via singly-indirect.
-    huge_size = 14 * BLOCK_SIZE   # 14336 bytes
+    # A file that exceeds 12 direct blocks and requires the singly-indirect
+    # block pointer (i_block[12]) — 14 blocks → first 12 are direct, last 2
+    # via singly-indirect. Also sized off BLOCK_SIZE.
+    huge_size = 14 * BLOCK_SIZE
     huge_data = bytes(range(256)) * (huge_size // 256)
     assert len(huge_data) == huge_size
     fs.add_file(ROOT_INO, 'hugefile.bin', huge_data)
@@ -1017,6 +1194,10 @@ def main(argv):
     # ---------------------------------------------------------- /boot (persistent disk only)
     if persistent_boot_kernel:
         add_persistent_boot_files(fs, dir_cache, persistent_boot_kernel)
+
+    # ------------------------------------------------------------ --extra-file
+    for host_path, dest_path in extra_files:
+        add_extra_file(fs, dir_cache, host_path, dest_path)
 
     # ------------------------------------------------------------------ build
     fs.build(out)

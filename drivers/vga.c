@@ -84,6 +84,15 @@ typedef struct console {
     size_t sb_count;
     size_t sb_next;
     size_t sb_view;
+    /* SDL2 platform support (docs/sdl-port.md, kernel/vt.c's
+     * vt_set_graphics_mode()) -- while set, every hardware-paint gate below
+     * that currently checks "is this console g_active" also requires this
+     * to be false, so an SDL app's framebuffer content survives console
+     * writes/repaints to the same VT instead of being overwritten by text.
+     * Deliberately does NOT suppress the serial-mirror side effects
+     * (serial_clear()/serial_erase_line() below) -- those never touch the
+     * framebuffer at all, so they're harmless to keep running. */
+    bool graphics_mode;
 } console_t;
 
 #define VGA_MAX_CONSOLES 8
@@ -107,6 +116,18 @@ static console_t g_consoles[VGA_MAX_CONSOLES];
  * console in g_consoles[] just keeps its own cell_char/cell_attr/cursor
  * state current without touching any of that — see force_draw() below. */
 static console_t *g_active = &g_consoles[0];
+
+/* True iff cs is both on screen and not currently suppressed for graphics
+ * mode -- the actual condition every hardware-framebuffer-touching gate
+ * below wants, as opposed to vga_console_is_active()'s plain "is this the
+ * active VT" query (which callers may legitimately want regardless of
+ * graphics mode) or the serial-mirror side effects (console_reset()'s
+ * serial_clear(), erase_current_line()'s serial_erase_line()), which stay
+ * gated on cs == g_active alone since they never touch the framebuffer. */
+static bool is_live(const console_t *cs)
+{
+    return cs == g_active && !cs->graphics_mode;
+}
 
 /* Hardware-wide properties: the same physical display, grid size, and font
  * geometry are shared by every console (only one is ever actually on
@@ -244,7 +265,7 @@ static void draw_cell(console_t *cs, size_t r, size_t c)
  * over the newly active console instead when it takes over. */
 static void force_draw(console_t *cs, size_t r, size_t c)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (use_fb) {
@@ -270,7 +291,7 @@ static void set_cell(console_t *cs, size_t r, size_t c, char ch, uint8_t attr)
 
 static void cursor_restore(console_t *cs)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (use_fb && cs->cursor_valid) {
@@ -280,7 +301,7 @@ static void cursor_restore(console_t *cs)
 
 static void cursor_draw(console_t *cs)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (use_fb) {
@@ -312,7 +333,7 @@ static void set_text_cursor_visible(bool visible)
 
 static void update_cursor(console_t *cs)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (cs->cursor_hidden) {
@@ -382,7 +403,7 @@ static void scroll(console_t *cs)
         cs->cell_char[bot][x] = ' ';
         cs->cell_attr[bot][x] = cs->color;
     }
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (use_fb) {
@@ -813,7 +834,7 @@ static void console_reset(console_t *cs)
         memset(cs->cell_char[y], ' ', vga_cols);
         memset(cs->cell_attr[y], (int)cs->color, vga_cols);
     }
-    if (cs == g_active) {
+    if (is_live(cs)) {
         if (use_fb) {
             uint32_t cw = (uint32_t)font_cell_w();
             uint32_t chh = (uint32_t)font_cell_h();
@@ -850,7 +871,7 @@ void vga_console_reset(console_t *cs)
  * same reasoning as insert_lines()/delete_lines()). */
 void vga_console_repaint(console_t *cs)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     if (use_fb) {
@@ -877,6 +898,24 @@ void vga_bind_active(console_t *cs)
     }
     g_active = cs;
     vga_console_repaint(cs);
+}
+
+/* kernel/vt.c's vt_set_graphics_mode() backing call -- see console_t's
+ * graphics_mode field comment and is_live() above. Entering graphics mode
+ * takes effect immediately (every subsequent hardware-paint gate checks
+ * is_live()); leaving it does NOT itself repaint -- kernel/vt.c calls
+ * vga_console_repaint() separately afterward if the VT is still active,
+ * exactly like vga_bind_active() already does for a normal VT switch. */
+void vga_console_set_graphics_mode(console_t *cs, bool enable)
+{
+    if (cs) {
+        cs->graphics_mode = enable;
+    }
+}
+
+bool vga_console_is_graphics_mode(const console_t *cs)
+{
+    return cs && cs->graphics_mode;
 }
 
 void vga_init(void)
@@ -1129,7 +1168,7 @@ void vga_status_bar(const char *left, const char *right)
  * console has nothing on screen to scroll. */
 void vga_console_scroll_view(console_t *cs, int delta)
 {
-    if (cs != g_active) {
+    if (!is_live(cs)) {
         return;
     }
     long view = (long)cs->sb_view - delta;

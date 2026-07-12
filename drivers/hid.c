@@ -151,12 +151,46 @@ static bool usage_in_report(const uint8_t report[HID_BOOT_REPORT_SIZE], uint8_t 
 #define HID_USAGE_F1 0x3A
 #define HID_USAGE_F6 0x3F
 
+/* Raw-event identity for a usage ID, independent of shift/caps state --
+ * mirrors drivers/keyboard.c's PS/2 rawcode logic (vt.h's
+ * vt_raw_input_push_key() comment). Always the unshifted mapping, or the
+ * extended-key KEY_* constant for arrows/Home/End/etc. */
+static int usage_rawcode(uint8_t usage)
+{
+    if (usage >= 0x4A && usage <= 0x52) {
+        return extended_usage_key(usage);
+    }
+    if (usage >= sizeof(usage_to_ascii) / sizeof(usage_to_ascii[0])) {
+        return KEY_NONE;
+    }
+    return usage_to_ascii[usage];
+}
+
+/* Modifier bit -> its raw KEY_L.../KEY_R... constant, for diffing the modifier
+ * byte across reports the same way usage IDs are diffed below (HID Boot
+ * Protocol has no separate "modifier usage ID": the whole modifier byte is
+ * a live bitmap, re-sent unchanged in every report while held). */
+static void push_modifier_diff(uint8_t prev, uint8_t cur, uint8_t bit, int key)
+{
+    if ((prev & bit) != (cur & bit)) {
+        vt_raw_input_push_key(key, (cur & bit) != 0);
+    }
+}
+
 static void decode_boot_report(hid_keyboard_t *kb)
 {
     uint8_t modifiers = kb->report_buf[0];
+    uint8_t prev_modifiers = kb->prev_report[0];
     bool shift = (modifiers & (HID_MOD_LEFT_SHIFT | HID_MOD_RIGHT_SHIFT)) != 0;
     bool ctrl = (modifiers & (HID_MOD_LEFT_CTRL | HID_MOD_RIGHT_CTRL)) != 0;
     bool alt = (modifiers & (HID_MOD_LEFT_ALT | HID_MOD_RIGHT_ALT)) != 0;
+
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_LEFT_SHIFT, KEY_LSHIFT);
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_RIGHT_SHIFT, KEY_RSHIFT);
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_LEFT_CTRL, KEY_LCTRL);
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_RIGHT_CTRL, KEY_RCTRL);
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_LEFT_ALT, KEY_LALT);
+    push_modifier_diff(prev_modifiers, modifiers, HID_MOD_RIGHT_ALT, KEY_RALT);
 
     for (uint32_t i = 2; i < HID_BOOT_REPORT_SIZE; ++i) {
         uint8_t usage = kb->report_buf[i];
@@ -165,6 +199,10 @@ static void decode_boot_report(hid_keyboard_t *kb)
         }
         if (usage_in_report(kb->prev_report, usage)) {
             continue; /* already held, not a new press */
+        }
+        int rawcode = usage_rawcode(usage);
+        if (rawcode != KEY_NONE) {
+            vt_raw_input_push_key(rawcode, 1);
         }
         if (alt && usage >= HID_USAGE_F1 && usage <= HID_USAGE_F6) {
             vt_switch((int)(usage - HID_USAGE_F1));
@@ -179,6 +217,25 @@ static void decode_boot_report(hid_keyboard_t *kb)
             continue;
         }
         vt_input_push(key);
+    }
+
+    /* Releases: any usage the previous report had that the current one no
+     * longer does. Boot Protocol reports carry no explicit release event
+     * (see the file header comment), only the currently-held set -- this
+     * is the same diffing translate_usage()'s callers already do for
+     * presses, run in the opposite direction. */
+    for (uint32_t i = 2; i < HID_BOOT_REPORT_SIZE; ++i) {
+        uint8_t usage = kb->prev_report[i];
+        if (usage == 0 || usage == 1) {
+            continue;
+        }
+        if (usage_in_report(kb->report_buf, usage)) {
+            continue; /* still held */
+        }
+        int rawcode = usage_rawcode(usage);
+        if (rawcode != KEY_NONE) {
+            vt_raw_input_push_key(rawcode, 0);
+        }
     }
 
     memcpy(kb->prev_report, kb->report_buf, HID_BOOT_REPORT_SIZE);
@@ -247,6 +304,118 @@ bool hid_try_attach(const usb_hc_ops_t *hc, const usb_device_t *dev)
                                         sizeof(kb->report_buf), hid_report_callback, kb)) {
         printf("hid: slot %u: failed to submit initial interrupt transfer\n", dev->slot_id);
         kb->in_use = false;
+        return false;
+    }
+    return true;
+}
+
+/* ---- Boot Protocol mouse ---- */
+
+/* Standard boot mouse report (USB HID spec Appendix B.2): byte0 = button
+ * bitmap (bit0 left, bit1 right, bit2 middle), byte1/2 = signed relative
+ * dx/dy. A 4th (wheel) byte is common but optional -- not read here, no
+ * PU_INPUT event for it exists yet (see include/pureunix/input.h). */
+#define HID_MOUSE_REPORT_SIZE 4U
+#define HID_MOUSE_BTN_LEFT   (1U << 0)
+#define HID_MOUSE_BTN_RIGHT  (1U << 1)
+#define HID_MOUSE_BTN_MIDDLE (1U << 2)
+
+typedef struct hid_mouse {
+    bool in_use;
+    uint32_t slot_id;
+    uint8_t endpoint_address;
+    uint8_t prev_buttons;
+    uint8_t report_buf[HID_MOUSE_REPORT_SIZE];
+} hid_mouse_t;
+
+static hid_mouse_t mice[HID_MAX_KEYBOARDS];
+
+static hid_mouse_t *alloc_mouse(void)
+{
+    for (uint32_t i = 0; i < HID_MAX_KEYBOARDS; ++i) {
+        if (!mice[i].in_use) {
+            return &mice[i];
+        }
+    }
+    return NULL;
+}
+
+static void push_button_diff(uint8_t prev, uint8_t cur, uint8_t bit, int code)
+{
+    if ((prev & bit) != (cur & bit)) {
+        vt_raw_input_push_mouse_button(code, (cur & bit) != 0);
+    }
+}
+
+static void decode_mouse_report(hid_mouse_t *m)
+{
+    uint8_t buttons = m->report_buf[0];
+    int8_t dx = (int8_t)m->report_buf[1];
+    int8_t dy = (int8_t)m->report_buf[2];
+
+    if (dx != 0 || dy != 0) {
+        /* USB HID reports +y as "down" the same way this kernel's
+         * framebuffer coordinate space already does (see
+         * include/pureunix/framebuffer.h), so dy passes through unflipped. */
+        vt_raw_input_push_mouse_motion(dx, dy);
+    }
+    push_button_diff(m->prev_buttons, buttons, HID_MOUSE_BTN_LEFT, PU_MOUSE_BTN_LEFT);
+    push_button_diff(m->prev_buttons, buttons, HID_MOUSE_BTN_RIGHT, PU_MOUSE_BTN_RIGHT);
+    push_button_diff(m->prev_buttons, buttons, HID_MOUSE_BTN_MIDDLE, PU_MOUSE_BTN_MIDDLE);
+    m->prev_buttons = buttons;
+}
+
+static void hid_mouse_report_callback(uint32_t slot_id, uint8_t endpoint_address, const void *buf,
+                                       uint16_t length, bool success, void *ctx)
+{
+    hid_mouse_t *m = (hid_mouse_t *)ctx;
+    if (!success || length < 3) {
+        usb_debugf("hid: slot %u: ep %02x: mouse report callback fired but not usable "
+                   "(success=%u length=%u)\n",
+                   slot_id, endpoint_address, success, length);
+        return;
+    }
+    memset(m->report_buf, 0, sizeof(m->report_buf));
+    memcpy(m->report_buf, buf, length < HID_MOUSE_REPORT_SIZE ? length : HID_MOUSE_REPORT_SIZE);
+    decode_mouse_report(m);
+}
+
+bool hid_mouse_try_attach(const usb_hc_ops_t *hc, const usb_device_t *dev)
+{
+    if (!dev->has_interrupt_in_endpoint) {
+        return false;
+    }
+    if (dev->interface_class != HID_CLASS || dev->interface_subclass != HID_SUBCLASS_BOOT
+        || dev->interface_protocol != HID_PROTOCOL_MOUSE) {
+        return false;
+    }
+
+    hid_mouse_t *m = alloc_mouse();
+    if (!m) {
+        printf("hid: slot %u: too many Boot Protocol mice already attached (max %u)\n",
+               dev->slot_id, HID_MAX_KEYBOARDS);
+        return false;
+    }
+    memset(m, 0, sizeof(*m));
+    m->slot_id = dev->slot_id;
+    m->endpoint_address = dev->endpoint_address;
+
+    if (!hc->control_transfer(dev->slot_id,
+                               USB_REQUEST_TYPE_HOST_TO_DEVICE | USB_REQUEST_TYPE_CLASS
+                                   | USB_REQUEST_TYPE_RECIPIENT_INTERFACE,
+                               HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT, dev->interface_number, 0,
+                               NULL, false)) {
+        printf("hid: slot %u: SET_PROTOCOL(Boot) failed for mouse\n", dev->slot_id);
+        return false;
+    }
+    printf("hid: slot %u: Boot Protocol mouse attached (interface %u, endpoint %02x)\n",
+           dev->slot_id, dev->interface_number, dev->endpoint_address);
+
+    m->in_use = true;
+    if (!hc->submit_interrupt_transfer(dev->slot_id, dev->endpoint_address, m->report_buf,
+                                        sizeof(m->report_buf), hid_mouse_report_callback, m)) {
+        printf("hid: slot %u: failed to submit initial mouse interrupt transfer\n", dev->slot_id);
+        m->in_use = false;
         return false;
     }
     return true;

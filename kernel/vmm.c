@@ -229,8 +229,17 @@ void vmm_free_user_directory(uint32_t pd_phys)
         return;
     }
     uint32_t *pd = (uint32_t *)pd_phys;
-    uint32_t pd_i = USER_WINDOW_BASE >> 22;
-    if (pd[pd_i] & PAGE_PRESENT) {
+    /* The user window now spans multiple PDEs (see vmm.h's "Virtual address
+     * space layout" comment) -- every one of them is private per-process
+     * (unlike pd[0..31], shared by reference with the kernel's own
+     * page_directory), so every present one here needs its own table and
+     * frames freed, not just a single hardcoded index. */
+    uint32_t first_pd_i = USER_WINDOW_BASE >> 22;
+    uint32_t last_pd_i  = (USER_WINDOW_END - 1) >> 22;
+    for (uint32_t pd_i = first_pd_i; pd_i <= last_pd_i; ++pd_i) {
+        if (!(pd[pd_i] & PAGE_PRESENT)) {
+            continue;
+        }
         uint32_t *table = (uint32_t *)(pd[pd_i] & ~0xFFF);
         for (uint32_t i = 0; i < 1024; ++i) {
             if (table[i] & PAGE_PRESENT) {
@@ -271,28 +280,34 @@ void vmm_map_page_in(uint32_t pd_phys, virt_addr_t virt, phys_addr_t phys, uint3
 
 bool vmm_fork_address_space(uint32_t dst_pd_phys, uint32_t src_pd_phys)
 {
-    uint32_t pd_i = USER_WINDOW_BASE >> 22;
     uint32_t *src_pd = (uint32_t *)src_pd_phys;
-    if (!(src_pd[pd_i] & PAGE_PRESENT)) {
-        return true;
-    }
-    uint32_t *src_table = (uint32_t *)(src_pd[pd_i] & ~0xFFF);
-    for (uint32_t i = 0; i < 1024; ++i) {
-        if (!(src_table[i] & PAGE_PRESENT)) {
+    /* See vmm_free_user_directory()'s comment: the user window now spans
+     * multiple PDEs, so every one of them needs its own deep-copy pass. */
+    uint32_t first_pd_i = USER_WINDOW_BASE >> 22;
+    uint32_t last_pd_i  = (USER_WINDOW_END - 1) >> 22;
+    for (uint32_t pd_i = first_pd_i; pd_i <= last_pd_i; ++pd_i) {
+        if (!(src_pd[pd_i] & PAGE_PRESENT)) {
             continue;
         }
-        phys_addr_t src_frame = src_table[i] & ~0xFFF;
-        phys_addr_t dst_frame = pmm_alloc_frame();
-        if (!dst_frame) {
-            return false;
+        uint32_t *src_table = (uint32_t *)(src_pd[pd_i] & ~0xFFF);
+        for (uint32_t i = 0; i < 1024; ++i) {
+            if (!(src_table[i] & PAGE_PRESENT)) {
+                continue;
+            }
+            phys_addr_t src_frame = src_table[i] & ~0xFFF;
+            phys_addr_t dst_frame = pmm_alloc_frame();
+            if (!dst_frame) {
+                return false;
+            }
+            /* Both frames are always identity-accessible here regardless of
+             * which directory is currently loaded in CR3, since every
+             * physical frame pmm_alloc_frame() hands out is < 128 MiB and
+             * thus covered by the shared kernel PDEs present in every
+             * directory. */
+            memcpy((void *)dst_frame, (void *)src_frame, PUREUNIX_PAGE_SIZE);
+            virt_addr_t virt = (pd_i << 22) | (i << 12);
+            vmm_map_page_in(dst_pd_phys, virt, dst_frame, (src_table[i] & 0xFFF) | PAGE_PRESENT);
         }
-        /* Both frames are always identity-accessible here regardless of
-         * which directory is currently loaded in CR3, since every physical
-         * frame pmm_alloc_frame() hands out is < 128 MiB and thus covered
-         * by the shared kernel PDEs present in every directory. */
-        memcpy((void *)dst_frame, (void *)src_frame, PUREUNIX_PAGE_SIZE);
-        virt_addr_t virt = (pd_i << 22) | (i << 12);
-        vmm_map_page_in(dst_pd_phys, virt, dst_frame, (src_table[i] & 0xFFF) | PAGE_PRESENT);
     }
     return true;
 }

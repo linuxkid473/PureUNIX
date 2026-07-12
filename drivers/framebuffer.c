@@ -1,3 +1,4 @@
+#include <pureunix/errno.h>
 #include <pureunix/framebuffer.h>
 #include <pureunix/memory.h>
 #include <pureunix/multiboot.h>
@@ -314,4 +315,26 @@ void fb_scroll_up(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pixel
         uint32_t off = (y + ry) * fb.pitch + x * bypp;
         memcpy((void *)(uintptr_t)(fb.addr + off), shadow + off, w * bypp);
     }
+}
+
+int fb_blit_buffer(const uint8_t *buf, size_t len)
+{
+    if (!fb.present) {
+        return -ENODEV;
+    }
+    uint32_t bypp = fb.bpp / 8;
+    size_t expected = (size_t)fb.width * fb.height * bypp;
+    if (!buf || len != expected) {
+        return -EINVAL;
+    }
+
+    size_t row_bytes = (size_t)fb.width * bypp;
+    for (uint32_t row = 0; row < fb.height; ++row) {
+        uint32_t off = row * fb.pitch;
+        memcpy((void *)(uintptr_t)(fb.addr + off), buf + (size_t)row * row_bytes, row_bytes);
+        if (shadow) {
+            memcpy(shadow + off, buf + (size_t)row * row_bytes, row_bytes);
+        }
+    }
+    return 0;
 }

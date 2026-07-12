@@ -4,7 +4,9 @@
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
 #include <pureunix/flock.h>
+#include <pureunix/framebuffer.h>
 #include <pureunix/icmp.h>
+#include <pureunix/input.h>
 #include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
 #include <pureunix/signal.h>
@@ -18,6 +20,7 @@
 #include <pureunix/tty.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
+#include <pureunix/vmm.h>
 #include <pureunix/vt.h>
 #include <pureunix/wait.h>
 
@@ -1654,6 +1657,122 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             *rtt_out = rtt;
         }
         return ok ? 0 : (uint32_t)-ETIMEDOUT;
+    }
+    case SYS_INPUT_POLL: {
+        pu_input_event_t *out = (pu_input_event_t *)regs->ebx;
+        task_t *t = task_current();
+        if (!out || !t) {
+            return (uint32_t)-EINVAL;
+        }
+        int vt_id = t->vt_id >= 0 ? t->vt_id : 0;
+        return vt_raw_input_try_get(vt_id, out) ? 1u : 0u;
+    }
+    case SYS_FB_GETINFO: {
+        struct pureunix_fb_info *out = (struct pureunix_fb_info *)regs->ebx;
+        if (!out) {
+            return (uint32_t)-EINVAL;
+        }
+        const fb_info_t *fb = fb_get_info();
+        if (!fb->present) {
+            return (uint32_t)-ENODEV;
+        }
+        out->width = fb->width;
+        out->height = fb->height;
+        out->bypp = fb->bpp / 8;
+        out->red_pos = fb->red_pos;
+        out->red_size = fb->red_size;
+        out->green_pos = fb->green_pos;
+        out->green_size = fb->green_size;
+        out->blue_pos = fb->blue_pos;
+        out->blue_size = fb->blue_size;
+        return 0;
+    }
+    case SYS_FB_BLIT: {
+        const uint8_t *buf = (const uint8_t *)regs->ebx;
+        size_t len = (size_t)regs->ecx;
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EINVAL;
+        }
+        int vt_id = t->vt_id >= 0 ? t->vt_id : 0;
+        if (!vt_is_graphics_mode(vt_id) || vt_active_id() != vt_id) {
+            /* Backgrounded or not-yet-graphics-mode: succeed with no
+             * hardware effect, mirroring vt_write()'s existing
+             * backgrounded-VT behavior — see include/pureunix/syscall.h's
+             * SYS_FB_BLIT comment. */
+            return 0;
+        }
+        return (uint32_t)fb_blit_buffer(buf, len);
+    }
+    case SYS_GET_TICKS_MS:
+        return (uint32_t)(pit_ticks() * 10);
+    case SYS_SET_GRAPHICS_MODE: {
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EINVAL;
+        }
+        int vt_id = t->vt_id >= 0 ? t->vt_id : 0;
+        vt_set_graphics_mode(vt_id, regs->ebx != 0);
+        return 0;
+    }
+    case SYS_FB_MMAP: {
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EINVAL;
+        }
+        if (t->fb_shadow_mapped) {
+            return FB_SHADOW_VA;
+        }
+        const fb_info_t *fb = fb_get_info();
+        if (!fb->present) {
+            return (uint32_t)-ENODEV;
+        }
+        size_t needed = (size_t)fb->width * fb->height * (fb->bpp / 8);
+        uint32_t pages = (uint32_t)((needed + PUREUNIX_PAGE_SIZE - 1) / PUREUNIX_PAGE_SIZE);
+        for (uint32_t i = 0; i < pages; ++i) {
+            phys_addr_t frame = pmm_alloc_frame();
+            if (!frame) {
+                /* Partial mapping left in place on failure -- matches this
+                 * process's normal address-space teardown (task exit/
+                 * fork-failure paths already free whatever's present in
+                 * the user window unconditionally), and a program that
+                 * gets -ENOMEM here has no reasonable way to continue
+                 * anyway. */
+                return (uint32_t)-ENOMEM;
+            }
+            memset((void *)(uintptr_t)frame, 0, PUREUNIX_PAGE_SIZE);
+            vmm_map_page_in(t->pd_phys, FB_SHADOW_VA + i * PUREUNIX_PAGE_SIZE, frame,
+                             PAGE_USER | PAGE_WRITE);
+        }
+        t->fb_shadow_mapped = true;
+        return FB_SHADOW_VA;
+    }
+    case SYS_SBRK: {
+        task_t *t = task_current();
+        if (!t) {
+            return (uint32_t)-EINVAL;
+        }
+        int32_t incr = (int32_t)regs->ebx;
+        uint32_t old_break = HEAP_VA + t->heap_used;
+        if (incr < 0 && (uint32_t)(-incr) > t->heap_used) {
+            return (uint32_t)-EINVAL;
+        }
+        uint32_t new_used = (uint32_t)((int32_t)t->heap_used + incr);
+        if (new_used > HEAP_MAX) {
+            return (uint32_t)-ENOMEM;
+        }
+        uint32_t new_needed = ALIGN_UP(new_used, PUREUNIX_PAGE_SIZE);
+        while (t->heap_mapped < new_needed) {
+            phys_addr_t frame = pmm_alloc_frame();
+            if (!frame) {
+                return (uint32_t)-ENOMEM;
+            }
+            memset((void *)(uintptr_t)frame, 0, PUREUNIX_PAGE_SIZE);
+            vmm_map_page_in(t->pd_phys, HEAP_VA + t->heap_mapped, frame, PAGE_USER | PAGE_WRITE);
+            t->heap_mapped += PUREUNIX_PAGE_SIZE;
+        }
+        t->heap_used = new_used;
+        return old_break;
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

@@ -313,6 +313,32 @@ typedef struct task {
      * inherits its creator's cwd at task_create()/task_fork() time — see
      * task_alloc() — exactly like uid/gid above. */
     char cwd[PUREUNIX_MAX_PATH];
+    /* SDL2 port (docs/sdl-port.md): true once SYS_FB_MMAP (arch/i386/
+     * syscall.c) has mapped this task's on-demand window-surface pixel
+     * buffer at FB_SHADOW_VA (include/pureunix/vmm.h) — makes repeat calls
+     * idempotent (just re-returns FB_SHADOW_VA) instead of re-allocating
+     * physical frames over an already-mapped region. False for every task
+     * that never calls it (the common case — nothing else uses this).
+     * task_fork() explicitly copies this alongside the VA mapping itself
+     * (which vmm_fork_address_space()'s whole-window deep copy already
+     * handles) so a fork()ed child's own later SYS_FB_MMAP call reuses the
+     * copy instead of leaking it by overwriting it with fresh frames. */
+    bool fb_shadow_mapped;
+    /* Real, incrementally-grown sbrk() heap (SYS_SBRK, arch/i386/
+     * syscall.c; include/pureunix/vmm.h's HEAP_VA/HEAP_MAX) — replaces the
+     * old fixed-size static-array heap every newlib program used to pay
+     * for regardless of use (see HEAP_VA's own comment). heap_used is the
+     * current break offset from HEAP_VA (what sbrk() has handed out);
+     * heap_mapped is how much of that range already has real physical
+     * frames behind it (always a multiple of the page size, always >=
+     * heap_used, rounded up to the next page) — SYS_SBRK only ever maps
+     * more when heap_used is about to exceed it, never on every call.
+     * Both start at 0 (task_alloc()'s kcalloc()) and are explicitly copied
+     * across task_fork() (kernel/task.c) alongside the VA mapping itself,
+     * which vmm_fork_address_space()'s whole-window deep copy already
+     * handles — same reasoning as fb_shadow_mapped above. */
+    uint32_t heap_used;
+    uint32_t heap_mapped;
 } task_t;
 
 void tasking_init(void);

@@ -459,9 +459,211 @@ $(HTOP_ELF): $(HTOP_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_c
 		$(HTOP_OBJS) \
 		-Wl,--start-group -lncurses -lc -lm -Wl,--end-group -lgcc -o $@
 
+# SDL2 2.28.5 (vendored upstream source under third_party/SDL2/ -- see that
+# directory's README.md and docs/sdl-port.md). Same "vendor upstream
+# source, compile it with our own Makefile rules, no upstream build
+# system" pattern as TCC/Lua/SQLite/htop above -- SDL2's own configure/
+# CMake both assume a hosted target and have no PureUNIX case (see the
+# README's "Why not SDL's own build system"); this instead hand-lists the
+# exact upstream .c files this platform's feature set needs (core, common
+# video/render/events/timer machinery, the software renderer, every
+# "dummy" stub backend for a not-yet-supported subsystem) plus one new
+# real backend this port adds, third_party/SDL2/SDL2-2.28.5/src/video/
+# pureunix/ (framebuffer/input glue, docs/sdl-port.md) and src/timer/
+# pureunix/ (real SYS_GET_TICKS_MS-backed timing). include/SDL_config_
+# pureunix.h (also new, not a patch) is this platform's hand-written
+# equivalent of what configure/CMake would otherwise generate.
+SDL_SRC := third_party/SDL2/SDL2-2.28.5
+SDL_CORE_SRCS := SDL.c SDL_assert.c SDL_dataqueue.c SDL_error.c SDL_guid.c \
+	SDL_hints.c SDL_list.c SDL_log.c SDL_utils.c \
+	atomic/SDL_atomic.c atomic/SDL_spinlock.c \
+	audio/SDL_audio.c audio/SDL_audiocvt.c audio/SDL_audiodev.c \
+	audio/SDL_audiotypecvt.c audio/SDL_mixer.c audio/SDL_wave.c \
+	audio/dummy/SDL_dummyaudio.c \
+	cpuinfo/SDL_cpuinfo.c \
+	events/imKStoUCS.c events/SDL_clipboardevents.c events/SDL_displayevents.c \
+	events/SDL_dropevents.c events/SDL_events.c events/SDL_gesture.c \
+	events/SDL_keyboard.c events/SDL_keysym_to_scancode.c events/SDL_mouse.c \
+	events/SDL_quit.c events/SDL_scancode_tables.c events/SDL_touch.c \
+	events/SDL_windowevents.c \
+	file/SDL_rwops.c \
+	filesystem/dummy/SDL_sysfilesystem.c \
+	haptic/SDL_haptic.c haptic/dummy/SDL_syshaptic.c \
+	joystick/controller_type.c joystick/SDL_gamecontroller.c joystick/SDL_joystick.c \
+	joystick/dummy/SDL_sysjoystick.c \
+	loadso/dummy/SDL_sysloadso.c \
+	locale/SDL_locale.c locale/dummy/SDL_syslocale.c \
+	misc/SDL_url.c misc/dummy/SDL_sysurl.c \
+	power/SDL_power.c \
+	render/SDL_d3dmath.c render/SDL_render.c render/SDL_yuv_sw.c \
+	render/software/SDL_blendfillrect.c render/software/SDL_blendline.c \
+	render/software/SDL_blendpoint.c render/software/SDL_drawline.c \
+	render/software/SDL_drawpoint.c render/software/SDL_render_sw.c \
+	render/software/SDL_rotate.c render/software/SDL_triangle.c \
+	sensor/SDL_sensor.c sensor/dummy/SDL_dummysensor.c \
+	stdlib/SDL_crc16.c stdlib/SDL_crc32.c stdlib/SDL_getenv.c \
+	stdlib/SDL_iconv.c stdlib/SDL_malloc.c stdlib/SDL_mslibc.c \
+	stdlib/SDL_qsort.c stdlib/SDL_stdlib.c stdlib/SDL_string.c \
+	stdlib/SDL_strtokr.c \
+	thread/SDL_thread.c thread/generic/SDL_syscond.c thread/generic/SDL_sysmutex.c \
+	thread/generic/SDL_syssem.c thread/generic/SDL_systhread.c thread/generic/SDL_systls.c \
+	timer/SDL_timer.c timer/pureunix/SDL_systimer.c \
+	video/SDL_blit_0.c video/SDL_blit_1.c video/SDL_blit_A.c video/SDL_blit_auto.c \
+	video/SDL_blit_copy.c video/SDL_blit_N.c video/SDL_blit_slow.c video/SDL_blit.c \
+	video/SDL_bmp.c video/SDL_clipboard.c video/SDL_egl.c video/SDL_fillrect.c \
+	video/SDL_pixels.c video/SDL_rect.c video/SDL_RLEaccel.c video/SDL_shape.c \
+	video/SDL_stretch.c video/SDL_surface.c video/SDL_video.c \
+	video/SDL_vulkan_utils.c video/SDL_yuv.c video/yuv2rgb/yuv_rgb.c \
+	video/pureunix/SDL_puvideo.c video/pureunix/SDL_puevents.c video/pureunix/SDL_pufb.c
+SDL_OBJS := $(addprefix $(BUILD)/user/sdl2/,$(SDL_CORE_SRCS:.c=.o))
+# -ffunction-sections/-fdata-sections + the sdltest link's -Wl,--gc-sections
+# below: this port compiles in every dummy stub backend (audio, joystick,
+# haptic, sensor, ...) alongside the real video/event/timer ones so
+# SDL_Init()'s subsystem dispatch table always has *something* to call
+# regardless of which SDL_INIT_* flags an app actually passes (see
+# docs/sdl-port.md) -- correct, but it means a plain whole-.o static link
+# pulls in every one of those subsystems' code whether or not a given app
+# ever touches them. Per-function/data sections let the linker discard
+# whatever a specific app's reachability graph from main() never reaches
+# instead, which matters here: PureUNIX's EXT2 image
+# (tools/mkext2.py's TOTAL_BLOCKS) is a fixed 8 MiB, and an SDL app
+# statically linking the whole library unpruned would be considerably
+# larger than every other installed program combined.
+SDL_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -D__pureunix__ -Iuser \
+	-I$(SDL_SRC)/include -I$(SDL_SRC)/src \
+	-ffunction-sections -fdata-sections \
+	-Wno-unused-parameter -Wno-sign-compare -Wno-unused-function -Wno-unused-variable
+
+$(BUILD)/user/sdl2/%.o: $(SDL_SRC)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SDL_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(SDL_OBJS:.o=.d)
+
+SDL_LIB := $(BUILD)/user/sdl2/libSDL2.a
+
+$(SDL_LIB): $(SDL_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(SDL_OBJS)
+
+$(BUILD)/user/sdltest.o: user/sdltest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/sdltest.d
+
+SDLTEST_ELF := $(BUILD)/user/sdltest.elf
+
+$(SDLTEST_ELF): $(BUILD)/user/sdltest.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/sdltest.o \
+		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+
+# Chocolate Doom 3.1.1 (vendored upstream source under
+# third_party/chocolate-doom/ -- see that directory's README.md and
+# docs/chocolate-doom-port.md). Same "vendor upstream source, compile it
+# with our own Makefile rules, no upstream build system" pattern as every
+# other third_party port -- the file lists below are copied directly from
+# upstream's own src/CMakeLists.txt / src/doom/CMakeLists.txt so this stays
+# a faithful reproduction of the real link graph. Only the chocolate-doom
+# binary is built (not chocolate-server/chocolate-setup/Heretic/Hexen/
+# Strife) -- see docs/chocolate-doom-port.md for why the setup GUI isn't
+# needed for real gameplay.
+CHOCDOOM_SRC := third_party/chocolate-doom/chocolate-doom-3.1.1
+CHOCDOOM_CONFIG := third_party/chocolate-doom/config
+
+CHOCDOOM_COMMON_SRCS := i_main.c i_system.c m_argv.c m_misc.c
+
+CHOCDOOM_GAME_SRCS := aes_prng.c d_event.c d_iwad.c d_loop.c d_mode.c \
+	deh_str.c gusconf.c i_cdmus.c i_endoom.c i_flmusic.c i_glob.c \
+	i_input.c i_joystick.c i_musicpack.c i_oplmusic.c i_pcsound.c \
+	i_sdlmusic.c i_sdlsound.c i_sound.c i_timer.c i_video.c i_videohr.c \
+	i_winmusic.c midifallback.c midifile.c mus2mid.c m_bbox.c m_cheat.c \
+	m_config.c m_controls.c m_fixed.c net_client.c net_common.c \
+	net_dedicated.c net_gui.c net_io.c net_loop.c net_packet.c \
+	net_petname.c net_query.c net_sdl.c net_server.c net_structrw.c \
+	sha1.c memio.c tables.c v_diskicon.c v_video.c w_checksum.c w_main.c \
+	w_wad.c w_file.c w_file_stdc.c w_file_posix.c w_merge.c z_zone.c
+
+CHOCDOOM_DEH_SRCS := deh_io.c deh_main.c deh_mapping.c deh_text.c
+
+CHOCDOOM_DOOM_SRCS := am_map.c deh_ammo.c deh_bexstr.c deh_cheat.c \
+	deh_doom.c deh_frame.c deh_misc.c deh_ptr.c deh_sound.c deh_thing.c \
+	deh_weapon.c d_items.c d_main.c d_net.c doomdef.c doomstat.c \
+	dstrings.c f_finale.c f_wipe.c g_game.c hu_lib.c hu_stuff.c info.c \
+	m_menu.c m_random.c p_ceilng.c p_doors.c p_enemy.c p_floor.c \
+	p_inter.c p_lights.c p_map.c p_maputl.c p_mobj.c p_plats.c p_pspr.c \
+	p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c p_telept.c \
+	p_tick.c p_user.c r_bsp.c r_data.c r_draw.c r_main.c r_plane.c \
+	r_segs.c r_sky.c r_things.c s_sound.c sounds.c statdump.c st_lib.c \
+	st_stuff.c wi_stuff.c
+
+CHOCDOOM_OPL_SRCS := opl.c opl_linux.c opl_obsd.c opl_queue.c opl_sdl.c \
+	opl_timer.c opl_win32.c ioperm_sys.c opl3.c
+
+CHOCDOOM_PCSOUND_SRCS := pcsound.c pcsound_bsd.c pcsound_sdl.c \
+	pcsound_linux.c pcsound_win32.c
+
+CHOCDOOM_TEXTSCREEN_SRCS := txt_conditional.c txt_checkbox.c txt_desktop.c \
+	txt_dropdown.c txt_fileselect.c txt_gui.c txt_inputbox.c txt_io.c \
+	txt_button.c txt_label.c txt_radiobutton.c txt_scrollpane.c \
+	txt_separator.c txt_spinctrl.c txt_sdl.c txt_strut.c txt_table.c \
+	txt_utf8.c txt_widget.c txt_window.c txt_window_action.c
+
+CHOCDOOM_OBJS := \
+	$(addprefix $(BUILD)/user/chocdoom/,$(CHOCDOOM_COMMON_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/,$(CHOCDOOM_GAME_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/,$(CHOCDOOM_DEH_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/doom/,$(CHOCDOOM_DOOM_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/opl/,$(CHOCDOOM_OPL_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/pcsound/,$(CHOCDOOM_PCSOUND_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/chocdoom/textscreen/,$(CHOCDOOM_TEXTSCREEN_SRCS:.c=.o))
+
+CHOCDOOM_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -D__pureunix__ -Iuser \
+	-I$(SDL_SRC)/include -I$(CHOCDOOM_CONFIG) -I$(CHOCDOOM_SRC)/src \
+	-I$(CHOCDOOM_SRC)/src/doom -I$(CHOCDOOM_SRC)/opl \
+	-I$(CHOCDOOM_SRC)/pcsound -I$(CHOCDOOM_SRC)/textscreen \
+	-ffunction-sections -fdata-sections \
+	-Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
+	-Wno-unused-variable -Wno-unused-but-set-variable
+
+$(BUILD)/user/chocdoom/%.o: $(CHOCDOOM_SRC)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CHOCDOOM_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/chocdoom/opl/%.o: $(CHOCDOOM_SRC)/opl/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CHOCDOOM_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/chocdoom/pcsound/%.o: $(CHOCDOOM_SRC)/pcsound/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CHOCDOOM_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/chocdoom/textscreen/%.o: $(CHOCDOOM_SRC)/textscreen/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CHOCDOOM_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(CHOCDOOM_OBJS:.o=.d)
+
+CHOCDOOM_ELF := $(BUILD)/user/chocolate-doom.elf
+
+# Real, freely-distributable id Software shareware IWAD (Doom v1.9,
+# sha1 5b2e249b9c5133ec987b3ea77596381dc0d6bc1d — see docs/
+# chocolate-doom-port.md's Testing section) — shipped at /bin/doom1.wad
+# so `chocolate-doom -iwad doom1.wad` works immediately from any PATH
+# directory with zero setup on a freshly booted image.
+CHOCDOOM_IWAD := third_party/chocolate-doom/doom1.wad
+
+$(CHOCDOOM_ELF): $(CHOCDOOM_OBJS) $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(CHOCDOOM_OBJS) \
+		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -529,9 +731,9 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT)
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad
 
 disk: $(DISK) $(DISK2)
 
@@ -542,9 +744,9 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL)
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the

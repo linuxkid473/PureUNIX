@@ -16,6 +16,7 @@
 #include <pureunix/keyboard.h>
 #include <pureunix/mbr.h>
 #include <pureunix/memory.h>
+#include <pureunix/mouse.h>
 #include <pureunix/panic.h>
 #include <pureunix/pci.h>
 #include <pureunix/procfs.h>
@@ -229,6 +230,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
         task_set_init_pid(init_reaper->id);
     }
     keyboard_init();
+    mouse_init();
     tty_init();
     vt_init();
     /* main_task (this function's own task, per tasking_init()) becomes

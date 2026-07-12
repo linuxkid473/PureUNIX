@@ -1,6 +1,7 @@
 #ifndef PUREUNIX_VT_H
 #define PUREUNIX_VT_H
 
+#include <pureunix/input.h>
 #include <pureunix/termios.h>
 #include <pureunix/types.h>
 
@@ -87,6 +88,48 @@ int vt_get_fg_pgid(int vt_id);
  * must-share-this-controlling-terminal's-session check before calling
  * this. */
 void vt_set_fg_pgid(int vt_id, int pgid);
+
+/* Raw input events (include/pureunix/input.h) -- a second event source fed
+ * by the same keyboard/mouse drivers as vt_input_push(), for SDL2's event
+ * pump (docs/sdl-port.md). Delivered only to the active VT's own queue,
+ * exactly like vt_input_push(); a backgrounded VT's queue is never fed.
+ *
+ * vt_raw_input_push_key(): code is a KEY_* constant or ASCII value (see
+ * include/pureunix/keyboard.h), independent of shift state -- e.g. the 'a'
+ * key reports code == 'a' whether or not Shift/Caps Lock is held, so a
+ * consumer can tell "which physical key" apart from "what character it
+ * would produce", the same distinction SDL_Scancode vs SDL_Keycode makes.
+ * pressed is 1 for a key-down, 0 for a key-up -- unlike vt_input_push(),
+ * which only ever reports presses.
+ *
+ * vt_raw_input_push_mouse_motion(): dx/dy is relative motion since the
+ * last call; the kernel maintains one global absolute pointer position
+ * (clamped to the framebuffer's pixel dimensions) and reports it back in
+ * the pushed event's x/y fields.
+ *
+ * vt_raw_input_push_mouse_button(): code is a PU_MOUSE_BTN_* constant. */
+void vt_raw_input_push_key(int code, int pressed);
+void vt_raw_input_push_mouse_motion(int dx, int dy);
+void vt_raw_input_push_mouse_button(int code, int pressed);
+/* Non-blocking pop from VT vt_id's raw queue. Returns true and fills *out
+ * if an event was available, false (leaving *out untouched) otherwise --
+ * SDL's event pump is poll-driven (called once per frame), never blocking,
+ * so there is no vt_raw_input_get() blocking counterpart. */
+bool vt_raw_input_try_get(int vt_id, pu_input_event_t *out);
+
+/* Text mode / graphics mode (SYS_SET_GRAPHICS_MODE, docs/sdl-port.md) --
+ * while a VT is in graphics mode, drivers/vga.c's own repaint entry points
+ * (vga_bind_active()/vga_console_repaint()) leave the framebuffer alone
+ * for that VT instead of overwriting an SDL app's rendering with console
+ * text, and console *writes* to that VT (vt_putc()/vt_write()) still
+ * update its saved cell buffer but skip the real hardware draw -- exactly
+ * mirroring how those functions already behave for a merely-backgrounded
+ * VT, just gated on this flag instead of (or in addition to) "is this the
+ * active VT". Leaving graphics mode forces a full text repaint if the VT
+ * is still active, so the console reappears exactly as it would have if
+ * the SDL app had never run. */
+void vt_set_graphics_mode(int vt_id, bool enable);
+bool vt_is_graphics_mode(int vt_id);
 
 /* Broadcasts SIGWINCH to every VT's foreground process group. The console
  * grid (drivers/vga.c's vga_cols/vga_rows) is one hardware-wide size shared

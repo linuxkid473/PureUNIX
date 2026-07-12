@@ -10,6 +10,7 @@
 #include <pureunix/time.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vmm.h>
+#include <pureunix/vt.h>
 #include <pureunix/wait.h>
 
 /* Every syscall — including deep VFS/filesystem call chains — runs on the
@@ -320,6 +321,18 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
      * space, so the child's real mapped size starts out identical —
      * see include/pureunix/task.h's mapped_bytes comment. */
     child->mapped_bytes = current->mapped_bytes;
+    /* vmm_fork_address_space() already deep-copied FB_SHADOW_VA's mapping
+     * too (it copies the whole user window, not just code/data/stack) —
+     * this flag just has to agree, or a later SYS_FB_MMAP call from the
+     * child would allocate fresh frames and overwrite that already-valid
+     * copy instead of reusing it (see include/pureunix/task.h's comment). */
+    child->fb_shadow_mapped = current->fb_shadow_mapped;
+    /* Same reasoning: vmm_fork_address_space() already deep-copied every
+     * heap page too (it copies the whole user window), this flag just has
+     * to agree so the child's own later sbrk() growth continues from the
+     * right offset instead of re-mapping over the parent's copied pages. */
+    child->heap_used = current->heap_used;
+    child->heap_mapped = current->heap_mapped;
     child->is_fork_child = true;
     child->fork_regs = *parent_regs;
     child->fork_regs.eax = 0; /* fork() returns 0 in the child */
@@ -454,6 +467,16 @@ void task_exit(int code)
 {
     current->exit_code = code;
     current->state = TASK_ZOMBIE;
+
+    /* Belt-and-suspenders with kernel/signal.c's identical cleanup on the
+     * signal-killed path: a task that put its own VT into graphics mode
+     * but exits some other way (_exit() bypassing its own atexit/SDL
+     * teardown, a bug, ...) must not leave that VT's console permanently
+     * suppressed and its ASCII input queue permanently dropping every
+     * keystroke — see kernel/vt.c's vt_input_push() graphics_mode gate. */
+    if (current->vt_id >= 0 && vt_is_graphics_mode(current->vt_id)) {
+        vt_set_graphics_mode(current->vt_id, false);
+    }
 
     /* Re-parent every child of the exiting task to the init-reaper
      * *before* signaling anyone or yielding away, so no orphan is ever

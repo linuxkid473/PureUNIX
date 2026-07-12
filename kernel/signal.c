@@ -6,6 +6,25 @@
  * docs/process-management.md. */
 #include <pureunix/signal.h>
 #include <pureunix/task.h>
+#include <pureunix/vt.h>
+
+/* A task killed here (SIGKILL, or any other signal's default terminate
+ * action below) never runs another instruction of its own — no atexit,
+ * no SDL_DestroyWindow, no chance to call SYS_SET_GRAPHICS_MODE(0) itself.
+ * If it had put its own VT into graphics mode, that VT's console would
+ * stay suppressed and (see kernel/vt.c's vt_input_push()) its ASCII input
+ * queue would keep silently dropping every keystroke forever — the VT's
+ * shell effectively frozen with no way back short of a reboot. Found via
+ * a real report: Ctrl+C during a running SDL app (default SIGINT action)
+ * reproduced exactly this. Belt-and-suspenders with task_exit()'s own
+ * identical cleanup for the voluntary-exit path — this one covers every
+ * path that skips task_exit() entirely. */
+static void force_graphics_mode_off_if_owned(task_t *target)
+{
+    if (target->vt_id >= 0 && vt_is_graphics_mode(target->vt_id)) {
+        vt_set_graphics_mode(target->vt_id, false);
+    }
+}
 
 /* Notifies target's parent of a waitpid()-relevant state change (a new
  * zombie, a fresh TASK_STOPPED, or a SIGCONT resume): sends real SIGCHLD
@@ -62,6 +81,7 @@ void signal_send(task_t *target, int sig)
          * again; matches the pre-M5 task_kill() behavior this replaces. */
         target->state = TASK_ZOMBIE;
         target->exit_code = -sig;
+        force_graphics_mode_off_if_owned(target);
         notify_parent_of_child_change(target);
         return;
     }
@@ -92,6 +112,7 @@ void signal_send(task_t *target, int sig)
              * specially cased above. */
             target->state = TASK_ZOMBIE;
             target->exit_code = -sig;
+            force_graphics_mode_off_if_owned(target);
             notify_parent_of_child_change(target);
             return;
         }

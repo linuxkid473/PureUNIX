@@ -7,6 +7,7 @@
  * queues, and vt_switch() as the single kernel-wide VT-switching path. */
 #include <pureunix/arch.h>
 #include <pureunix/errno.h>
+#include <pureunix/framebuffer.h>
 #include <pureunix/keyboard.h>
 #include <pureunix/signal.h>
 #include <pureunix/string.h>
@@ -17,6 +18,11 @@
 #include <pureunix/wait.h>
 
 #define VT_KEYBUF_SIZE 128
+/* Deeper than VT_KEYBUF_SIZE: mouse motion can generate several events per
+ * PIT tick while the pointer is moving, and unlike the ASCII queue nothing
+ * here collapses repeats -- an SDL app polls this queue roughly once per
+ * frame, not once per keystroke, so it needs more slack against bursts. */
+#define VT_RAWBUF_SIZE 256
 
 typedef struct vt {
     console_t *console;
@@ -33,10 +39,25 @@ typedef struct vt {
      * ids start at 1). */
     int owner_sid;
     int fg_pgid;
+
+    /* Raw input queue (include/pureunix/input.h) -- see vt.h's comment on
+     * vt_raw_input_push_key()/vt_raw_input_try_get(). A plain ring buffer,
+     * not wait-queue-backed like keybuf above: consumers poll it (SDL's
+     * event pump runs once per frame), they never block waiting for it. */
+    pu_input_event_t rawbuf[VT_RAWBUF_SIZE];
+    volatile uint32_t raw_head;
+    volatile uint32_t raw_tail;
 } vt_t;
 
 static vt_t vts[NUM_VTS];
 static int active_vt;
+
+/* One global pointer position, clamped to the framebuffer's pixel bounds --
+ * mice don't belong to a particular VT the way a keyboard's *destination*
+ * does, but events are still only ever delivered to whichever VT is active
+ * (same as vt_input_push()), so a single shared position is enough: it's
+ * meaningless while no VT is actually consuming it. */
+static int32_t mouse_x, mouse_y;
 
 static void termios_defaults(struct termios *t)
 {
@@ -165,6 +186,42 @@ void vt_input_push(int key)
         }
     }
 
+    if (vga_console_is_graphics_mode(vt->console)) {
+        /* Ctrl+S is repurposed, only while this VT is graphics-mode (an
+         * SDL app owns the screen), as an unconditional emergency kill
+         * switch — deliberately *not* gated by ISIG the way Ctrl+C/Z/\
+         * above are: those rely on the app leaving termios alone (true of
+         * every SDL/chocolate-doom program today, which never touches
+         * ISIG), but this hotkey exists precisely so a wedged/misbehaving
+         * graphics app can never leave the console stuck. SIGKILL (not
+         * SIGTERM/SIGINT) because it cannot be blocked, ignored, or
+         * handled — "recursively close" every process in the foreground
+         * group, guaranteed. kernel/signal.c's SIGKILL handling already
+         * forces graphics_mode back off and repaints as part of tearing
+         * the target down, so this one keypress alone returns the VT
+         * straight back to its ash shell, synchronously, with no
+         * dependence on the app's own (possibly hung) cleanup path.
+         * Outside graphics mode this falls through unchanged to the
+         * ordinary ASCII queue below, so editor.c's existing KEY_CTRL_S
+         * ("save") meaning is completely unaffected. */
+        if (key == KEY_CTRL_S) {
+            vt_write(active_vt, "\n^S: killing graphics app\n", 27);
+            signal_send_pgrp((uint32_t)vt->fg_pgid, SIGKILL);
+            return;
+        }
+        /* An SDL app owns this VT via the raw input queue (see
+         * vt_raw_input_push_key() below) instead of ordinary ASCII reads.
+         * Without this, every key typed during a graphics-mode session
+         * (movement keys during a game, etc.) would still pile up
+         * unread in this canonical queue, invisible until the app exits
+         * and the underlying shell resumes reading its tty — at which
+         * point the entire backlog replays at once as garbage input,
+         * corrupting whatever command the user types next. Matches the
+         * same graphics_mode gate drivers/vga.c already applies to
+         * output. */
+        return;
+    }
+
     uint32_t next = (vt->key_head + 1) % VT_KEYBUF_SIZE;
     if (next != vt->key_tail) {
         vt->keybuf[vt->key_head] = key;
@@ -212,6 +269,72 @@ int vt_input_getkey(int vt_id)
      * drivers/tty.c's tty_read() does, before ever reaching here. */
     wait_queue_sleep(&vts[vt_id].key_wq, getkey_ready, &ctx);
     return ctx.key;
+}
+
+/* Common enqueue helper for all three vt_raw_input_push_*() entry points
+ * below -- IRQ-context safe (plain ring buffer, no blocking), matching
+ * vt_input_push()'s own safety requirement (called from the same keyboard/
+ * mouse IRQ handlers). Silently drops the event if the active VT's raw
+ * queue is full: an SDL app that stalls badly enough to fill 256 slots
+ * loses old motion/key events rather than the kernel blocking or growing
+ * unbounded, the same "drop, don't block" policy real evdev queues use
+ * under overflow. */
+static void raw_push(pu_input_event_t ev)
+{
+    vt_t *vt = &vts[active_vt];
+    uint32_t next = (vt->raw_head + 1) % VT_RAWBUF_SIZE;
+    if (next == vt->raw_tail) {
+        return;
+    }
+    vt->rawbuf[vt->raw_head] = ev;
+    vt->raw_head = next;
+}
+
+void vt_raw_input_push_key(int code, int pressed)
+{
+    pu_input_event_t ev = { .type = PU_INPUT_KEY, .code = code, .value = pressed };
+    raw_push(ev);
+}
+
+void vt_raw_input_push_mouse_motion(int dx, int dy)
+{
+    const fb_info_t *fb = fb_get_info();
+    int32_t max_x = fb->present && fb->width > 0 ? (int32_t)fb->width - 1 : 0;
+    int32_t max_y = fb->present && fb->height > 0 ? (int32_t)fb->height - 1 : 0;
+
+    mouse_x += dx;
+    mouse_y += dy;
+    if (mouse_x < 0) mouse_x = 0;
+    if (mouse_y < 0) mouse_y = 0;
+    if (mouse_x > max_x) mouse_x = max_x;
+    if (mouse_y > max_y) mouse_y = max_y;
+
+    pu_input_event_t ev = {
+        .type = PU_INPUT_MOUSE_MOTION, .dx = dx, .dy = dy, .x = mouse_x, .y = mouse_y,
+    };
+    raw_push(ev);
+}
+
+void vt_raw_input_push_mouse_button(int code, int pressed)
+{
+    pu_input_event_t ev = {
+        .type = PU_INPUT_MOUSE_BUTTON, .code = code, .value = pressed, .x = mouse_x, .y = mouse_y,
+    };
+    raw_push(ev);
+}
+
+bool vt_raw_input_try_get(int vt_id, pu_input_event_t *out)
+{
+    if (!valid_vt(vt_id) || !out) {
+        return false;
+    }
+    vt_t *vt = &vts[vt_id];
+    if (vt->raw_head == vt->raw_tail) {
+        return false;
+    }
+    *out = vt->rawbuf[vt->raw_tail];
+    vt->raw_tail = (vt->raw_tail + 1) % VT_RAWBUF_SIZE;
+    return true;
 }
 
 void vt_putc(int vt_id, char c)
@@ -298,6 +421,31 @@ void vt_set_fg_pgid(int vt_id, int pgid)
         return;
     }
     vts[vt_id].fg_pgid = pgid;
+}
+
+void vt_set_graphics_mode(int vt_id, bool enable)
+{
+    if (!valid_vt(vt_id)) {
+        return;
+    }
+    vga_console_set_graphics_mode(vts[vt_id].console, enable);
+    if (!enable && vt_id == active_vt) {
+        /* Leaving graphics mode while still on screen: force the console
+         * back into view immediately rather than waiting for whatever
+         * next happens to write to it -- see include/pureunix/vt.h's
+         * "clean exit" comment. vga_bind_active() would no-op here (it
+         * only repaints on an actual g_active change), so this calls the
+         * repaint directly, same as vga_bind_active() does internally. */
+        vga_console_repaint(vts[vt_id].console);
+    }
+}
+
+bool vt_is_graphics_mode(int vt_id)
+{
+    if (!valid_vt(vt_id)) {
+        return false;
+    }
+    return vga_console_is_graphics_mode(vts[vt_id].console);
 }
 
 void vt_signal_resize(void)

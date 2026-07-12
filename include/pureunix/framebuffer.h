@@ -15,6 +15,41 @@ typedef struct {
     uint8_t blue_pos, blue_size;
 } fb_info_t;
 
+/* Userspace-visible ABI mirror of fb_info_t (SDL2's pureunix video backend,
+ * docs/sdl-port.md) -- deliberately not fb_info_t itself: that struct's
+ * bool/uint8_t mix has no guaranteed layout across a syscall boundary, the
+ * same reason include/pureunix/stat.h's struct pureunix_stat exists
+ * alongside the kernel's own inode-facing struct. Layout must match
+ * user/pureunix_gfx.h's pu_fb_info_t.
+ *
+ * Deliberately exposes the *native* red/green/blue field layout rather
+ * than normalizing to one fixed format: SYS_FB_BLIT expects the caller's
+ * buffer already packed exactly this way (bypp bytes/pixel, these bit
+ * positions/sizes), so it can copy it to VRAM with no per-pixel repacking
+ * -- the same approach a real Linux fbdev-backed SDL port takes (query the
+ * hardware's actual bit layout once via an ioctl, then build an
+ * SDL_PixelFormat to match, rather than converting every blit). */
+struct pureunix_fb_info {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bypp; /* bytes per pixel (fb.bpp/8): 3 or 4 */
+    uint32_t red_pos, red_size;
+    uint32_t green_pos, green_size;
+    uint32_t blue_pos, blue_size;
+};
+
+/* Copies a tightly-packed (bypp bytes/pixel, no padding, row-major, no
+ * hardware pitch) userspace pixel buffer into the real framebuffer,
+ * honoring the hardware's own pitch internally -- SYS_FB_BLIT's
+ * (arch/i386/syscall.c) implementation. buf must already be packed exactly
+ * per struct pureunix_fb_info's field layout above (SYS_FB_GETINFO) and be
+ * exactly fb.width * fb.height * bypp bytes (len is checked against that).
+ * A plain per-row memcpy, not fb_put_pixel()'s per-pixel pack -- there is
+ * nothing left to convert once the caller already matches the hardware's
+ * own layout. Returns 0, -ENODEV (no framebuffer), or -EINVAL (len
+ * mismatch). */
+int fb_blit_buffer(const uint8_t *buf, size_t len);
+
 /* Parses the multiboot2 framebuffer tag (if any). Safe to call before
  * paging is set up: it only reads mbi fields, never touches fb memory. */
 bool fb_probe(uint32_t magic, uint32_t mbi_addr);

@@ -1540,6 +1540,9 @@ void xhci_enumerate(void)
          * protocol) -- future class drivers (mice, storage) would get
          * their own hid_try_attach()-shaped hook called here too. */
         hid_try_attach(&xhci_hc_ops, &dev);
+        /* Same shape, for a Boot Protocol mouse (interface_protocol ==
+         * HID_PROTOCOL_MOUSE rather than HID_PROTOCOL_KEYBOARD). */
+        hid_mouse_try_attach(&xhci_hc_ops, &dev);
         /* Same shape, for Mass Storage (checked internally via
          * dev.has_bulk_endpoints, already gated on interface class 0x08 by
          * parse_configuration()). */

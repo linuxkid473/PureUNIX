@@ -153,6 +153,90 @@ enum {
      * EBX: fd. ECX (SYS_FCHMOD): mode_t. ECX/EDX (SYS_FCHOWN): uid/gid. */
     SYS_FCHMOD = 54,
     SYS_FCHOWN = 55,
+
+    /* SDL2 platform support (docs/sdl-port.md) -- deliberately dedicated
+     * syscalls rather than routed through the VFS/fd model (no
+     * FD_KIND_INPUT device node, no /dev/fb): every existing "device
+     * special file" (/dev/tty, /dev/null) still represents something a
+     * real read()/write()/close() lifecycle makes sense for, but polling
+     * raw input events and bulk-blitting a whole framebuffer are both
+     * one-shot, fixed-shape operations with nothing to open or close --
+     * the same reasoning SYS_PING (net/icmp.c) already applies here.
+     *
+     * Non-blocking pop from the calling task's own VT's raw input queue
+     * (include/pureunix/vt.h's vt_raw_input_push_key()/mouse variants).
+     * EBX: struct pureunix_input_event * (out). Returns 1 if an event was
+     * popped, 0 if the queue was empty, or a negative errno. */
+    SYS_INPUT_POLL = 56,
+
+    /* Framebuffer geometry for whichever VT the caller belongs to (the
+     * hardware framebuffer is one physical display shared by every VT --
+     * see drivers/framebuffer.c). EBX: struct pureunix_fb_info * (out).
+     * Returns 0, or -ENODEV if there is no framebuffer at all (legacy VGA
+     * text mode). */
+    SYS_FB_GETINFO = 57,
+
+    /* Bulk-copies a whole userspace pixel buffer into the real framebuffer
+     * (drivers/framebuffer.c's fb_fill_rect(), row by row, honoring the
+     * hardware pitch) -- the SDL pureunix video backend's window surface
+     * flip. EBX: const void * (RGB/BGR packed pixels, tightly packed at
+     * width*bypp per row -- *not* the hardware's own pitch, translated
+     * here). ECX: length in bytes (must exactly equal width*height*bypp).
+     * Only has any visible effect while the caller's VT is both active and
+     * in graphics mode (SYS_FB_SET_GRAPHICS_MODE) -- otherwise it still
+     * succeeds (so a backgrounded SDL app's render loop doesn't need to
+     * special-case this), it just doesn't touch real hardware, mirroring
+     * vt_write()'s existing backgrounded-VT behavior. Returns 0, or a
+     * negative errno (-ENODEV: no framebuffer; -EINVAL: wrong length). */
+    SYS_FB_BLIT = 58,
+
+    /* Milliseconds since boot, derived from the PIT tick counter
+     * (arch/i386/pit.c's pit_ticks(), 100Hz -- so this has 10ms real
+     * resolution despite the millisecond unit) -- SDL_GetTicks()'s entire
+     * backing store. Returned directly as this syscall's result (like
+     * SYS_GETPID), not through an out-param: unlike SYS_GETTIMEOFDAY this
+     * can never need more than 32 bits for any boot session that matters
+     * (49 days), and every other free-standing counter syscall here
+     * (SYS_GETPID, SYS_GETUID, ...) already returns its value directly. */
+    SYS_GET_TICKS_MS = 59,
+
+    /* Toggles the calling task's own VT between text mode (console output
+     * repaints the framebuffer normally -- drivers/vga.c) and graphics
+     * mode (repaints are suspended so an SDL app can own the framebuffer
+     * exclusively via SYS_FB_BLIT without the console clobbering it, or
+     * vice versa) -- see kernel/vt.c's vt_set_graphics_mode(). EBX: 1 to
+     * enter graphics mode, 0 to leave it (which forces a full text
+     * repaint if the VT is still active, restoring the console cleanly --
+     * see docs/sdl-port.md's "clean exit" requirement). Returns 0. */
+    SYS_SET_GRAPHICS_MODE = 60,
+
+    /* Maps this task's on-demand window-surface pixel buffer at a fixed VA
+     * (FB_SHADOW_VA, include/pureunix/vmm.h) within the widened user
+     * window, sized to the real framebuffer's width*height*bypp (tightly
+     * packed, matching what SYS_FB_BLIT already expects). Deliberately not
+     * backed by the newlib heap array or any ELF segment -- see
+     * NEWLIB_HEAP_SIZE's comment in user/newlib_syscalls.c for why a
+     * shared, always-linked-in allocation would cost every newlib program
+     * that many extra real MiB regardless of whether it's an SDL app.
+     * Idempotent: a second call from the same task just returns the same
+     * VA again (task_t.fb_shadow_mapped) rather than re-allocating.
+     * Returns FB_SHADOW_VA (never NULL/0 on success — that address is
+     * never 0), or a negative errno (-ENODEV: no framebuffer; -ENOMEM). */
+    SYS_FB_MMAP = 61,
+
+    /* Real sbrk(): grows (or, if EBX is negative, shrinks) the calling
+     * task's heap break by EBX bytes and returns the *previous* break
+     * (matching POSIX sbrk() exactly — user/newlib_syscalls.c's sbrk() is
+     * now a thin wrapper around this, replacing what used to be a plain
+     * userspace pointer bump through a fixed-size static array). Real
+     * pages are mapped one at a time as the break actually grows past
+     * whatever's already backed by physical frames (task_t.heap_mapped),
+     * up to HEAP_MAX (include/pureunix/vmm.h) -- see HEAP_VA's own comment
+     * for why this replaced the old array. Returns -ENOMEM (not -1, unlike
+     * a real libc sbrk() which sets errno instead — this is the raw
+     * syscall's own negative-errno convention throughout) if growing would
+     * exceed HEAP_MAX, or -EINVAL if EBX would shrink the break below 0. */
+    SYS_SBRK = 62,
 };
 
 #endif

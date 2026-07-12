@@ -30,5 +30,6 @@
 #define ETIMEDOUT 60 /* SYS_PING got no reply within its timeout */
 #define EAGAIN   11  /* resource temporarily unavailable (fcntl F_SETLK contention — see kernel/flock.c) */
 #define ENOLCK   37  /* no locks available (fcntl advisory-lock table exhausted) */
+#define ENODEV   19  /* no such device (SYS_FB_GETINFO/SYS_FB_BLIT with no framebuffer) */
 
 #endif

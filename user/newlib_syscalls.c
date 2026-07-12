@@ -51,6 +51,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pureunix_gfx.h"
+
 /* ---- Raw syscall gate — identical to syscall3() in user/libpure.c ---- */
 
 static int raw_syscall(int n, int a, int b, int c)
@@ -113,6 +115,13 @@ enum {
     PU_SYS_GETPRIORITY = 53,
     PU_SYS_FCHMOD = 54,
     PU_SYS_FCHOWN = 55,
+    PU_SYS_INPUT_POLL = 56,
+    PU_SYS_FB_GETINFO = 57,
+    PU_SYS_FB_BLIT = 58,
+    PU_SYS_GET_TICKS_MS = 59,
+    PU_SYS_SET_GRAPHICS_MODE = 60,
+    PU_SYS_FB_MMAP = 61,
+    PU_SYS_SBRK = 62,
 };
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
@@ -1860,26 +1869,34 @@ void _exit(int code)
 /* Heap                                                                   */
 /* -------------------------------------------------------------------- */
 
-/* The per-process window is 3 MiB minus a 64 KiB stack (USER_WINDOW_BASE/
- * END in include/pureunix/vmm.h); 1 MiB for the heap comfortably leaves
- * the rest for code/data/bss. */
-#define NEWLIB_HEAP_SIZE (1 * 1024 * 1024)
-static char newlib_heap[NEWLIB_HEAP_SIZE];
-static size_t newlib_heap_used = 0;
-
+/* Real sbrk(), backed by SYS_SBRK (arch/i386/syscall.c): the kernel maps
+ * one real physical page at a time as the break actually grows past
+ * task_t.heap_mapped, up to HEAP_MAX (32 MiB, include/pureunix/vmm.h) --
+ * replaces what used to be a plain pointer bump through a fixed-size
+ * static array in every newlib program's own bss. That old design
+ * eagerly cost every single program (hello, sqlite3, lua, ...) however
+ * many real MiB the array was sized to, regardless of whether it ever
+ * used that much heap, because kernel/elf.c's PT_LOAD loader has no
+ * demand paging: it allocates a real physical frame for *every* page of
+ * a program's bss up front at exec() time. This was found and fixed
+ * while porting Chocolate Doom (docs/chocolate-doom-port.md): its zone
+ * allocator (src/z_zone.c) mallocs up to ~16-32 MiB in one shot, which
+ * would have meant bumping that shared array to 32 MiB for every newlib
+ * program just to satisfy one of them -- a real-world case of the exact
+ * problem the SDL2 port's own dedicated-mapping pattern (SYS_FB_MMAP)
+ * had already flagged as the wrong fix (see HEAP_VA's comment in
+ * include/pureunix/vmm.h). A real incremental sbrk() fixes it for good:
+ * a tiny program now costs only the handful of pages it actually
+ * touches, while a program that genuinely needs tens of MiB can still
+ * get them, up to HEAP_MAX. */
 void *sbrk(ptrdiff_t incr)
 {
-    if (incr < 0 && (size_t)(-incr) > newlib_heap_used) {
-        errno = EINVAL;
+    int r = raw_syscall(PU_SYS_SBRK, (int)incr, 0, 0);
+    if (r < 0) {
+        errno = -r;
         return (void *)-1;
     }
-    if (incr > 0 && newlib_heap_used + (size_t)incr > NEWLIB_HEAP_SIZE) {
-        errno = ENOMEM;
-        return (void *)-1;
-    }
-    void *prev = newlib_heap + newlib_heap_used;
-    newlib_heap_used += incr;
-    return prev;
+    return (void *)r;
 }
 
 /* -------------------------------------------------------------------- */
@@ -2230,4 +2247,37 @@ struct group *getgrgid(gid_t gid)
     pwgr_gr.gr_gid = gid;
     pwgr_gr.gr_mem = pwgr_gr_mem;
     return &pwgr_gr;
+}
+
+/* ---- SDL2 platform support (docs/sdl-port.md) ---- */
+
+int pu_input_poll(pu_input_event_t *out)
+{
+    return raw_syscall(PU_SYS_INPUT_POLL, (int)out, 0, 0);
+}
+
+int pu_fb_getinfo(pu_fb_info_t *out)
+{
+    return raw_syscall(PU_SYS_FB_GETINFO, (int)out, 0, 0);
+}
+
+int pu_fb_blit(const void *buf, unsigned int len)
+{
+    return raw_syscall(PU_SYS_FB_BLIT, (int)buf, (int)len, 0);
+}
+
+unsigned int pu_get_ticks_ms(void)
+{
+    return (unsigned int)raw_syscall(PU_SYS_GET_TICKS_MS, 0, 0, 0);
+}
+
+void pu_set_graphics_mode(int enable)
+{
+    (void)raw_syscall(PU_SYS_SET_GRAPHICS_MODE, enable, 0, 0);
+}
+
+void *pu_fb_mmap(void)
+{
+    int r = raw_syscall(PU_SYS_FB_MMAP, 0, 0, 0);
+    return r < 0 ? NULL : (void *)r;
 }
