@@ -3,6 +3,7 @@
 #include <pureunix/elf.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
+#include <pureunix/flock.h>
 #include <pureunix/icmp.h>
 #include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
@@ -30,7 +31,27 @@ enum {
     PU_F_SETFD = 2,
     PU_F_GETFL = 3,
     PU_F_SETFL = 4,
+    PU_F_GETLK = 7,
+    PU_F_SETLK = 8,
+    PU_F_SETLKW = 9,
     PU_F_DUPFD_CLOEXEC = 14,
+};
+
+/* Wire format for F_GETLK/F_SETLK/F_SETLKW's struct flock* argument (EDX) —
+ * a plain, explicit ABI struct rather than newlib's own struct flock
+ * (short/long fields), mirrored field-for-field by user/newlib_syscalls.c's
+ * fcntl() before/after the syscall — same "kernel and newlib each keep
+ * their own differently-shaped struct, translate at the boundary" pattern
+ * as struct pureunix_stat / user/newlib_syscalls.c's struct pu_raw_stat.
+ * l_whence is honored (SEEK_SET/CUR/END); l_pid is always 0 on a
+ * successful F_GETLK conflict report — see include/pureunix/flock.h for
+ * why a real pid isn't tracked. */
+struct pu_raw_flock {
+    int32_t l_type;
+    int32_t l_whence;
+    int32_t l_start;
+    int32_t l_len;
+    int32_t l_pid;
 };
 
 /* Every path-taking syscall below used to hand its raw path straight to
@@ -506,6 +527,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         bool want_write  = (flags & O_WRONLY) != 0;
         bool want_creat  = (flags & O_CREAT) != 0;
         bool want_append = (flags & O_APPEND) != 0;
+        bool want_trunc  = (flags & O_TRUNC) != 0;
 
         task_t *t = task_current();
         int fd = find_free_fd(t, 0);
@@ -588,8 +610,22 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EACCES;
         }
 
-        if (want_append) {
-            vfs_read_file(path, &f->data, &f->size); /* best-effort; empty is fine */
+        /* Preserve existing content unless the caller explicitly asked to
+         * discard it (O_TRUNC) — real POSIX open() semantics: O_WRONLY/
+         * O_RDWR alone must never silently discard a file's data. Used to
+         * only do this for O_APPEND, so any writable, non-append,
+         * non-truncating open of an EXISTING file started from an empty
+         * in-memory buffer and clobbered real content with zero bytes at
+         * close() — found via the SQLite port (docs/sqlite-port.md):
+         * SQLite always reopens its db file O_RDWR|O_CREAT with no
+         * O_TRUNC, the first thing in this project to actually depend on
+         * a writable reopen seeing prior content instead of always
+         * meaning "start over" (every previous writer — ash's `>`
+         * redirection, editors' save paths, coreutils — always pairs a
+         * writable open with O_TRUNC when it wants a blank slate, so this
+         * fix changes nothing for any of them). */
+        if (!want_trunc) {
+            vfs_read_file(path, &f->data, &f->size); /* best-effort; empty is fine (new file) */
         }
         f->offset = want_append ? f->size : 0;
 
@@ -886,6 +922,40 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                 t->fds[fd].file->flags = arg;
             }
             return 0;
+        case PU_F_GETLK:
+        case PU_F_SETLK:
+        case PU_F_SETLKW: {
+            /* F_SETLKW is handled identically to F_SETLK (non-blocking) —
+             * see include/pureunix/flock.h: SQLite's default build (no
+             * SQLITE_ENABLE_SETLK_TIMEOUT) never actually issues an
+             * F_SETLKW, so there is deliberately no blocking/wait-queue
+             * path here to get wrong. */
+            struct pu_raw_flock *lk = (struct pu_raw_flock *)(uintptr_t)arg;
+            open_file_t *f = t->fds[fd].file;
+            if (!lk || !f || f->kind != FD_KIND_FILE) {
+                return (uint32_t)-EINVAL;
+            }
+            int32_t start = lk->l_start;
+            if (lk->l_whence == SEEK_CUR) {
+                start += (int32_t)f->offset;
+            } else if (lk->l_whence == SEEK_END) {
+                start += (int32_t)f->size;
+            }
+            if (cmd == PU_F_GETLK) {
+                int16_t type = (int16_t)lk->l_type;
+                int32_t s = start, l = lk->l_len;
+                flock_getlk(f->path, f, &type, &s, &l);
+                lk->l_type = type;
+                if (type != PU_F_UNLCK) {
+                    lk->l_whence = SEEK_SET;
+                    lk->l_start = s;
+                    lk->l_len = l;
+                    lk->l_pid = 0;
+                }
+                return 0;
+            }
+            return (uint32_t)flock_setlk(f->path, f, (int16_t)lk->l_type, start, lk->l_len);
+        }
         case PU_F_DUPFD:
         case PU_F_DUPFD_CLOEXEC: {
             /* F_DUPFD_CLOEXEC's close-on-exec bit (fd_entry_t.cloexec) is
@@ -1255,6 +1325,27 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         resolve_path(path_buf, raw_path);
         return (uint32_t)vfs_chown(path_buf, uid, gid);
     }
+    case SYS_FCHMOD: {
+        int fd = (int)regs->ebx;
+        mode_t mode = (mode_t)regs->ecx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_FILE) {
+            return (uint32_t)-EBADF;
+        }
+        return (uint32_t)vfs_chmod(t->fds[fd].file->path, mode);
+    }
+    case SYS_FCHOWN: {
+        int fd = (int)regs->ebx;
+        uid_t uid = (uid_t)regs->ecx;
+        gid_t gid = (gid_t)regs->edx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_FILE) {
+            return (uint32_t)-EBADF;
+        }
+        return (uint32_t)vfs_chown(t->fds[fd].file->path, uid, gid);
+    }
     case SYS_READDIR: {
         const char *raw_path = (const char *)regs->ebx;
         struct pureunix_dirent *out = (struct pureunix_dirent *)regs->ecx;
@@ -1372,6 +1463,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             if (!vga_apply_font_scale(scale)) {
                 return (uint32_t)-EINVAL;
             }
+            vt_signal_resize();
             return 0;
         }
         if (request == VT_GETACTIVE) {

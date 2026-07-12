@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """tools/test-persistent-boot.py — proves the persistent disk image
 (tools/mkdiskimg.py's output) actually survives a reboot: boots it fresh,
-completes first-boot root-password setup, creates a file, kills that QEMU
-process entirely, boots a brand new QEMU process against the *same* disk
-image file, logs in with the same password, and confirms the file is still
+creates a file, kills that QEMU process entirely, boots a brand new QEMU
+process against the *same* disk image file, and confirms the file is still
 there. A false pass here is essentially impossible — the second boot is a
 genuinely separate OS process with no shared memory, so any content it
 reads came from bytes actually committed to the image file on disk.
+
+kernel/main.c now auto-logs in as root unconditionally ("Auto-login as
+root -- no first-boot wizard, no login prompt. BusyBox ash starts
+immediately on every boot.") -- the password-wizard/login-prompt flow this
+used to drive no longer exists on any current build (same staleness
+tools/vt-inject-test.py's boot_to_shell() was already fixed for -- see
+docs/lua-port.md's Testing section). `--password` is accepted but unused,
+kept only so existing callers/CLI invocations don't need to change.
 
 Reuses the same QMP send-key driving technique as tools/vt-inject-test.py
 (see that file's header comment for why: no usable stdin over `-serial
@@ -171,23 +178,11 @@ def main():
         serial1 = os.path.join(tmp, "serial1.log")
         qmp1 = os.path.join(tmp, "qmp1.sock")
 
-        print("=== boot 1: first-boot setup + create file ===")
+        print("=== boot 1: create file ===")
         qemu = QemuSession(args.disk_img, serial1, qmp1, usb=args.usb)
         try:
-            qemu.wait_for(r"Set a password for the 'root' account", 60)
-            time.sleep(0.5)
-            qemu.type_text(args.password + "\n")
-            time.sleep(0.5)
-            qemu.type_text(args.password + "\n")
-            qemu.wait_for(r"login:", 30)
-            time.sleep(0.3)
-            qemu.type_text("root\n")
-            time.sleep(0.3)
-            qemu.wait_for(r"Password:", 15)
-            time.sleep(0.3)
-            qemu.type_text(args.password + "\n")
-            qemu.wait_for(r"#\s*$", 20)
-            time.sleep(0.5)
+            qemu.wait_for(r"Enter 'help'", 60)
+            time.sleep(1.5)
             qemu.type_text("echo persistence-worked > /home/test.txt\n")
             time.sleep(0.5)
             qemu.type_text("cat /home/test.txt\n")
@@ -195,7 +190,7 @@ def main():
             if transcript1.count("persistence-worked") < 1:
                 print("FAIL: boot 1 never echoed the file back")
                 sys.exit(1)
-            print("boot 1 OK: password set, /home/test.txt created and readable")
+            print("boot 1 OK: /home/test.txt created and readable")
         finally:
             qemu.kill()
 
@@ -204,22 +199,11 @@ def main():
         serial2 = os.path.join(tmp, "serial2.log")
         qmp2 = os.path.join(tmp, "qmp2.sock")
 
-        print("=== boot 2: fresh QEMU process, same disk image, same password ===")
+        print("=== boot 2: fresh QEMU process, same disk image ===")
         qemu = QemuSession(args.disk_img, serial2, qmp2, usb=args.usb)
         try:
-            transcript = qemu.wait_for(r"login:", 40)
-            if "first-boot setup" in transcript:
-                print("FAIL: first-boot setup ran again on boot 2 — root password did not persist")
-                sys.exit(1)
-            time.sleep(0.3)
-            qemu.type_text("root\n")
-            time.sleep(0.3)
-            qemu.wait_for(r"Password:", 15)
-            time.sleep(0.3)
-            qemu.type_text(args.password + "\n")
-            qemu.wait_for(r"#\s*$", 20)
-            print("boot 2: logged in with the SAME password set on boot 1")
-            time.sleep(0.5)
+            qemu.wait_for(r"Enter 'help'", 60)
+            time.sleep(1.5)
             qemu.type_text("cat /home/test.txt\n")
             transcript = qemu.wait_for(r"#\s*$", 20)
             if "persistence-worked" not in transcript:
@@ -230,7 +214,7 @@ def main():
         finally:
             qemu.kill()
 
-    print("=== PASS: password and filesystem changes both persisted across reboot ===")
+    print("=== PASS: filesystem changes persisted across reboot ===")
 
 
 if __name__ == "__main__":

@@ -203,6 +203,17 @@ typedef struct task {
     char cmdline[128];
     /* time_now() (kernel/time.c) at task creation — Unix epoch seconds. */
     uint32_t start_time;
+    /* Real total bytes mapped into this task's address space at the last
+     * exec() — every PT_LOAD segment's page-aligned size (kernel/elf.c's
+     * elf_load_into()) plus the fixed USER_STACK_SIZE stack region, not a
+     * fixed per-task constant. 0 for a kernel-only task (never execs a
+     * user ELF). Genuinely varies per program (e.g. a tiny "hello" vs.
+     * ncdemo's ~1.3 MiB of ncurses), unlike the coarse fixed-window
+     * estimate this used to be — see fs/procfs.c's /proc/[pid]/stat
+     * vsize/rss fields, the only consumer. task_fork() copies this
+     * unchanged (the child's address space is a real copy of the same
+     * size until it execs something else). */
+    uint32_t mapped_bytes;
     /* CPU time accounting, in PIT ticks (100 Hz — see arch/i386/pit.c) —
      * incremented for whichever task is `current` on every timer IRQ. */
     uint64_t cpu_ticks;

@@ -13,4 +13,11 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+/* fcntl() F_SETLK/F_GETLK record-locking l_type values — same numbering as
+ * newlib's <sys/_default_fcntl.h> (and Linux), so no translation is needed
+ * on that field. See include/pureunix/flock.h / kernel/flock.c. */
+#define PU_F_RDLCK 1
+#define PU_F_WRLCK 2
+#define PU_F_UNLCK 3
+
 #endif

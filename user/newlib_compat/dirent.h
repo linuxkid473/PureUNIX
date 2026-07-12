@@ -44,5 +44,8 @@ typedef struct DIR DIR;
 DIR *opendir(const char *path);
 struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
+/* Honest ENOSYS stub — see user/newlib_syscalls.c's real definition for
+ * why a real fd-backed dirfd() isn't meaningful on this kernel. */
+int dirfd(DIR *dirp);
 
 #endif

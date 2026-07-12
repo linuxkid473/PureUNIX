@@ -28,5 +28,7 @@
 #define ERANGE   34  /* result too large for the caller's buffer (getcwd()) */
 #define EPIPE    32  /* write() on a pipe with no readers left (SYS_WRITE, SYS_PIPE) */
 #define ETIMEDOUT 60 /* SYS_PING got no reply within its timeout */
+#define EAGAIN   11  /* resource temporarily unavailable (fcntl F_SETLK contention — see kernel/flock.c) */
+#define ENOLCK   37  /* no locks available (fcntl advisory-lock table exhausted) */
 
 #endif

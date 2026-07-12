@@ -1,0 +1,239 @@
+#ifndef HEADER_CRT
+#define HEADER_CRT
+/*
+htop - CRT.h
+(C) 2004-2011 Hisham H. Muhammad
+Released under the GNU GPLv2+, see the COPYING file
+in the source distribution for its full text.
+*/
+
+#include <stdbool.h>
+
+#include "Macros.h"
+#include "ProvideCurses.h"
+#include "Settings.h"
+
+
+#define SCREEN_TAB_MARGIN_LEFT 2
+#define SCREEN_TAB_COLUMN_GAP  1
+
+typedef enum TreeStr_ {
+   TREE_STR_VERT,
+   TREE_STR_RTEE,
+   TREE_STR_BEND,
+   TREE_STR_TEND,
+   TREE_STR_OPEN,
+   TREE_STR_SHUT,
+   TREE_STR_ASC,
+   TREE_STR_DESC,
+   LAST_TREE_STR
+} TreeStr;
+
+typedef enum ColorScheme_ {
+   COLORSCHEME_DEFAULT,
+   COLORSCHEME_MONOCHROME,
+   COLORSCHEME_BLACKONWHITE,
+   COLORSCHEME_LIGHTTERMINAL,
+   COLORSCHEME_MIDNIGHT,
+   COLORSCHEME_BLACKNIGHT,
+   COLORSCHEME_BROKENGRAY,
+   COLORSCHEME_NORD,
+   LAST_COLORSCHEME
+} ColorScheme;
+
+typedef enum ColorElements_ {
+   RESET_COLOR,
+   DEFAULT_COLOR,
+   FUNCTION_BAR,
+   FUNCTION_KEY,
+   FAILED_SEARCH,
+   FAILED_READ,
+   PAUSED,
+   PANEL_HEADER_FOCUS,
+   PANEL_HEADER_UNFOCUS,
+   PANEL_SELECTION_FOCUS,
+   PANEL_SELECTION_FOLLOW,
+   PANEL_SELECTION_UNFOCUS,
+   LARGE_NUMBER,
+   METER_SHADOW,
+   METER_TEXT,
+   METER_VALUE,
+   METER_VALUE_ERROR,
+   METER_VALUE_IOREAD,
+   METER_VALUE_IOWRITE,
+   METER_VALUE_NOTICE,
+   METER_VALUE_OK,
+   METER_VALUE_WARN,
+   LED_COLOR,
+   UPTIME,
+   BATTERY,
+   TASKS_RUNNING,
+   SWAP,
+   SWAP_CACHE,
+   SWAP_FRONTSWAP,
+   PROCESS,
+   PROCESS_SHADOW,
+   PROCESS_TAG,
+   PROCESS_MEGABYTES,
+   PROCESS_GIGABYTES,
+   PROCESS_TREE,
+   PROCESS_RUN_STATE,
+   PROCESS_D_STATE,
+   PROCESS_BASENAME,
+   PROCESS_HIGH_PRIORITY,
+   PROCESS_LOW_PRIORITY,
+   PROCESS_NEW,
+   PROCESS_TOMB,
+   PROCESS_THREAD,
+   PROCESS_THREAD_BASENAME,
+   PROCESS_COMM,
+   PROCESS_THREAD_COMM,
+   PROCESS_PRIV,
+   BAR_BORDER,
+   BAR_SHADOW,
+   GRAPH_1,
+   GRAPH_2,
+   MEMORY_1,
+   MEMORY_2,
+   MEMORY_3,
+   MEMORY_4,
+   MEMORY_5,
+   MEMORY_6,
+   HUGEPAGE_1,
+   HUGEPAGE_2,
+   HUGEPAGE_3,
+   HUGEPAGE_4,
+   LOAD,
+   LOAD_AVERAGE_FIFTEEN,
+   LOAD_AVERAGE_FIVE,
+   LOAD_AVERAGE_ONE,
+   CHECK_BOX,
+   CHECK_MARK,
+   CHECK_TEXT,
+   CLOCK,
+   DATE,
+   DATETIME,
+   HELP_BOLD,
+   HELP_SHADOW,
+   HOSTNAME,
+   CPU_NICE,
+   CPU_NICE_TEXT,
+   CPU_NORMAL,
+   CPU_SYSTEM,
+   CPU_IOWAIT,
+   CPU_IRQ,
+   CPU_SOFTIRQ,
+   CPU_STEAL,
+   CPU_GUEST,
+   GPU_ENGINE_1,
+   GPU_ENGINE_2,
+   GPU_ENGINE_3,
+   GPU_ENGINE_4,
+   GPU_RESIDUE,
+   PANEL_EDIT,
+   SCREENS_OTH_BORDER,
+   SCREENS_OTH_TEXT,
+   SCREENS_CUR_BORDER,
+   SCREENS_CUR_TEXT,
+   PRESSURE_STALL_TEN,
+   PRESSURE_STALL_SIXTY,
+   PRESSURE_STALL_THREEHUNDRED,
+   FILE_DESCRIPTOR_USED,
+   FILE_DESCRIPTOR_MAX,
+   ZFS_MFU,
+   ZFS_MRU,
+   ZFS_ANON,
+   ZFS_HEADER,
+   ZFS_OTHER,
+   ZFS_COMPRESSED,
+   ZFS_RATIO,
+   ZRAM_COMPRESSED,
+   ZRAM_UNCOMPRESSED,
+   DYNAMIC_GRAY,
+   DYNAMIC_DARKGRAY,
+   DYNAMIC_RED,
+   DYNAMIC_GREEN,
+   DYNAMIC_BLUE,
+   DYNAMIC_CYAN,
+   DYNAMIC_MAGENTA,
+   DYNAMIC_YELLOW,
+   DYNAMIC_WHITE,
+   LAST_COLORELEMENT
+} ColorElements;
+
+void CRT_fatalError(const char* note) ATTR_NORETURN;
+
+#ifdef NDEBUG
+# define CRT_debug(...)
+#else
+void CRT_debug_impl(const char* file, size_t lineno, const char* func, const char* fmt, ...) ATTR_FORMAT(printf, 4, 5);
+# define CRT_debug(...) CRT_debug_impl(__FILE__, __LINE__, __func__, __VA_ARGS__)
+#endif
+
+void CRT_handleSIGSEGV(int signal) ATTR_NORETURN;
+
+#define KEY_WHEELUP    KEY_F(30)
+#define KEY_WHEELDOWN  KEY_F(31)
+#define KEY_RECLICK    KEY_F(32)
+#define KEY_RIGHTCLICK KEY_F(33)
+#define KEY_SHIFT_TAB  KEY_F(34)
+#define KEY_ALT(x)     (KEY_F(64 - 26) + ((x) - 'A'))
+#define KEY_FOCUS_IN   (KEY_MAX + 'I')
+#define KEY_FOCUS_OUT  (KEY_MAX + 'O')
+#define KEY_DEL_MAC    127
+#define KEY_CTRL_LEFT  KEY_SLEFT   // we treat them the same
+#define KEY_CTRL_RIGHT KEY_SRIGHT  // we treat them, yup, the same
+
+#ifndef PADPLUS
+# define KEY_PADPLUS   583
+# define KEY_PADMINUS  588
+#else
+# define KEY_PADPLUS   PADPLUS
+# define KEY_PADMINUS  PADMINUS
+#endif
+
+extern char CRT_degreeSign[];
+
+#ifdef HAVE_LIBNCURSESW
+
+extern bool CRT_utf8;
+
+#endif
+
+extern const char* const* CRT_treeStr;
+
+extern const int* CRT_colors;
+
+extern int CRT_cursorX;
+
+extern int CRT_scrollHAmount;
+
+extern int CRT_scrollWheelVAmount;
+
+extern ColorScheme CRT_colorScheme;
+
+#ifdef HAVE_GETMOUSE
+void CRT_setMouse(bool enabled);
+#else
+#define CRT_setMouse(enabled)
+#endif
+
+void CRT_init(const Settings* settings, bool allowUnicode, bool retainScreenOnExit);
+
+void CRT_done(void);
+
+void CRT_resetSignalHandlers(void);
+
+int CRT_readKey(void);
+
+void CRT_disableDelay(void);
+
+void CRT_enableDelay(void);
+
+static inline void CRT_updateDelay(void) {
+   CRT_enableDelay(); // pushes new delay setting into halfdelay(3X)
+}
+
+void CRT_setColors(int colorScheme);
+
+#endif

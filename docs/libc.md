@@ -98,12 +98,29 @@ raw `int $0x80` syscall ABI (`docs/syscalls.md`):
     declares these but never built them for this single-task,
     cooperatively-scheduled target, so there's genuinely nothing for a
     per-`FILE*` lock to exclude.
+  - `fcntl(F_GETLK/F_SETLK/F_SETLKW)` — real, added for the SQLite port
+    (`docs/sqlite-port.md`): SQLite's default unix VFS depends on genuine
+    POSIX advisory record locking for every transaction. Marshals
+    newlib's `struct flock` across `SYS_FCNTL` to `kernel/flock.c`'s real
+    per-path advisory lock table (see `include/pureunix/flock.h`).
+    `F_SETLKW` is handled identically to `F_SETLK` (non-blocking) since
+    SQLite's default build never actually issues a blocking lock request.
+  - `fchmod()`/`fchown()` — real, added for the SQLite port: didn't exist
+    at all before (only the path-based `chmod()`/`chown()` did). New
+    `SYS_FCHMOD`/`SYS_FCHOWN` syscalls resolve against the fd's own
+    `open_file_t.path` and call the same `vfs_chmod()`/`vfs_chown()` the
+    path-based versions use — SQLite's `os_unix.c` uses these to copy a
+    database file's permissions onto a freshly created rollback-journal
+    file.
 - **Honest stubs (accepted, no enforcement model exists to back them)**:
   `sigaction()`/`sigprocmask()`/`sigsuspend()`/`signal()` (record/report
   only — no real signal delivery, see `docs/syscalls.md`'s `SYS_KILL`),
   `getrlimit()`/`setrlimit()` (always "unlimited"), `poll()` (best-effort
   "always ready" — no real readiness multiplexing), `times()`/`sysconf()`/
-  `sched_yield()`, `ttyname()`/`ttyname_r()` (one console, one name).
+  `sched_yield()`, `ttyname()`/`ttyname_r()` (one console, one name),
+  `getrusage()` (always zeroed CPU time — added for the SQLite port's
+  shell `.timer` command; PureUNIX tracks per-task CPU ticks internally,
+  `task_t.cpu_ticks`, but nothing surfaces them through a syscall yet).
 
 ### 3. `user/newlib_compat/` — shadow headers
 

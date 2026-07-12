@@ -299,3 +299,12 @@ void vt_set_fg_pgid(int vt_id, int pgid)
     }
     vts[vt_id].fg_pgid = pgid;
 }
+
+void vt_signal_resize(void)
+{
+    for (int i = 0; i < NUM_VTS; ++i) {
+        if (vts[i].fg_pgid > 0) {
+            signal_send_pgrp((uint32_t)vts[i].fg_pgid, SIGWINCH);
+        }
+    }
+}

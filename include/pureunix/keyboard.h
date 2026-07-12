@@ -30,6 +30,22 @@ enum {
      * literal keystrokes, and docs/process-management.md. */
     KEY_CTRL_Z,
     KEY_CTRL_BACKSLASH,
+    /* Function keys F1..F12 — bare (no Alt), since Alt+F1..F6 is already
+     * claimed for VT switching (drivers/keyboard.c). Translated to real
+     * ANSI/xterm escape sequences by drivers/tty.c's key_to_seq(), matching
+     * docs/ncurses-port.md's "pureunix" terminfo entry's kf1..kf12. */
+    KEY_F1,
+    KEY_F2,
+    KEY_F3,
+    KEY_F4,
+    KEY_F5,
+    KEY_F6,
+    KEY_F7,
+    KEY_F8,
+    KEY_F9,
+    KEY_F10,
+    KEY_F11,
+    KEY_F12,
 };
 
 void keyboard_init(void);

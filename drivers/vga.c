@@ -45,11 +45,28 @@ typedef struct console {
     size_t col;
     uint8_t color;
     int esc_state;
-    char esc_buf[16];
+    char esc_buf[32];
     size_t esc_len;
     /* DECSTBM scroll region, 0-indexed and inclusive on both ends. */
     int scroll_top;
     int scroll_bottom;
+    /* SGR reverse/bold: deliberately *not* per-cell state (see ansi_sgr()'s
+     * comment) — cs->color always holds the actual physical fg/bg nibbles
+     * to draw; apply_fg()/apply_bg()/set_reverse() keep it that way whether
+     * or not `reverse` is currently active. `bold` only brightens
+     * subsequently-set fg colors (SGR 1 doesn't retroactively rebrighten a
+     * color already set before it, matching common xterm-like behavior). */
+    bool reverse;
+    bool bold;
+    /* DECTCEM cursor visibility (ESC[?25l/h). Named so zero-init BSS means
+     * "not hidden" == visible, the correct starting state — see the
+     * black-on-black uninit-color gotcha this driver already had to work
+     * around for cs->color, which is why that one instead needs an explicit
+     * seed (vga_console_set_color()). */
+    bool cursor_hidden;
+    /* DECSC/DECRC (ESC 7 / ESC 8) saved cursor position. */
+    size_t saved_row;
+    size_t saved_col;
     /* Tracks where the software cursor overlay is currently drawn on the
      * framebuffer for *this* console the last time it was active, so it can
      * be erased before being redrawn at its new position. Meaningless (and
@@ -275,9 +292,36 @@ static void cursor_draw(console_t *cs)
     }
 }
 
+/* Enables/disables the real VGA text-mode hardware cursor via the CRT
+ * controller's cursor start/end scanline registers (bit 5 of the start
+ * register is the hardware "cursor disable" bit). Only meaningful in
+ * !use_fb legacy text mode — the framebuffer path's cursor is a software
+ * inverted-cell overlay (cursor_draw()/cursor_restore()), toggled by simply
+ * not drawing it. Picks a conventional underline shape (scanlines 13-15)
+ * when re-enabling since this driver never otherwise touches these
+ * registers, so there's no prior BIOS shape to restore. */
+static void set_text_cursor_visible(bool visible)
+{
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, visible ? 0x0D : 0x20);
+    if (visible) {
+        outb(0x3D4, 0x0B);
+        outb(0x3D5, 0x0F);
+    }
+}
+
 static void update_cursor(console_t *cs)
 {
     if (cs != g_active) {
+        return;
+    }
+    if (cs->cursor_hidden) {
+        if (use_fb) {
+            cursor_restore(cs);
+            cs->cursor_valid = false;
+        } else {
+            set_text_cursor_visible(false);
+        }
         return;
     }
     if (use_fb) {
@@ -285,6 +329,7 @@ static void update_cursor(console_t *cs)
         cursor_draw(cs);
         return;
     }
+    set_text_cursor_visible(true);
     uint16_t pos = (uint16_t)(cs->row * vga_cols + cs->col);
     outb(0x3D4, 0x0F);
     outb(0x3D5, pos & 0xFF);
@@ -428,15 +473,37 @@ static void delete_lines(console_t *cs, int n)
     }
 }
 
-static void newline(console_t *cs)
+/* IND (ESC D): cursor down one line, scrolling the region at the bottom
+ * margin — the non-carriage-return half of newline() below, also reused
+ * directly by the bare ESC D escape. */
+static void index_down(console_t *cs)
 {
-    cs->col = 0;
     if ((int)cs->row == cs->scroll_bottom) {
         scroll(cs);
     } else if (cs->row + 1 < vga_rows) {
         cs->row++;
     }
 }
+
+/* RI (ESC M): cursor up one line; at the top margin, scrolls the region
+ * *down* instead (inserting a blank line at the top) — exactly
+ * insert_lines(cs, 1)'s effect when the cursor is already sitting on
+ * cs->scroll_top, which is the only case that can trigger here. */
+static void reverse_index(console_t *cs)
+{
+    if ((int)cs->row == cs->scroll_top) {
+        insert_lines(cs, 1);
+    } else if (cs->row > 0) {
+        cs->row--;
+    }
+}
+
+static void newline(console_t *cs)
+{
+    cs->col = 0;
+    index_down(cs);
+}
+
 
 static void erase_current_line(console_t *cs)
 {
@@ -453,6 +520,47 @@ static void erase_current_line(console_t *cs)
  * directly — red/blue and yellow/cyan are swapped. */
 static const uint8_t ansi_to_vga[8] = {0, 4, 2, 6, 1, 5, 3, 7};
 
+/* Sets the *logical* fg to `idx`, keeping cs->color as the physical
+ * fg|bg<<4 pair it's always been — when cs->reverse is active, "logical fg"
+ * physically lives in the bg nibble, so the write target flips instead of
+ * cs->color gaining a separate logical/physical split. cs->bold brightens
+ * only base (< 8) indices, and only at the moment a color is set (SGR 1
+ * doesn't retroactively rebrighten a color already set before it — matches
+ * common xterm-like behavior, and needs no extra per-console state). */
+static void apply_fg(console_t *cs, uint8_t idx)
+{
+    if (cs->bold && idx < 8) {
+        idx = (uint8_t)(idx + 8);
+    }
+    if (cs->reverse) {
+        cs->color = make_color(cs->color & 0x0F, idx);
+    } else {
+        cs->color = make_color(idx, cs->color >> 4);
+    }
+}
+
+static void apply_bg(console_t *cs, uint8_t idx)
+{
+    if (cs->reverse) {
+        cs->color = make_color(idx, cs->color >> 4);
+    } else {
+        cs->color = make_color(cs->color & 0x0F, idx);
+    }
+}
+
+/* SGR 7/27 (reverse video on/off): swapping cs->color's physical fg/bg
+ * nibbles is its own inverse, so both directions are the same operation —
+ * guarded on cs->reverse already matching so toggling an already-active
+ * state twice in a row (or off when never on) can't double-swap. */
+static void set_reverse(console_t *cs, bool on)
+{
+    if (on == cs->reverse) {
+        return;
+    }
+    cs->color = make_color(cs->color >> 4, cs->color & 0x0F);
+    cs->reverse = on;
+}
+
 static void ansi_sgr(console_t *cs, const char *seq)
 {
     int value = 0;
@@ -467,12 +575,28 @@ static void ansi_sgr(console_t *cs, const char *seq)
         if (c == ';' || c == 'm' || c == '\0') {
             if (!have_value || value == 0) {
                 cs->color = vga_default_color();
+                cs->reverse = false;
+                cs->bold = false;
+            } else if (value == 1) {
+                cs->bold = true;
+            } else if (value == 22) {
+                cs->bold = false;
+            } else if (value == 7) {
+                set_reverse(cs, true);
+            } else if (value == 27) {
+                set_reverse(cs, false);
+            } else if (value == 39) {
+                apply_fg(cs, VGA_LIGHT_GREY);
+            } else if (value == 49) {
+                apply_bg(cs, VGA_BLACK);
             } else if (value >= 30 && value <= 37) {
-                cs->color = make_color(ansi_to_vga[value - 30], cs->color >> 4);
+                apply_fg(cs, ansi_to_vga[value - 30]);
             } else if (value >= 90 && value <= 97) {
-                cs->color = make_color((uint8_t)(ansi_to_vga[value - 90] + 8), cs->color >> 4);
+                apply_fg(cs, (uint8_t)(ansi_to_vga[value - 90] + 8));
             } else if (value >= 40 && value <= 47) {
-                cs->color = make_color(cs->color & 0x0F, ansi_to_vga[value - 40]);
+                apply_bg(cs, ansi_to_vga[value - 40]);
+            } else if (value >= 100 && value <= 107) {
+                apply_bg(cs, (uint8_t)(ansi_to_vga[value - 100] + 8));
             }
             value = 0;
             have_value = false;
@@ -595,6 +719,45 @@ static void ansi_execute(console_t *cs)
         break;
     case 'M':
         delete_lines(cs, (n > 0 && params[0] > 0) ? params[0] : 1);
+        break;
+    case 'A': {
+        int amt = (n > 0 && params[0] > 0) ? params[0] : 1;
+        int nr = (int)cs->row - amt;
+        cs->row = (size_t)(nr < 0 ? 0 : nr);
+        break;
+    }
+    case 'B': {
+        int amt = (n > 0 && params[0] > 0) ? params[0] : 1;
+        int nr = (int)cs->row + amt;
+        cs->row = (size_t)(nr >= (int)vga_rows ? (int)vga_rows - 1 : nr);
+        break;
+    }
+    case 'C': {
+        int amt = (n > 0 && params[0] > 0) ? params[0] : 1;
+        int nc = (int)cs->col + amt;
+        cs->col = (size_t)(nc >= (int)vga_cols ? (int)vga_cols - 1 : nc);
+        break;
+    }
+    case 'D': {
+        int amt = (n > 0 && params[0] > 0) ? params[0] : 1;
+        int nc = (int)cs->col - amt;
+        cs->col = (size_t)(nc < 0 ? 0 : nc);
+        break;
+    }
+    /* DECTCEM (ESC[?25h / ESC[?25l) — ansi_params() silently skips the '?'
+     * private-marker byte (it's neither a digit nor ';'), so params[0] is
+     * already the plain mode number 25 here; any other private mode number
+     * (mouse reporting, alt-screen, ...) is intentionally left a no-op
+     * rather than a half-implemented hack — see docs/ncurses-port.md. */
+    case 'h':
+        if (n > 0 && params[0] == 25) {
+            cs->cursor_hidden = false;
+        }
+        break;
+    case 'l':
+        if (n > 0 && params[0] == 25) {
+            cs->cursor_hidden = true;
+        }
         break;
     default:
         break;
@@ -760,6 +923,31 @@ void vga_putc_vt(console_t *cs, char c)
             return;
         }
         cs->esc_state = 0;
+        /* Bare (non-CSI) two-byte escapes: DECSC/DECRC save/restore cursor
+         * and IND/RI index/reverse-index. Any other ESC+c falls through and
+         * is printed as an ordinary character — this parser's pre-existing
+         * behavior for an unrecognized two-byte escape, unchanged here. */
+        if (c == '7') {
+            cs->saved_row = cs->row;
+            cs->saved_col = cs->col;
+            return;
+        }
+        if (c == '8') {
+            cs->row = cs->saved_row;
+            cs->col = cs->saved_col;
+            update_cursor(cs);
+            return;
+        }
+        if (c == 'D') {
+            index_down(cs);
+            update_cursor(cs);
+            return;
+        }
+        if (c == 'M') {
+            reverse_index(cs);
+            update_cursor(cs);
+            return;
+        }
     } else if (cs->esc_state == 2) {
         if (cs->esc_len + 1 < sizeof(cs->esc_buf)) {
             cs->esc_buf[cs->esc_len++] = c;
@@ -785,6 +973,12 @@ void vga_putc_vt(console_t *cs, char c)
         newline(cs);
     } else if (c == '\r') {
         cs->col = 0;
+    } else if (c == '\007') {
+        /* BEL: no audio/visual bell hardware to ring — a silent no-op
+         * (rather than falling through to render it as a garbage glyph)
+         * matches the "pureunix" terminfo entry's bel=^G, which just
+         * documents that a BEL byte reaches the terminal, not what it
+         * does with it. */
     } else if (c == '\t') {
         do {
             vga_putc_vt(cs, ' ');

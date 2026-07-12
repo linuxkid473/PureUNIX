@@ -26,6 +26,7 @@
 #define SIGTSTP 18
 #define SIGCONT 19
 #define SIGCHLD 20
+#define SIGWINCH 28
 
 /* Matches newlib's own SIG_DFL=0/SIG_IGN=1 exactly (third_party/newlib/
  * i686-elf/include/signal.h) — task_t.sig_handlers[] entries use these

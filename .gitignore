@@ -8,6 +8,8 @@ build/
 !third_party/busybox/busybox.elf
 graphify-out/
 
+__pycache__/
+
 # macOS
 .DS_Store
 

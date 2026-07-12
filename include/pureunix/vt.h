@@ -88,4 +88,14 @@ int vt_get_fg_pgid(int vt_id);
  * this. */
 void vt_set_fg_pgid(int vt_id, int pgid);
 
+/* Broadcasts SIGWINCH to every VT's foreground process group. The console
+ * grid (drivers/vga.c's vga_cols/vga_rows) is one hardware-wide size shared
+ * by every VT, so a resize (currently only TIOCSFONT — see SYS_IOCTL,
+ * arch/i386/syscall.c) changes every VT's terminal dimensions at once, not
+ * just the calling task's own — real Linux only signals the VT that
+ * actually resized, but there's only ever one real size here to signal
+ * about. pgid <= 0 (no session has claimed that VT yet) is silently
+ * skipped, same as vt_input_push()'s signal path. */
+void vt_signal_resize(void);
+
 #endif

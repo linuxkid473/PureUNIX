@@ -18,13 +18,28 @@
  * Linux's /proc/[pid]/cmdline format exactly — see fs/procfs.c),
  * truncating at the buffer's size if the full argv doesn't fit rather
  * than failing exec() over it. Falls back to just the program's own path
- * if argv is empty/NULL (an argc == 0 call is unusual but not invalid). */
+ * if argv is empty/NULL (an argc == 0 call is unusual but not invalid).
+ *
+ * Always zeroes the *entire* buffer first — this task_t's cmdline field
+ * may already hold longer content from an earlier state (task_alloc()'s
+ * own name-based default, or a previous exec() on this same task_t, e.g.
+ * a shell that execs several external commands in sequence over its own
+ * lifetime without an intervening fork()). Previously this only wrote
+ * the new content and left everything past it untouched, so a shorter
+ * new cmdline could leave stale bytes from the old one dangling past the
+ * new NUL terminator; fs/procfs.c's /proc/[pid]/cmdline rendering trims
+ * *trailing* NULs by scanning backward from the end of the fixed buffer,
+ * so any leftover non-NUL byte anywhere later in the buffer made the
+ * reported cmdline run all the way out to it — real, reproducible
+ * corruption (confirmed independently by BusyBox's own `ps` and by
+ * htop, third_party/htop/, both reading the exact same corrupted bytes
+ * straight from procfs — not a bug in either tool). */
 static void pack_cmdline(char *dst, size_t dst_size, const char *path, int argc, char *const argv[])
 {
+    memset(dst, 0, dst_size);
     size_t off = 0;
     if (argc <= 0 || !argv || !argv[0]) {
         strncpy(dst, path, dst_size - 1);
-        dst[dst_size - 1] = '\0';
         return;
     }
     for (int i = 0; i < argc && argv[i] && off < dst_size; ++i) {
@@ -39,11 +54,29 @@ static void pack_cmdline(char *dst, size_t dst_size, const char *path, int argc,
             dst[off++] = '\0';
         }
     }
-    if (off < dst_size) {
-        dst[off] = '\0';
-    } else {
-        dst[dst_size - 1] = '\0';
-    }
+}
+
+/* Sets task_t.name (the "comm" field — fs/procfs.c's /proc/[pid]/stat and
+ * /proc/[pid]/status, matching Linux's own comm exactly) to the exec'd
+ * program's basename, the same real basename-of-argv[0]/path convention
+ * every real Unix uses. Previously never touched at exec() time at all —
+ * every process's name stayed whatever task_alloc() gave it at creation
+ * (elf_exec_argv()'s task_create_user() literally hardcodes "user";
+ * task_fork() otherwise just copies the parent's own name), so *every*
+ * process's comm looked identical regardless of what it actually execed
+ * — pack_cmdline() above already got this right for the full cmdline,
+ * comm just never followed. Found because BusyBox's own `ps` and htop
+ * (third_party/htop/) independently showed the exact same "{user}"
+ * artifact for every single process — real, upstream ps display logic
+ * (bracket a process whose comm doesn't match its own cmdline basename)
+ * correctly reacting to a genuine, general kernel gap, not a bug in
+ * either tool. */
+static void pack_comm(char *dst, size_t dst_size, const char *path)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    strncpy(dst, base, dst_size - 1);
+    dst[dst_size - 1] = '\0';
 }
 
 /* Ring3 sandbox window: code+data+bss go in the low part, a fixed-size
@@ -214,8 +247,10 @@ static int build_argv_stack(phys_addr_t top_frame, uint32_t top_page_va, int arg
  * mapped into it are the caller's responsibility to free via
  * vmm_free_user_directory()). */
 static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char *const argv[],
-                          char *const envp[], uint32_t *out_entry, uint32_t *out_stack)
+                          char *const envp[], uint32_t *out_entry, uint32_t *out_stack,
+                          uint32_t *out_mapped_bytes)
 {
+    uint32_t mapped_bytes = 0;
     /* raw_path may be relative (a real user process's execve("./foo", ...)
      * or a bare/relative name from a fork()+exec() shell — the in-kernel
      * shell's own callers (shell/sh.c) already pass an absolute path, so
@@ -296,6 +331,7 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
 
             vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
         }
+        mapped_bytes += seg_end - seg_start;
     }
 
     uint32_t entry = eh->e_entry;
@@ -316,6 +352,7 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
             top_frame = frame;
         }
     }
+    mapped_bytes += USER_STACK_SIZE;
 
     uint32_t stack_top = USER_WINDOW_END;
     if (build_argv_stack(top_frame, top_page_va, argc, argv, envp, &stack_top) != 0) {
@@ -331,6 +368,7 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
 
     *out_entry = entry;
     *out_stack = stack_top;
+    *out_mapped_bytes = mapped_bytes;
     return 0;
 }
 
@@ -342,8 +380,8 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
         return -ENOMEM;
     }
 
-    uint32_t entry, stack_top;
-    int rc = elf_load_into(path, pd_phys, argc, argv, envp, &entry, &stack_top);
+    uint32_t entry, stack_top, mapped_bytes;
+    int rc = elf_load_into(path, pd_phys, argc, argv, envp, &entry, &stack_top, &mapped_bytes);
     if (rc != 0) {
         vmm_free_user_directory(pd_phys);
         return rc;
@@ -356,6 +394,8 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
         return -ENOMEM;
     }
     pack_cmdline(child->cmdline, sizeof(child->cmdline), path, argc, argv);
+    pack_comm(child->name, sizeof(child->name), path);
+    child->mapped_bytes = mapped_bytes;
 
     /* Starts its own new process group (same session, inherited
      * unchanged) rather than the caller's — elf_exec_argv() is always
@@ -405,14 +445,16 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
         return -ENOMEM;
     }
 
-    uint32_t entry, stack_top;
-    int rc = elf_load_into(path, new_pd, argc, argv, envp, &entry, &stack_top);
+    uint32_t entry, stack_top, mapped_bytes;
+    int rc = elf_load_into(path, new_pd, argc, argv, envp, &entry, &stack_top, &mapped_bytes);
     if (rc != 0) {
         vmm_free_user_directory(new_pd);
         return rc;
     }
 
     pack_cmdline(t->cmdline, sizeof(t->cmdline), path, argc, argv);
+    pack_comm(t->name, sizeof(t->name), path);
+    t->mapped_bytes = mapped_bytes;
 
     /* POSIX close-on-exec: any fd fcntl(F_DUPFD_CLOEXEC)'d (e.g. BusyBox
      * ash's setjobctl() — see fd_entry_t.cloexec's own comment) must not

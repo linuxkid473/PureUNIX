@@ -842,15 +842,41 @@ static void test_open_close(void)
     pu_close(rfd);
 
     /* O_CREAT on an existing path (no O_EXCL) must not fail — POSIX creat()
-     * semantics; every non-append write-open also starts from an empty
-     * buffer (see docs/syscalls.md's SYS_OPEN section), so this both
-     * confirms the open succeeds and that the prior content is replaced. */
+     * semantics. A writable, non-append reopen with no O_TRUNC must
+     * preserve existing content (real POSIX open() semantics: only
+     * O_TRUNC discards it) — found missing during the SQLite port
+     * (docs/sqlite-port.md): SQLite always reopens its db file
+     * O_RDWR|O_CREAT with no O_TRUNC and depends on seeing prior content,
+     * which this kernel's SYS_OPEN never loaded for a non-append write
+     * open before (see docs/syscalls.md's SYS_OPEN section). Writing "hi"
+     * (2 bytes) at offset 0 into the still-5-byte "hello" buffer overlays
+     * the first two bytes, giving "hillo" — a real read-modify-write, not
+     * a truncate. */
     int wfd2 = pu_open("/systest_tmp_openclose.txt", O_WRONLY | O_CREAT);
     check_true("O_CREAT on an existing file succeeds (no O_EXCL)", wfd2 >= 3);
     pu_write(wfd2, "hi", 2);
     pu_close(wfd2);
     r = pu_stat("/systest_tmp_openclose.txt", &st);
-    check_eq("re-opened-for-write file was truncated to the new content", 2, (int)st.st_size);
+    check_eq("re-opened-for-write without O_TRUNC preserves prior content length", 5, (int)st.st_size);
+
+    int rfd2 = pu_open("/systest_tmp_openclose.txt", O_RDONLY);
+    check_true("reopen for reading (after read-modify-write) succeeds", rfd2 >= 3);
+    char buf2[16];
+    int n2 = pu_read(rfd2, buf2, sizeof(buf2));
+    check_true("read-modify-write overlaid the start, preserved the rest",
+               n2 == 5 && bytes_eq(buf2, "hillo", 5));
+    pu_close(rfd2);
+
+    /* O_TRUNC, by contrast, must actually discard prior content — the
+     * real POSIX escape hatch for "start over" every writer that wants a
+     * blank slate (ash's `>` redirection, editors' save paths, coreutils)
+     * already uses. */
+    int wfd3 = pu_open("/systest_tmp_openclose.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    check_true("O_TRUNC reopen of an existing file succeeds", wfd3 >= 3);
+    pu_write(wfd3, "hi", 2);
+    pu_close(wfd3);
+    r = pu_stat("/systest_tmp_openclose.txt", &st);
+    check_eq("O_TRUNC reopen actually truncated to just the new content", 2, (int)st.st_size);
 
     pu_unlink("/systest_tmp_openclose.txt");
 

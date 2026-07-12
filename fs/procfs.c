@@ -67,16 +67,20 @@ static bool parse_pid_path(const char *path, uint32_t *out_pid, const char **out
     return true;
 }
 
-/* Rough per-process memory footprint: this kernel's per-process address
- * space is a small, fixed-layout window (include/pureunix/vmm.h) rather
- * than something with per-page accounting readily available, so this is
- * a coarse approximation (the whole 3 MiB user window for any live user
- * task, 0 for a kernel-only task like main_task/init-reaper/vt-session),
- * not an exact resident-page count. Documented as a known limitation —
- * see docs/procfs.md. */
+/* Real per-process memory footprint: task_t.mapped_bytes (kernel/elf.c's
+ * elf_load_into()) is the genuine sum of every PT_LOAD segment's page-
+ * aligned size plus the fixed stack region, computed at the process's
+ * last exec() — not a fixed per-task constant, so this now actually
+ * varies between e.g. a tiny "hello" and ncdemo's ~1.3 MiB of linked
+ * ncurses. Still an approximation of Linux's vsize/rss (this kernel maps
+ * every page of a process eagerly at exec() time rather than lazily on
+ * first touch, so there's no separate "resident" subset smaller than
+ * "mapped" the way a real demand-paged kernel would report) — but a
+ * real, per-program-varying number rather than the same constant for
+ * every process. 0 for a kernel-only task (never execs a user ELF). */
 static uint32_t approx_vsize_bytes(const task_t *t)
 {
-    return t->is_user ? (USER_WINDOW_END - USER_WINDOW_BASE) : 0;
+    return t->mapped_bytes;
 }
 
 static int render_pid_stat(const task_t *t, char **out_data, size_t *out_size)

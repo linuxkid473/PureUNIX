@@ -310,9 +310,158 @@ $(LUAC_ELF): $(BUILD)/user/lua/luac.o $(LUA_BASE_OBJS) $(BUILD)/user/newlib_crt0
 		$(BUILD)/user/lua/luac.o $(LUA_BASE_OBJS) \
 		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
 
+# SQLite 3.53.3 (vendored amalgamation under third_party/sqlite/ -- see that
+# dir's README.md for the vendoring rationale) -- real, unmodified upstream
+# SQLite, built the same "vendor upstream source, compile with our own
+# Makefile rules" pattern as TCC/Lua above. Unlike Lua's own many-small-
+# files src/Makefile, SQLite's own upstream distribution *is* the
+# amalgamation form (sqlite3.c + shell.c, exactly what sqlite.org packages
+# for embedding) -- so there's no "own build system" to route around here;
+# this just compiles the two files upstream already intends to be compiled
+# together, the same way `gcc shell.c sqlite3.c -o sqlite3` in SQLite's own
+# docs would, using i686-elf-gcc/newlib instead of a hosted toolchain.
+#
+# -DSQLITE_OS_UNIX=1 forces the unix VFS backend explicitly rather than
+# relying on sqlite3.c's own `#if defined(_WIN32) ... #else unix#endif`
+# autodetection (which would already land on unix here, since nothing
+# defines _WIN32 on this freestanding target, but this is the same
+# "declare platform intent explicitly" style as Lua's -DLUA_USE_POSIX).
+# The real work backing that VFS -- POSIX advisory record locking via
+# fcntl(F_SETLK/F_GETLK), which SQLite's default unix VFS needs for every
+# transaction even with a single connection -- is include/pureunix/flock.h
+# + kernel/flock.c (see docs/sqlite-port.md), not a stub.
+#
+# -DSQLITE_THREADSAFE=0: PureUNIX has no threading model (same reasoning as
+# Lua's flockfile()/funlockfile() no-ops), so SQLite's internal mutexes
+# compile out entirely rather than needing a pthread port.
+# -DSQLITE_OMIT_LOAD_EXTENSION: no dynamic linker at all (same reasoning as
+# Lua's LUA_USE_DLOPEN omission / TCC's CONFIG_TCC_STATIC) -- extension
+# loading fails cleanly with upstream's own "not authorized" error; every
+# other SQL feature is unaffected.
+# -DSQLITE_OMIT_WAL: WAL mode needs a real shared-memory VFS layer
+# (xShmMap/xShmLock, normally an mmap'd -shm file coordinating multiple
+# processes) this port doesn't implement; the default rollback-journal
+# mode (what every `sqlite3 file.db` session uses unless it explicitly
+# opts into `PRAGMA journal_mode=WAL`) needs none of that and works fully.
+# -DSQLITE_MAX_MMAP_SIZE=0: PureUNIX's mmap() (user/newlib_syscalls.c) only
+# supports MAP_ANON|MAP_PRIVATE scratch allocations, not a real file-backed
+# mapping SQLite's opportunistic mmap I/O path would need -- this disables
+# that path cleanly rather than letting it fail at runtime.
+# -DHAVE_USLEEP=1: real usleep() exists (user/newlib_syscalls.c, added for
+# the Lua port) -- lets unixSleep() use real microsecond-resolution sleeps
+# instead of rounding every busy-handler retry up to a whole second.
+SQLITE_SRC := third_party/sqlite/sqlite-3.53.3
+SQLITE_DEFS := -DSQLITE_OS_UNIX=1 -DSQLITE_THREADSAFE=0 \
+	-DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_WAL \
+	-DSQLITE_MAX_MMAP_SIZE=0 -DHAVE_USLEEP=1
+SQLITE_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SQLITE_SRC) $(SQLITE_DEFS) -Wno-unused-function
+
+$(BUILD)/user/sqlite/%.o: $(SQLITE_SRC)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SQLITE_CFLAGS) -MMD -MP -c $< -o $@
+
+SQLITE_OBJS := $(BUILD)/user/sqlite/sqlite3.o $(BUILD)/user/sqlite/shell.o
+DEPS += $(SQLITE_OBJS:.o=.d)
+
+SQLITE_ELF := $(BUILD)/user/sqlite3.elf
+
+$(SQLITE_ELF): $(SQLITE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(SQLITE_OBJS) \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
+# ncurses 6.5 (vendored *build output* under third_party/ncurses/i686-elf/ --
+# see third_party/ncurses/README.md and tools/build-ncurses.sh for why this
+# one dependency, unlike TCC/Lua/SQLite, is a prebuilt-and-vendored artifact
+# instead of source compiled directly by this Makefile: the same "generated
+# sources are real, upstream-produced build output, not something to
+# hand-reproduce" reasoning third_party/newlib already uses). Headers +
+# libncurses.a/libform.a/libmenu.a/libpanel.a are just another -isystem/-L
+# pair, exactly like $(NEWLIB_DIR) itself, so any current or future
+# NEWLIB_PROGRAMS-style userspace binary can link against them the same way.
+NCURSES_DIR := third_party/ncurses/i686-elf
+NCURSES_CFLAGS := $(NEWLIB_CFLAGS) -isystem $(NCURSES_DIR)/include
+NCURSES_LDFLAGS := $(NEWLIB_LDFLAGS) -L$(NCURSES_DIR)/lib
+
+$(BUILD)/user/ncdemo.o: user/ncdemo.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NCURSES_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/ncdemo.d
+
+NCDEMO_ELF := $(BUILD)/user/ncdemo.elf
+
+$(NCDEMO_ELF): $(BUILD)/user/ncdemo.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NCURSES_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/ncdemo.o \
+		-Wl,--start-group -lncurses -lc -lm -Wl,--end-group -lgcc -o $@
+
+# htop 3.5.1 (vendored upstream source under third_party/htop/ -- see that
+# directory's README.md and docs/htop-port.md). Unlike ncurses, htop's own
+# build generates no real source at build time -- picking a platform just
+# selects which small subdirectory's .c files join one fixed, hand-
+# enumerable core file list (Makefile.am's `myhtopsources`) -- so this
+# follows the TCC/Lua/SQLite "vendor upstream source, compile it with our
+# own Makefile rules, no upstream build system" pattern instead, with a
+# hand-written config.h (third_party/htop/pureunix/config.h) standing in
+# for the one htop's own `configure` would otherwise generate -- see that
+# file's own header comment for why. third_party/htop/pureunix/ is a real,
+# new htop platform backend (Platform.c/Machine.c/Process.c/ProcessTable.c,
+# the same plugin shape linux/, freebsd/, etc. already use) reading
+# PureUNIX's own real /proc (fs/procfs.c), not a patch to any upstream
+# htop file and not a fake Linux /proc.
+HTOP_SRC := third_party/htop/htop-3.5.1
+HTOP_PUREUNIX := third_party/htop/pureunix
+HTOP_CORE_SRCS := Action.c Affinity.c AffinityPanel.c AvailableColumnsPanel.c \
+	AvailableMetersPanel.c BatteryMeter.c CategoriesPanel.c ColorsPanel.c \
+	ColumnsPanel.c CommandLine.c CommandScreen.c CPUMeter.c CRT.c \
+	DateTimeMeter.c DiskIOMeter.c DisplayOptionsPanel.c DynamicColumn.c \
+	DynamicMeter.c DynamicScreen.c EnvScreen.c FileDescriptorMeter.c \
+	FunctionBar.c Hashtable.c Header.c HeaderOptionsPanel.c HostnameMeter.c \
+	History.c IncSet.c InfoScreen.c LineEditor.c ListItem.c \
+	LoadAverageMeter.c Machine.c MainPanel.c MemoryMeter.c \
+	MemorySwapMeter.c Meter.c MetersPanel.c NetworkIOMeter.c Object.c \
+	OpenFilesScreen.c OptionItem.c Panel.c Process.c ProcessLocksScreen.c \
+	ProcessTable.c Row.c RichString.c Scheduling.c ScreenManager.c \
+	ScreensPanel.c ScreenTabsPanel.c Settings.c SignalsPanel.c SwapMeter.c \
+	SysArchMeter.c Table.c TasksMeter.c TraceScreen.c UptimeMeter.c \
+	UsersTable.c Vector.c XUtils.c
+HTOP_PLATFORM_SRCS := Platform.c PureUnixMachine.c PureUnixProcess.c PureUnixProcessTable.c
+HTOP_OBJS := $(addprefix $(BUILD)/user/htop/,$(HTOP_CORE_SRCS:.c=.o)) \
+	$(addprefix $(BUILD)/user/htop/,$(HTOP_PLATFORM_SRCS:.c=.o)) \
+	$(BUILD)/user/htop/htop.o \
+	$(BUILD)/user/htop/generic/gettime.o
+
+$(BUILD)/user/htop/generic/gettime.o: $(HTOP_SRC)/generic/gettime.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HTOP_CFLAGS) -MMD -MP -c $< -o $@
+HTOP_CFLAGS := $(USER_CFLAGS) $(NCURSES_CFLAGS) -D_GNU_SOURCE -DHAVE_CONFIG_H \
+	-Ithird_party/htop -I$(HTOP_PUREUNIX) -I$(HTOP_SRC) \
+	-Wno-unused-parameter -Wno-sign-compare -Wno-unused-function
+
+$(BUILD)/user/htop/%.o: $(HTOP_SRC)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HTOP_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/htop/%.o: $(HTOP_PUREUNIX)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HTOP_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(HTOP_OBJS:.o=.d)
+
+HTOP_ELF := $(BUILD)/user/htop.elf
+
+$(HTOP_ELF): $(HTOP_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NCURSES_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(HTOP_OBJS) \
+		-Wl,--start-group -lncurses -lc -lm -Wl,--end-group -lgcc -o $@
+
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -380,8 +529,8 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) \
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT)
 
 disk: $(DISK) $(DISK2)
@@ -393,8 +542,8 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) \
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-

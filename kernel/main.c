@@ -350,6 +350,14 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     shell_setenv("USER", "root");
     shell_setenv("HOME", "/root");
     shell_setenv("SHELL", "/bin/sh");
+    /* Every VT's console speaks the same "pureunix" terminfo entry
+     * (docs/ncurses-port.md, third_party/ncurses/pureunix.terminfo) —
+     * without this, ncurses' initscr() has no TERM to resolve at all and
+     * fails outright ("Error opening terminal: unknown."). One global env
+     * table (shell/builtins.c) shared by every VT session task below, so
+     * setting this once here covers VT1..NUM_VTS, same as USER/HOME/SHELL
+     * above. */
+    shell_setenv("TERM", "pureunix");
     shell_set_home_cwd("/root");
     boot_checkpoint("after auto-login");
 

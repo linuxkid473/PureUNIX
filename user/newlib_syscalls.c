@@ -42,6 +42,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/select.h>
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/utsname.h>
@@ -110,6 +111,8 @@ enum {
     PU_SYS_SIGPENDING  = 51,
     PU_SYS_SETPRIORITY = 52,
     PU_SYS_GETPRIORITY = 53,
+    PU_SYS_FCHMOD = 54,
+    PU_SYS_FCHOWN = 55,
 };
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
@@ -142,6 +145,20 @@ struct pu_raw_stat {
     uint32_t raw_ctime;
     uint32_t st_blocks;
     uint32_t st_blksize;
+};
+
+/* Mirrors arch/i386/syscall.c's struct pu_raw_flock — plain int32_t fields
+ * rather than newlib's struct flock (short/long, see
+ * <sys/_default_fcntl.h>), for the same reason as struct pu_raw_stat
+ * above: an explicit, fixed-width wire struct instead of relying on two
+ * differently-declared structs happening to line up. fcntl() below
+ * translates field-by-field in both directions. */
+struct pu_raw_flock {
+    int32_t l_type;
+    int32_t l_whence;
+    int32_t l_start;
+    int32_t l_len;
+    int32_t l_pid;
 };
 
 /* Mirrors include/pureunix/termios.h's struct termios (NCCS == 8, its own
@@ -261,15 +278,49 @@ int close(int fd)
     return r < 0 ? fail(r) : 0;
 }
 
-/* Minimal fcntl(): F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL only — see
- * SYS_FCNTL (arch/i386/syscall.c) and docs/syscalls.md. F_GETFD/F_SETFD are
- * honest no-ops (no close-on-exec model — every fd is always inherited
- * across exec, see task_create_user()/task_fork()). F_GETFL/F_SETFL
- * translate PureUNIX's O_* bit layout to/from newlib's, same as open(). */
+/* Minimal fcntl(): F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_GETLK/F_SETLK/
+ * F_SETLKW — see SYS_FCNTL (arch/i386/syscall.c) and docs/syscalls.md.
+ * F_GETFD/F_SETFD are honest no-ops (no close-on-exec model — every fd is
+ * always inherited across exec, see task_create_user()/task_fork()).
+ * F_GETFL/F_SETFL translate PureUNIX's O_* bit layout to/from newlib's,
+ * same as open(). F_GETLK/F_SETLK/F_SETLKW (added for the SQLite port,
+ * docs/sqlite-port.md — SQLite's default unix VFS depends on real POSIX
+ * advisory locking for every transaction) marshal newlib's struct flock
+ * into struct pu_raw_flock across the syscall — see kernel/flock.c and
+ * that struct's own comment for why F_SETLKW is handled exactly like
+ * F_SETLK (SQLite's default build never actually blocks in the kernel for
+ * this). */
 int fcntl(int fd, int cmd, ...)
 {
     va_list ap;
     va_start(ap, cmd);
+
+    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+        struct flock *lck = va_arg(ap, struct flock *);
+        va_end(ap);
+        struct pu_raw_flock rlk;
+        rlk.l_type = lck->l_type;
+        rlk.l_whence = lck->l_whence;
+        rlk.l_start = (int32_t)lck->l_start;
+        rlk.l_len = (int32_t)lck->l_len;
+        rlk.l_pid = lck->l_pid;
+
+        int r = raw_syscall(PU_SYS_FCNTL, fd, cmd, (int)&rlk);
+        if (r < 0) {
+            return fail(r);
+        }
+        if (cmd == F_GETLK) {
+            lck->l_type = (short)rlk.l_type;
+            if (rlk.l_type != F_UNLCK) {
+                lck->l_whence = (short)rlk.l_whence;
+                lck->l_start = (long)rlk.l_start;
+                lck->l_len = (long)rlk.l_len;
+                lck->l_pid = (short)rlk.l_pid;
+            }
+        }
+        return 0;
+    }
+
     int arg = va_arg(ap, int);
     va_end(ap);
 
@@ -1071,6 +1122,24 @@ int chown(const char *path, uid_t uid, gid_t gid)
     return r < 0 ? fail(r) : 0;
 }
 
+/* fd-based chmod()/chown() — added for the SQLite port (docs/sqlite-port.md):
+ * os_unix.c's unixCreate() copies the main db file's permissions/ownership
+ * onto a freshly created rollback-journal file via these. Real, not a
+ * stub: SYS_FCHMOD/SYS_FCHOWN (arch/i386/syscall.c) resolve against the
+ * fd's own open_file_t.path and call the same vfs_chmod()/vfs_chown() the
+ * path-based syscalls above use. */
+int fchmod(int fd, mode_t mode)
+{
+    int r = raw_syscall(PU_SYS_FCHMOD, fd, (int)mode, 0);
+    return r < 0 ? fail(r) : 0;
+}
+
+int fchown(int fd, uid_t uid, gid_t gid)
+{
+    int r = raw_syscall(PU_SYS_FCHOWN, fd, (int)uid, (int)gid);
+    return r < 0 ? fail(r) : 0;
+}
+
 int chdir(const char *path)
 {
     int r = raw_syscall(PU_SYS_CHDIR, (int)path, 0, 0);
@@ -1186,6 +1255,24 @@ int closedir(DIR *dirp)
     return 0;
 }
 
+/* Honest stub, not a fake fd: this kernel's SYS_READDIR has no per-
+ * directory cursor at all (opendir() dumps the whole listing into DIR up
+ * front — see struct DIR's own comment above), so there is no real
+ * underlying file descriptor a DIR* could report. Real POSIX dirfd() is
+ * only ever meaningful paired with fd-relative calls (openat()/
+ * fstatat()/...), none of which exist here either (see this file's own
+ * openat/fstatat gaps) — ENOSYS is the correct answer, not a fabricated
+ * fd number. Exists purely so callers that merely *reference* dirfd() at
+ * compile time (e.g. htop's XUtils.h xDirfd(), only actually invoked
+ * behind its own HAVE_OPENAT guard) link; nothing in this port's build
+ * calls it at runtime. */
+int dirfd(DIR *dirp)
+{
+    (void)dirp;
+    errno = ENOSYS;
+    return -1;
+}
+
 /* -------------------------------------------------------------------- */
 /* Process control                                                       */
 /* -------------------------------------------------------------------- */
@@ -1264,6 +1351,56 @@ int execvp(const char *file, char *const argv[])
     }
     errno = ENOENT;
     return -1;
+}
+
+/* execl()/execlp()'s real, standard shape everywhere: collect the
+ * variadic argument list into a plain argv[] array, then hand off to the
+ * real vector-argument syscall wrappers above — not a PureUNIX-specific
+ * stub, just the same thin wrapper every libc ships. Added for htop's
+ * OpenFilesScreen/TraceScreen (third_party/htop/), which both call
+ * execlp("lsof"/"strace"/"truss", ...) — none of those binaries exist on
+ * PureUNIX, so the call still fails (ENOENT), exactly the same graceful
+ * "not installed" failure a real Unix without lsof/strace would give. */
+#define EXECL_MAX_ARGS 32
+
+int execlp(const char *file, const char *arg0, ...)
+{
+    const char *argv[EXECL_MAX_ARGS];
+    int n = 0;
+    argv[n++] = arg0;
+    va_list ap;
+    va_start(ap, arg0);
+    while (n < EXECL_MAX_ARGS - 1) {
+        const char *next = va_arg(ap, const char *);
+        argv[n++] = next;
+        if (!next) {
+            break;
+        }
+    }
+    va_end(ap);
+    argv[EXECL_MAX_ARGS - 1] = NULL;
+    return execvp(file, (char *const *)argv);
+}
+
+/* No real hostname database exists (no sethostname()-configurable state
+ * anywhere in the kernel) — a fixed, honest name rather than fabricating
+ * per-boot state nothing backs, matching Platform_getRelease()'s own
+ * "PureUNIX" naming in third_party/htop/pureunix/Platform.c. */
+int gethostname(char *name, size_t len)
+{
+    static const char host[] = "pureunix";
+    if (!name) {
+        errno = EFAULT;
+        return -1;
+    }
+    size_t n = sizeof(host) < len ? sizeof(host) : len;
+    memcpy(name, host, n);
+    if (n < len) {
+        name[n] = '\0';
+    } else if (len > 0) {
+        name[len - 1] = '\0';
+    }
+    return 0;
 }
 
 /* ---- system()/popen()/pclose() ----
@@ -1672,6 +1809,36 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return ready;
 }
 
+/* Same real gap and same honest answer as poll() just above (no readiness
+ * multiplexing exists in this kernel) — every fd named in readfds/
+ * writefds is reported ready immediately rather than lying about a real
+ * wait; exceptfds is always empty (no urgent/OOB data model exists
+ * either). Added for htop's TraceScreen (third_party/htop/) — its own
+ * F-key strace/truss integration fails at the execlp() step anyway
+ * (neither binary exists on PureUNIX), so this mainly just needs to link
+ * and not misbehave, not genuinely multiplex. */
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
+{
+    (void)timeout;
+    int ready = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        bool set = false;
+        if (readfds && FD_ISSET(fd, readfds)) {
+            set = true;
+        }
+        if (writefds && FD_ISSET(fd, writefds)) {
+            set = true;
+        }
+        if (set) {
+            ready++;
+        }
+    }
+    if (exceptfds) {
+        FD_ZERO(exceptfds);
+    }
+    return ready;
+}
+
 long sysconf(int name)
 {
     switch (name) {
@@ -1898,6 +2065,23 @@ int setrlimit(int resource, const struct rlimit *rlim)
 {
     (void)resource;
     (void)rlim;
+    return 0;
+}
+
+/* getrusage(): honest stub — see user/newlib_compat/sys/resource.h's own
+ * comment on struct rusage for why (no syscall surfaces task_t.cpu_ticks
+ * anywhere yet). Added for the SQLite port's shell.c `.timer` command. */
+int getrusage(int who, struct rusage *usage)
+{
+    (void)who;
+    if (!usage) {
+        errno = EFAULT;
+        return -1;
+    }
+    usage->ru_utime.tv_sec = 0;
+    usage->ru_utime.tv_usec = 0;
+    usage->ru_stime.tv_sec = 0;
+    usage->ru_stime.tv_usec = 0;
     return 0;
 }
 

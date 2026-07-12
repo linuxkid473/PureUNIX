@@ -64,7 +64,22 @@ int tty_set_termios(const struct termios *in)
 static int key_to_byte(const struct termios *t, int key)
 {
     if (key == KEY_ENTER) {
-        return '\n';
+        /* '\r' (0x0D/CR), not '\n' (0x0A/LF) — the real, conventional byte
+         * every physical terminal's Return key transmits in raw/cbreak
+         * mode (canonical-mode line assembly below still accepts either,
+         * so ordinary shell input is unaffected). Found because ncurses
+         * apps that call nonl() (htop's CRT_init(), third_party/htop/ —
+         * disabling ncurses' own default automatic \r->\n input
+         * translation, precisely so they can see this raw byte
+         * themselves) check the raw code for 13 explicitly (e.g. Action.c's
+         * list-picker "confirm selection" handler) and never matched
+         * against the '\n' this used to send — Enter silently did nothing
+         * in htop's sort-by/kill-signal panels. Apps that *don't* call
+         * nonl() (e.g. user/ncdemo.c) are unaffected: ncurses' own default
+         * nl() mode already translates a raw '\r' back to '\n' before
+         * wgetch() returns it, exactly like a real terminal/ncurses pair
+         * anywhere else. */
+        return '\r';
     }
     if (key == KEY_BACKSPACE) {
         return (int)t->c_cc[VERASE];
@@ -82,6 +97,83 @@ static int key_to_byte(const struct termios *t, int key)
         return key;
     }
     return -1;
+}
+
+/* Extended keys with no direct ASCII meaning (arrows, Home/End/PgUp/PgDn/
+ * Delete, F1..F12) — key_to_byte() above returns -1 for all of these.
+ * Translated to real ANSI/xterm terminal-input escape sequences here,
+ * matching this port's "pureunix" terminfo entry (docs/ncurses-port.md)
+ * exactly, so ncurses' getch()/KEY_* resolution sees the same bytes a real
+ * terminal emitting that terminfo's kcuu1/kcud1/.../kf1..kf12 would send.
+ * Returns the sequence length (<= PENDING_MAX), or 0 if `key` has no
+ * escape-sequence mapping either (a genuinely unhandled key). */
+#define PENDING_MAX 8
+
+static size_t key_to_escape_seq(int key, char *out)
+{
+    switch (key) {
+    case KEY_UP:        memcpy(out, "\033[A", 3); return 3;
+    case KEY_DOWN:      memcpy(out, "\033[B", 3); return 3;
+    case KEY_RIGHT:     memcpy(out, "\033[C", 3); return 3;
+    case KEY_LEFT:      memcpy(out, "\033[D", 3); return 3;
+    case KEY_HOME:      memcpy(out, "\033[H", 3); return 3;
+    case KEY_END:       memcpy(out, "\033[F", 3); return 3;
+    case KEY_PAGE_UP:   memcpy(out, "\033[5~", 4); return 4;
+    case KEY_PAGE_DOWN: memcpy(out, "\033[6~", 4); return 4;
+    case KEY_DELETE:    memcpy(out, "\033[3~", 4); return 4;
+    case KEY_F1:        memcpy(out, "\033OP", 3); return 3;
+    case KEY_F2:        memcpy(out, "\033OQ", 3); return 3;
+    case KEY_F3:        memcpy(out, "\033OR", 3); return 3;
+    case KEY_F4:        memcpy(out, "\033OS", 3); return 3;
+    case KEY_F5:        memcpy(out, "\033[15~", 5); return 5;
+    case KEY_F6:        memcpy(out, "\033[17~", 5); return 5;
+    case KEY_F7:        memcpy(out, "\033[18~", 5); return 5;
+    case KEY_F8:        memcpy(out, "\033[19~", 5); return 5;
+    case KEY_F9:        memcpy(out, "\033[20~", 5); return 5;
+    case KEY_F10:       memcpy(out, "\033[21~", 5); return 5;
+    case KEY_F11:       memcpy(out, "\033[23~", 5); return 5;
+    case KEY_F12:       memcpy(out, "\033[24~", 5); return 5;
+    default:             return 0;
+    }
+}
+
+/* One escape-sequence queue per VT (indexed like every other per-VT input
+ * state in kernel/vt.c) — a special key produces several bytes from one
+ * keypress, but tty_read() hands them back to its caller one at a time (or
+ * however many fit in the caller's buffer), so the not-yet-returned tail
+ * has to survive across separate tty_read()/SYS_READ calls, not just
+ * within one. */
+static char pending_buf[NUM_VTS][PENDING_MAX];
+static uint8_t pending_len[NUM_VTS];
+static uint8_t pending_pos[NUM_VTS];
+
+/* Non-blocking: drains a queued escape-sequence byte if one is pending,
+ * else tries one already-buffered key (vt_input_try_getkey() never blocks),
+ * queuing the rest of its escape sequence if it turns out to need one.
+ * Returns -1 if nothing is available right now. */
+static int try_next_byte(int vt_id, const struct termios *t)
+{
+    if (pending_pos[vt_id] < pending_len[vt_id]) {
+        return (unsigned char)pending_buf[vt_id][pending_pos[vt_id]++];
+    }
+    for (;;) {
+        int key = vt_input_try_getkey(vt_id);
+        if (key == 0 /* KEY_NONE */) {
+            return -1;
+        }
+        int b = key_to_byte(t, key);
+        if (b >= 0) {
+            return b;
+        }
+        size_t seqlen = key_to_escape_seq(key, pending_buf[vt_id]);
+        if (seqlen > 0) {
+            pending_len[vt_id] = (uint8_t)seqlen;
+            pending_pos[vt_id] = 1;
+            return (unsigned char)pending_buf[vt_id][0];
+        }
+        /* Stray key with no byte or escape-sequence mapping: keep draining
+         * without blocking, matching this loop's pre-existing behavior. */
+    }
 }
 
 static void echo_char(int vt_id, const struct termios *t, char c)
@@ -107,11 +199,24 @@ static void echo_erase(int vt_id, const struct termios *t)
  * switched back to, exactly like a real Linux VT. */
 static int next_byte(int vt_id, const struct termios *t)
 {
-    int b;
-    do {
-        b = key_to_byte(t, vt_input_getkey(vt_id));
-    } while (b < 0);
-    return b;
+    for (;;) {
+        if (pending_pos[vt_id] < pending_len[vt_id]) {
+            return (unsigned char)pending_buf[vt_id][pending_pos[vt_id]++];
+        }
+        int key = vt_input_getkey(vt_id);
+        int b = key_to_byte(t, key);
+        if (b >= 0) {
+            return b;
+        }
+        size_t seqlen = key_to_escape_seq(key, pending_buf[vt_id]);
+        if (seqlen > 0) {
+            pending_len[vt_id] = (uint8_t)seqlen;
+            pending_pos[vt_id] = 0;
+        }
+        /* Neither an ASCII-mapped key nor one with an escape-sequence
+         * mapping (a genuinely unhandled key, or the KEY_NONE the block
+         * above never actually queues towards) — block for the next one. */
+    }
 }
 
 /* Ctrl+C/Ctrl+Z/Ctrl+\ are handled entirely below this layer now —
@@ -140,7 +245,12 @@ static int tty_read_canonical(int vt_id, const struct termios *t, char *buf, siz
             }
             break;
         }
-        if (c == '\n') {
+        if (c == '\n' || c == '\r') {
+            /* Accept either — KEY_ENTER now produces the real, raw '\r'
+             * terminal convention (key_to_byte() above), but the line
+             * itself always ends with a literal '\n', matching what
+             * every canonical-mode reader (fgets(), BusyBox's own
+             * non-raw-mode fallback, ...) already expects. */
             echo_char(vt_id, t, '\n');
             line[n < sizeof(line) ? n : sizeof(line) - 1] = '\n';
             n = (n < sizeof(line)) ? n + 1 : sizeof(line);
@@ -190,13 +300,9 @@ static int tty_read_raw(int vt_id, const struct termios *t, char *buf, size_t le
     echo_char(vt_id, t, (char)first);
 
     while (i < len) {
-        int key = vt_input_try_getkey(vt_id);
-        if (key == 0 /* KEY_NONE */) {
-            break;
-        }
-        int c = key_to_byte(t, key);
+        int c = try_next_byte(vt_id, t);
         if (c < 0) {
-            continue;
+            break;
         }
         buf[i++] = (char)c;
         echo_char(vt_id, t, (char)c);

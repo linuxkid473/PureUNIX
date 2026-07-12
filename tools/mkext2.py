@@ -611,6 +611,23 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'luac.elf' for p in programs):
         fs.add_symlink(bin_ino, 'luac', 'luac.elf')
 
+    # Same idea for the SQLite CLI (third_party/sqlite/, docs/sqlite-port.md)
+    # -- a plain name-without-.elf symlink so `sqlite3` works as an ordinary
+    # PATH command.
+    if any(os.path.basename(p).lower() == 'sqlite3.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'sqlite3', 'sqlite3.elf')
+
+    # Same idea for the ncurses demo (third_party/ncurses/, docs/ncurses-
+    # port.md) -- a plain name-without-.elf symlink so `ncdemo` works as an
+    # ordinary PATH command.
+    if any(os.path.basename(p).lower() == 'ncdemo.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'ncdemo', 'ncdemo.elf')
+
+    # Same idea for htop (third_party/htop/, docs/htop-port.md) -- a plain
+    # name-without-.elf symlink so `htop` works as an ordinary PATH command.
+    if any(os.path.basename(p).lower() == 'htop.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'htop', 'htop.elf')
+
 
 def add_dev(fs, dir_cache: dict, num_vts: int = 6):
     """Add /dev/tty1../ttyN and /dev/tty -- see include/pureunix/vt.h and

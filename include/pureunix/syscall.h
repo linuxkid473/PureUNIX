@@ -144,6 +144,15 @@ enum {
      * task_getpriority(), docs/process-management.md. */
     SYS_SETPRIORITY = 52, /* EBX: pid (0 == caller), ECX: nice value (clamped to [-20,19]) */
     SYS_GETPRIORITY = 53, /* EBX: pid (0 == caller), ECX: int * (out) */
+
+    /* fchmod(2)/fchown(2): same as SYS_CHMOD/SYS_CHOWN but resolve against
+     * an already-open fd's own path (open_file_t.path) instead of a
+     * caller-supplied one — added for the SQLite port (docs/sqlite-port.md):
+     * os_unix.c's unixCreate() copies the main db file's permissions/
+     * ownership onto a freshly created rollback-journal file via these.
+     * EBX: fd. ECX (SYS_FCHMOD): mode_t. ECX/EDX (SYS_FCHOWN): uid/gid. */
+    SYS_FCHMOD = 54,
+    SYS_FCHOWN = 55,
 };
 
 #endif

@@ -1,0 +1,271 @@
+/*
+htop - Metric.c
+(C) 2020-2021 htop dev team
+(C) 2020-2021 Red Hat, Inc.
+Released under the GNU GPLv2+, see the COPYING file
+in the source distribution for its full text.
+*/
+
+#include "config.h" // IWYU pragma: keep
+
+#include "pcp/Metric.h"
+
+#include <ctype.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "XUtils.h"
+
+#include "pcp/Platform.h"
+
+
+extern Platform* pcp;
+
+const pmDesc* Metric_desc(Metric metric) {
+   return &pcp->descs[metric];
+}
+
+int Metric_type(Metric metric) {
+   return pcp->descs[metric].type;
+}
+
+pmAtomValue* Metric_values(Metric metric, pmAtomValue* atom, int count, int type) {
+   if (pcp->result == NULL)
+      return NULL;
+
+   pmValueSet* vset = pcp->result->vset[metric];
+   if (!vset || vset->numval <= 0)
+      return NULL;
+
+   /* extract requested number of values as requested type */
+   const pmDesc* desc = &pcp->descs[metric];
+   for (int i = 0; i < vset->numval; i++) {
+      if (i == count)
+         break;
+      const pmValue* value = &vset->vlist[i];
+      int sts = pmExtractValue(vset->valfmt, value, desc->type, &atom[i], type);
+      if (sts < 0) {
+         if (pmDebugOptions.appl0)
+            fprintf(stderr, "Error: cannot extract metric value: %s\n",
+                            pmErrStr(sts));
+         memset(&atom[i], 0, sizeof(pmAtomValue));
+      }
+   }
+   return atom;
+}
+
+int Metric_instanceCount(Metric metric) {
+   pmValueSet* vset = pcp->result->vset[metric];
+   if (vset)
+      return vset->numval;
+   return 0;
+}
+
+int Metric_instanceOffset(Metric metric, int inst) {
+   pmValueSet* vset = pcp->result->vset[metric];
+   if (!vset || vset->numval <= 0)
+      return 0;
+
+   /* search for optimal offset for subsequent inst lookups to begin */
+   for (int i = 0; i < vset->numval; i++) {
+      if (inst == vset->vlist[i].inst)
+         return i;
+   }
+   return 0;
+}
+
+static pmAtomValue* Metric_extract(Metric metric, int inst, int offset, pmValueSet* vset, pmAtomValue* atom, const pmDesc **desc, int type) {
+
+   /* extract value (using requested type) of given metric instance */
+   const pmDesc* outdesc = &pcp->descs[metric];
+   const pmValue* value = &vset->vlist[offset];
+   int sts = pmExtractValue(vset->valfmt, value, outdesc->type, atom, type);
+   if (sts < 0) {
+      if (pmDebugOptions.appl0)
+         fprintf(stderr, "Error: cannot extract %s instance %d value: %s\n",
+                         pcp->names[metric], inst, pmErrStr(sts));
+      memset(atom, 0, sizeof(pmAtomValue));
+   }
+   *desc = outdesc;
+   return atom;
+}
+
+static const pmDesc* Metric_instanceDesc(Metric metric, int inst, int offset, pmAtomValue* atom, int type) {
+   pmValueSet* vset = pcp->result->vset[metric];
+   if (!vset || vset->numval <= 0)
+      return NULL;
+
+   /* fast-path using heuristic offset based on expected location */
+   const pmDesc* desc = NULL;
+   if (offset >= 0 && offset < vset->numval && inst == vset->vlist[offset].inst
+       && Metric_extract(metric, inst, offset, vset, atom, &desc, type))
+      return desc;
+
+   /* slow-path using a linear search for the requested instance */
+   for (int i = 0; i < vset->numval; i++) {
+      if (inst == vset->vlist[i].inst
+          && Metric_extract(metric, inst, i, vset, atom, &desc, type))
+         break;
+   }
+   return desc;
+}
+
+pmAtomValue* Metric_instance(Metric metric, int inst, int offset, pmAtomValue* atom, int type) {
+   if (Metric_instanceDesc(metric, inst, offset, atom, type))
+      return atom;
+   return NULL;
+}
+
+static inline pmAtomValue* kibibytes(pmAtomValue* atom, int scale) {
+   /* perform integer math, raising to the power +/-N */
+   int i, power = scale - PM_SPACE_KBYTE;
+   if (power > 0) {
+      for (i = 0; i < power; i++)
+         atom->ull *= ONE_K;
+   } else if (power < 0) {
+      for (i = 0; i > power; i--)
+         atom->ull /= ONE_K;
+   }
+   return atom;
+}
+
+pmAtomValue* Metric_instance_kibibytes(Metric metric, int inst, int offset, pmAtomValue* atom) {
+   const pmDesc *desc = Metric_instanceDesc(metric, inst, offset, atom, PM_TYPE_U64);
+   if (desc)
+      return kibibytes(atom, desc->units.scaleSpace);
+   return NULL;
+}
+
+static inline pmAtomValue* milliseconds(pmAtomValue* atom, int scale) {
+   switch (scale) {
+   case PM_TIME_NSEC:
+      atom->ull /= 1000000ULL;
+      break;
+   case PM_TIME_USEC:
+      atom->ull /= 1000ULL;
+      break;
+   case PM_TIME_MSEC:
+      break;
+   case PM_TIME_SEC:
+      atom->ull *= 1000ULL;
+      break;
+   case PM_TIME_MIN:
+      atom->ull *= 1000ULL * 60ULL;
+      break;
+   case PM_TIME_HOUR:
+      atom->ull *= 1000ULL * 60ULL * 60ULL;
+      break;
+   }
+   return atom;
+}
+
+pmAtomValue* Metric_instance_milliseconds(Metric metric, int inst, int offset, pmAtomValue* atom) {
+   const pmDesc *desc = Metric_instanceDesc(metric, inst, offset, atom, PM_TYPE_U64);
+   if (desc)
+      return milliseconds(atom, desc->units.scaleTime);
+   return NULL;
+}
+
+/*
+ * Iterate over a set of instances (incl PM_IN_NULL)
+ * returning the next instance identifier and offset.
+ *
+ * Start it off by passing offset -1 into the routine.
+ */
+bool Metric_iterate(Metric metric, int* instp, int* offsetp, size_t entrylen) {
+   if (!pcp->result)
+      return false;
+
+   pmValueSet* vset = pcp->result->vset[metric];
+   if (!vset || vset->numval <= 0 || (size_t)vset->numval > LONG_MAX / entrylen)
+      return false;
+
+   int offset = *offsetp;
+   offset = (offset < 0) ? 0 : offset + 1;
+   if (offset > vset->numval - 1)
+      return false;
+
+   *offsetp = offset;
+   *instp = vset->vlist[offset].inst;
+   return true;
+}
+
+/* Switch on/off a metric for value fetching (sampling) */
+void Metric_enable(Metric metric, bool enable) {
+   pcp->fetch[metric] = enable ? pcp->pmids[metric] : PM_ID_NULL;
+}
+
+bool Metric_enabled(Metric metric) {
+   return pcp->fetch[metric] != PM_ID_NULL;
+}
+
+void Metric_enableThreads(void) {
+   pmValueSet* vset = xCalloc(1, sizeof(pmValueSet));
+   vset->vlist[0].inst = PM_IN_NULL;
+   vset->vlist[0].value.lval = 1;
+   vset->valfmt = PM_VAL_INSITU;
+   vset->numval = 1;
+   vset->pmid = pcp->pmids[PCP_CONTROL_THREADS];
+
+   pmResult* result = xCalloc(1, sizeof(pmResult));
+   result->vset[0] = vset;
+   result->numpmid = 1;
+
+   int sts = pmStore(result);
+   if (sts < 0 && pmDebugOptions.appl0)
+      fprintf(stderr, "Error: cannot enable threads: %s\n", pmErrStr(sts));
+
+   pmFreeResult(result);
+}
+
+bool Metric_fetch(struct timeval* timestamp) {
+   if (pcp->result) {
+      pmFreeResult(pcp->result);
+      pcp->result = NULL;
+   }
+   if (pcp->reconnect) {
+      if (pmReconnectContext(pcp->context) < 0)
+         return false;
+      pcp->reconnect = false;
+   }
+   int sts, count = 0;
+   int total = (int) pcp->totalMetrics;
+   do {
+      sts = pmFetch(total, pcp->fetch, &pcp->result);
+   } while (sts == PM_ERR_IPC && ++count < 3);
+   if (sts < 0) {
+      if (pmDebugOptions.appl0)
+         fprintf(stderr, "Error: cannot fetch metric values: %s\n",
+                 pmErrStr(sts));
+      pcp->reconnect = true;
+      return false;
+   }
+   if (timestamp) {
+#if PMAPI_VERSION >= 3
+      pmtimespecTotimeval(&pcp->result->timestamp, timestamp);
+#else
+      *timestamp = pcp->result->timestamp;
+#endif
+   }
+   return true;
+}
+
+void Metric_externalName(Metric metric, int inst, char** externalName) {
+   const pmDesc* desc = &pcp->descs[metric];
+   /* ignore a failure here - its safe to do so */
+   (void)pmNameInDom(desc->indom, inst, externalName);
+}
+
+int Metric_lookupText(const char* metric, char** desc) {
+   pmID pmid;
+   int sts;
+
+   sts = pmLookupName(1, &metric, &pmid);
+   if (sts < 0)
+      return sts;
+
+   if (pmLookupText(pmid, PM_TEXT_ONELINE, desc) >= 0)
+      (*desc)[0] = (char) toupper((*desc)[0]); /* UI consistency */
+   return 0;
+}

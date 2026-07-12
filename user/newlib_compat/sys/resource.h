@@ -11,6 +11,7 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_RESOURCE_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_RESOURCE_H
 
+#include <sys/time.h>
 #include <sys/types.h>
 
 typedef unsigned long rlim_t;
@@ -52,5 +53,24 @@ int setrlimit(int resource, const struct rlimit *rlim);
 
 int getpriority(int which, id_t who);
 int setpriority(int which, id_t who, int prio);
+
+/* getrusage(): an honest stub, same category as getrlimit()/setrlimit()
+ * above — PureUNIX's per-task CPU-tick counter (task_t.cpu_ticks,
+ * arch/i386/pit.c) is never surfaced through any syscall (times()/
+ * sysconf() are the same kind of stub, see docs/libc.md's "Honest
+ * stubs"), so this always reports zeroed usage rather than a real
+ * measurement. Added for the SQLite port (docs/sqlite-port.md): the
+ * sqlite3 CLI's `.timer on` meta-command calls this to print per-query
+ * CPU time; with this stub it links, runs, and prints "0.000000" rather
+ * than failing to link at all — a real gap (no accurate CPU-time
+ * reporting), not a crash. */
+struct rusage {
+    struct timeval ru_utime;
+    struct timeval ru_stime;
+};
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+
+int getrusage(int who, struct rusage *usage);
 
 #endif

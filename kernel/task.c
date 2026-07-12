@@ -1,6 +1,7 @@
 #include <pureunix/arch.h>
 #include <pureunix/errno.h>
 #include <pureunix/fcntl.h>
+#include <pureunix/flock.h>
 #include <pureunix/memory.h>
 #include <pureunix/signal.h>
 #include <pureunix/stdio.h>
@@ -116,6 +117,12 @@ int open_file_unref(open_file_t *f)
             rc = vfs_write_file(f->path, f->data ? f->data : (const uint8_t *)"", f->size, 0);
         }
         kfree(f->data);
+        /* Real POSIX drops every advisory lock a process holds on a file
+         * when any fd referring to it is closed; here "owner" is this
+         * open_file_t itself (include/pureunix/flock.h explains why that's
+         * the right identity), so releasing on its own teardown is exact,
+         * not an approximation. */
+        flock_release_owner(f);
     } else if (f->kind == FD_KIND_PIPE) {
         pipe_buf_t *p = f->pipe_buf;
         if (p) {
@@ -309,6 +316,10 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
     child->pd_phys = child_pd;
     child->user_entry = current->user_entry;
     child->user_stack = current->user_stack;
+    /* vmm_fork_address_space() just copied the parent's whole address
+     * space, so the child's real mapped size starts out identical —
+     * see include/pureunix/task.h's mapped_bytes comment. */
+    child->mapped_bytes = current->mapped_bytes;
     child->is_fork_child = true;
     child->fork_regs = *parent_regs;
     child->fork_regs.eax = 0; /* fork() returns 0 in the child */

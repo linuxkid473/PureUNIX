@@ -43,6 +43,28 @@ static const char shift_map[128] = {
     [0x35] = '?', [0x39] = ' ', [0x01] = KEY_ESCAPE,
 };
 
+/* Set-1 function-key scancodes (never 0xE0-prefixed) — F1..F6 are already
+ * claimed for Alt+F<n> VT switching above, so this only ever fires for a
+ * bare (no Alt) function key. */
+static int function_key(uint8_t scancode)
+{
+    switch (scancode) {
+    case 0x3B: return KEY_F1;
+    case 0x3C: return KEY_F2;
+    case 0x3D: return KEY_F3;
+    case 0x3E: return KEY_F4;
+    case 0x3F: return KEY_F5;
+    case 0x40: return KEY_F6;
+    case 0x41: return KEY_F7;
+    case 0x42: return KEY_F8;
+    case 0x43: return KEY_F9;
+    case 0x44: return KEY_F10;
+    case 0x57: return KEY_F11;
+    case 0x58: return KEY_F12;
+    default: return KEY_NONE;
+    }
+}
+
 static int extended_key(uint8_t scancode)
 {
     switch (scancode) {
@@ -113,6 +135,12 @@ static void keyboard_irq(interrupt_regs_t *regs)
      * there is no separate Fn scancode) needs nothing extra here. */
     if (alt_down && sc >= 0x3B && sc <= 0x40) {
         vt_switch((int)(sc - 0x3B));
+        return;
+    }
+
+    int fkey = function_key(sc);
+    if (fkey != KEY_NONE) {
+        vt_input_push(fkey);
         return;
     }
 
