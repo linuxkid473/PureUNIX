@@ -48,6 +48,10 @@ cd "${WORK_DIR}/busybox-${BUSYBOX_VERSION}"
 echo "==> Applying pureunix.config"
 cp "${VENDOR_DIR}/pureunix.config" .config
 
+echo "==> Patching startup banner to say \"PureUNIX BusyBox\""
+sed -i.bak 's/"BusyBox v" BB_VER BB_EXTRA_VERSION/"PureUNIX BusyBox v" BB_VER BB_EXTRA_VERSION/' libbb/messages.c
+rm -f libbb/messages.c.bak
+
 EXTRA_CFLAGS="-isystem ${COMPAT_DIR} -isystem ${NEWLIB_DIR}/include -ffreestanding -fno-stack-protector -fno-pic -fno-pie -D_GNU_SOURCE"
 
 # oldconfig (not olddefconfig) so a version bump's new config options get
