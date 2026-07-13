@@ -768,6 +768,12 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'chocolate-doom.elf' for p in programs):
         fs.add_symlink(bin_ino, 'chocolate-doom', 'chocolate-doom.elf')
 
+    # Same idea for imgview (docs/imgview.md, real libpng/zlib-backed PNG
+    # viewer) -- a plain name-without-.elf symlink so `imgview file.png`
+    # works as an ordinary PATH command with no setup.
+    if any(os.path.basename(p).lower() == 'imgview.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'imgview', 'imgview.elf')
+
 
 def add_dev(fs, dir_cache: dict, num_vts: int = 6):
     """Add /dev/tty1../ttyN and /dev/tty -- see include/pureunix/vt.h and

@@ -661,9 +661,133 @@ $(CHOCDOOM_ELF): $(CHOCDOOM_OBJS) $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(B
 		$(CHOCDOOM_OBJS) \
 		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
 
+# zlib 1.3.2 (vendored upstream source under third_party/zlib/ -- see that
+# directory's README.md). Same "vendor upstream source, compile it with our
+# own Makefile rules, no upstream build system" pattern as every other
+# third_party port here -- zlib's own ./configure only ever regenerates a
+# Makefile and (redundantly) zconf.h from zconf.h.in, and the release
+# tarball already ships both pre-generated identically (diff zconf.h
+# zconf.h.in is empty), so unlike TCC/Lua/SQLite there isn't even a
+# configure-generated artifact being stood in for here.
+#
+# -DHAVE_UNISTD_H=1: zconf.h only defines Z_HAVE_UNISTD_H (which gzlib.c/
+# gzread.c/gzwrite.c need for their real read()/write()/close()/lseek()
+# calls) from a real ./configure's HAVE_UNISTD_H substitution, or a couple
+# of hardcoded compiler checks (Watcom, DJGPP) that don't apply to this
+# target -- the same "declare a real, true platform capability via -D
+# instead of patching source" reasoning as SQLite's -DHAVE_USLEEP=1 above
+# (newlib provides a real, complete POSIX unistd.h here).
+ZLIB_SRC := third_party/zlib/zlib-1.3.2
+ZLIB_SRCS := adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c \
+	gzread.c gzwrite.c infback.c inffast.c inflate.c inftrees.c trees.c \
+	uncompr.c zutil.c
+ZLIB_OBJS := $(addprefix $(BUILD)/user/zlib/,$(ZLIB_SRCS:.c=.o))
+ZLIB_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -DHAVE_UNISTD_H=1 -I$(ZLIB_SRC)
+
+$(BUILD)/user/zlib/%.o: $(ZLIB_SRC)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ZLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(ZLIB_OBJS:.o=.d)
+
+ZLIB_LIB := $(BUILD)/user/zlib/libz.a
+
+$(ZLIB_LIB): $(ZLIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(ZLIB_OBJS)
+
+# libpng 1.6.58 (vendored upstream source under third_party/libpng/ -- see
+# that directory's README.md), built directly against $(ZLIB_SRC)/$(ZLIB_LIB)
+# above -- same pattern again. libpng's own ./configure mainly exists to
+# generate pnglibconf.h from scripts/pnglibconf.dfa via awk; upstream ships
+# a ready-made stand-in for exactly this "no configure" situation --
+# scripts/pnglibconf.h.prebuilt, "the configuration used to build the
+# distributed dll and lib files" per libpng's own INSTALL doc (the same
+# "official escape hatch for skipping configure", not a project invention,
+# that ncurses/tcc/htop each use their own version of) -- copied into the
+# build tree below as a real generated build artifact, never into the
+# vendored source tree itself.
+LIBPNG_SRC := third_party/libpng/libpng-1.6.58
+LIBPNG_BUILD := $(BUILD)/user/libpng
+LIBPNG_SRCS := png.c pngerror.c pngget.c pngmem.c pngpread.c pngread.c \
+	pngrio.c pngrtran.c pngrutil.c pngset.c pngtrans.c pngwio.c pngwrite.c \
+	pngwtran.c pngwutil.c
+LIBPNG_OBJS := $(addprefix $(LIBPNG_BUILD)/,$(LIBPNG_SRCS:.c=.o))
+LIBPNG_CFLAGS := $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(LIBPNG_BUILD) -I$(LIBPNG_SRC) -I$(ZLIB_SRC)
+
+$(LIBPNG_BUILD)/pnglibconf.h: $(LIBPNG_SRC)/scripts/pnglibconf.h.prebuilt
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(LIBPNG_BUILD)/%.o: $(LIBPNG_SRC)/%.c $(LIBPNG_BUILD)/pnglibconf.h
+	@mkdir -p $(dir $@)
+	$(CC) $(LIBPNG_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(LIBPNG_OBJS:.o=.d)
+
+LIBPNG_LIB := $(LIBPNG_BUILD)/libpng16.a
+
+$(LIBPNG_LIB): $(LIBPNG_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(LIBPNG_OBJS)
+
+# Real zlib/libpng headers + static libs installed onto the EXT2 image at
+# the same /usr/include, /usr/lib TCC_SYSROOT_FILES already populates with
+# newlib's own headers/libc.a (TCC_USR_INCLUDE/TCC_USR_LIB above) -- so both
+# a future third_party/ Makefile-based port (via $(ZLIB_SRC)/$(ZLIB_LIB),
+# $(LIBPNG_SRC)/$(LIBPNG_LIB) directly, the same NCURSES_DIR-style pair this
+# port itself uses) and a bare on-target `tcc foo.c -lpng16 -lz` can compile
+# and link against real zlib/libpng, exactly as docs/imgview.md documents.
+ZLIB_LIBPNG_EXTRA_FILES := \
+	--extra-file $(ZLIB_SRC)/zlib.h:/usr/include/zlib.h \
+	--extra-file $(ZLIB_SRC)/zconf.h:/usr/include/zconf.h \
+	--extra-file $(ZLIB_LIB):/usr/lib/libz.a \
+	--extra-file $(LIBPNG_SRC)/png.h:/usr/include/png.h \
+	--extra-file $(LIBPNG_SRC)/pngconf.h:/usr/include/pngconf.h \
+	--extra-file $(LIBPNG_BUILD)/pnglibconf.h:/usr/include/pnglibconf.h \
+	--extra-file $(LIBPNG_LIB):/usr/lib/libpng16.a
+ZLIB_LIBPNG_EXTRA_DEPS := $(ZLIB_SRC)/zlib.h $(ZLIB_SRC)/zconf.h $(ZLIB_LIB) \
+	$(LIBPNG_SRC)/png.h $(LIBPNG_SRC)/pngconf.h $(LIBPNG_BUILD)/pnglibconf.h $(LIBPNG_LIB)
+
+# imgview: native PNG viewer (user/imgview.c, docs/imgview.md) -- the whole
+# point of porting zlib/libpng above. Links against both static libs plus
+# newlib, exactly like $(NCDEMO_ELF) links against ncurses.
+IMGVIEW_CFLAGS := $(NEWLIB_CFLAGS) -I$(LIBPNG_BUILD) -I$(LIBPNG_SRC) -I$(ZLIB_SRC) -Iuser
+
+$(BUILD)/user/imgview.o: user/imgview.c user/pureunix_gfx.h $(LIBPNG_BUILD)/pnglibconf.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(IMGVIEW_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/imgview.d
+
+IMGVIEW_ELF := $(BUILD)/user/imgview.elf
+
+$(IMGVIEW_ELF): $(BUILD)/user/imgview.o $(LIBPNG_LIB) $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/imgview.o \
+		-Wl,--start-group $(LIBPNG_LIB) $(ZLIB_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+
+# ziptest: standalone zlib compress()/uncompress() roundtrip regression
+# check (user/ziptest.c, docs/zlib-port.md) -- a regression-test binary like
+# systest.elf/opentest.elf, not an end-user command, so no /bin symlink.
+$(BUILD)/user/ziptest.o: user/ziptest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(ZLIB_SRC) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/ziptest.d
+
+ZIPTEST_ELF := $(BUILD)/user/ziptest.elf
+
+$(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/ziptest.o \
+		-Wl,--start-group $(ZLIB_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -731,9 +855,9 @@ DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES)
 
 disk: $(DISK) $(DISK2)
 
@@ -744,9 +868,9 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the
