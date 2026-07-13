@@ -56,7 +56,20 @@
 static bool try_login_shell(const char *path)
 {
     vfs_stat_t st;
-    if (vfs_stat(path, &st) != 0) {
+    int rc = vfs_stat(path, &st);
+    if (rc != 0) {
+        /* Logged unconditionally (not gated behind USB_DEBUG or similar) --
+         * this is the one place a real, silent root-cause (root filesystem
+         * never mounted, /bin/sh genuinely missing, or a disk read that
+         * failed mid-lookup -- e.g. the xHCI/USB-MSD concurrency race fixed
+         * in drivers/xhci.c and drivers/usb_msd.c, which used to make
+         * vfs_stat() fail with no explanation at all when multiple VTs
+         * raced to exec their shell off the same USB-backed root at once --
+         * would otherwise surface as nothing but a silent drop to the
+         * built-in recovery shell, with zero way to tell which of those
+         * three it was. */
+        printf("vt%d: vfs_stat(\"%s\") failed (rc=%d) -- cannot start this shell\n",
+               task_current()->vt_id + 1, path, rc);
         return false;
     }
     char *const argv[] = { (char *)path, NULL };
@@ -76,8 +89,9 @@ static void run_login_shell(void)
     if (strcmp(shell_path, "/bin/puresh") != 0 && try_login_shell("/bin/puresh")) {
         return;
     }
-    printf("warning: could not start a login shell (%s) — falling back to the built-in recovery shell\n",
-           shell_path);
+    printf("vt%d: warning: could not start a login shell (%s) — falling back to the built-in "
+           "recovery shell\n",
+           task_current()->vt_id + 1, shell_path);
     shell_run();
 }
 
@@ -167,12 +181,27 @@ static disk_device_t *find_persistent_root_disk(void)
     int n = 0;
     candidates[n++] = ata_primary_master();
     candidates[n++] = ata_primary_slave();
+    int usb_disks_found = 0;
     for (int i = 0; i < USB_MSD_MAX_DEVICES; ++i) {
         disk_device_t *usb_disk = usb_msd_disk(i);
         if (usb_disk) {
             candidates[n++] = usb_disk;
+            ++usb_disks_found;
         }
     }
+    /* A real Pavilion-class board has no legacy PATA/IDE controller at all,
+     * so ata_primary_master/slave() are expected to be !present there --
+     * a real bare-metal USB-stick boot depends entirely on at least one
+     * USB Mass Storage device having attached successfully (drivers/
+     * usb_msd.c, via xhci_enumerate() earlier in kernel_main()). Called out
+     * explicitly here so "no root found" on real hardware is immediately
+     * distinguishable as "xHCI/USB-MSD never saw a disk at all" (look at
+     * the "usb_msd:"/"xhci:" lines above this) vs. "saw a disk, but its MBR/
+     * EXT2 contents didn't check out" (see mbr.c's/ext2_mount()'s own
+     * per-candidate diagnostics below). */
+    printf("find_persistent_root_disk: %d USB Mass Storage device(s) attached, checking %d disk "
+           "candidate(s) total for a persistent EXT2 root\n",
+           usb_disks_found, n);
 
     for (int i = 0; i < n; ++i) {
         uint32_t start_lba, sector_count;
@@ -323,6 +352,21 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
             } else {
                 printf("EXT2 mount failed on %s; root filesystem unavailable.\n", disk2->name);
             }
+        } else {
+            /* No ramdisk module, no persistent root disk, and no
+             * unpartitioned ata1 either -- every root-mount candidate this
+             * kernel knows about has been exhausted. Logged explicitly so
+             * this doesn't look identical to the ext2_mount()-failed cases
+             * above: there, a disk was found but rejected; here, nothing
+             * was ever found to try mounting at all (see this function's
+             * "find_persistent_root_disk:"/"usb_msd:"/"xhci:" lines above
+             * for which stage actually came up empty). Every VT session's
+             * shell will now vfs_stat("/bin/sh") against an unmounted root
+             * and fall back to the built-in recovery shell -- expected,
+             * not itself a bug, given no root filesystem exists to boot. */
+            printf("No root filesystem candidate found at all (no GRUB ramdisk module, no "
+                   "persistent USB/ATA disk with a bootable EXT2 root, no unpartitioned ata1) -- "
+                   "root filesystem unavailable.\n");
         }
     }
 

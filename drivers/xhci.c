@@ -4,9 +4,11 @@
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 #include <pureunix/hid.h>
+#include <pureunix/task.h>
 #include <pureunix/usb.h>
 #include <pureunix/usb_msd.h>
 #include <pureunix/vmm.h>
+#include <pureunix/wait.h>
 #include <pureunix/xhci.h>
 
 static xhci_controller_t ctrl;
@@ -45,6 +47,63 @@ typedef struct xhci_pending_bulk_xfer {
 } xhci_pending_bulk_xfer_t;
 
 static xhci_pending_bulk_xfer_t pending_bulk_xfer;
+
+/* bulk_transfer() (below) waits for pending_bulk_xfer's completion via a
+ * deliberately *yielding* pit_sleep() loop, not the unbounded arch_halt()
+ * idiom control_transfer()'s wait_transfer_irq() uses (see
+ * XHCI_BULK_TRANSFER_TIMEOUT_MS's comment for why: an unbounded wait would
+ * hang the whole kernel forever on a yanked/unresponsive storage device).
+ * Because it yields, a second task calling bulk_transfer() concurrently --
+ * e.g. every VT's login-shell session execing /bin/sh off the same USB-MSD-
+ * backed root filesystem right after boot, see kernel/main.c's vt_session_
+ * main() -- can and does resume mid-wait and stomp this single global
+ * pending_bulk_xfer slot out from under the first caller. On real hardware,
+ * where a bulk transfer's DMA completion takes real, non-zero time, this
+ * window is wide open every single boot; under QEMU's usb-storage backend,
+ * which completes each transfer near-instantly, the window is effectively
+ * never hit. This is exactly the "xhci: event: Transfer Event unmatched"
+ * symptom and the real root cause behind a real Pavilion falling back to
+ * the emergency shell while the identical image boots fine under QEMU --
+ * every VT's shell exec corrupts every other's disk read at once. Fixed by
+ * making the whole submit-then-wait sequence atomic across callers: only
+ * one task may be inside bulk_transfer() at a time, everyone else queues on
+ * this lock (itself a real, yielding wait -- other unrelated tasks, e.g. a
+ * different VT's keyboard input, keep running normally) rather than racing
+ * the shared state. Matches Bulk-Only Transport's own inherently-serial
+ * nature (CBW, then data, then CSW, never overlapped) anyway. */
+typedef struct xhci_xfer_lock {
+    bool busy;
+    wait_queue_t wq;
+} xhci_xfer_lock_t;
+
+static xhci_xfer_lock_t bulk_xfer_lock;
+
+static bool xfer_lock_is_free(void *ctx)
+{
+    return !((xhci_xfer_lock_t *)ctx)->busy;
+}
+
+static void xfer_lock_acquire(xhci_xfer_lock_t *lock)
+{
+    for (;;) {
+        uint32_t flags = arch_save_and_disable_interrupts();
+        if (!lock->busy) {
+            lock->busy = true;
+            arch_restore_interrupts(flags);
+            return;
+        }
+        arch_restore_interrupts(flags);
+        wait_queue_sleep(&lock->wq, xfer_lock_is_free, lock);
+    }
+}
+
+static void xfer_lock_release(xhci_xfer_lock_t *lock)
+{
+    uint32_t flags = arch_save_and_disable_interrupts();
+    lock->busy = false;
+    arch_restore_interrupts(flags);
+    wait_queue_wake_one(&lock->wq);
+}
 
 /* One entry per (slot, DCI) with a repeating interrupt-IN transfer armed
  * via submit_interrupt_transfer() -- unlike pending_cmd/pending_xfer (each
@@ -1284,6 +1343,12 @@ static bool bulk_transfer(uint32_t slot_id, uint8_t endpoint_address, void *buf,
         return false;
     }
 
+    /* See bulk_xfer_lock's own comment (top of file) -- this makes the
+     * whole submit-then-wait sequence below atomic across every caller,
+     * since pending_bulk_xfer is a single global slot and the wait below
+     * genuinely yields to other tasks. */
+    xfer_lock_acquire(&bulk_xfer_lock);
+
     xhci_ring_t *ring = &ctrl.slots[slot_id].rings[dci];
     phys_addr_t buf_phys = (phys_addr_t)(uintptr_t)buf;
     phys_addr_t trb_phys = ring_enqueue(ring, buf_phys, 0, length,
@@ -1308,12 +1373,14 @@ static bool bulk_transfer(uint32_t slot_id, uint8_t endpoint_address, void *buf,
         printf("xhci: bulk transfer timed out waiting for completion (slot %u, ep %02x)\n",
                slot_id, endpoint_address);
         pending_bulk_xfer.trb_phys = 0;
+        xfer_lock_release(&bulk_xfer_lock);
         return false;
     }
 
     uint32_t completion_code = pending_bulk_xfer.completion_code;
     uint32_t residual = pending_bulk_xfer.residual_length;
     pending_bulk_xfer.trb_phys = 0;
+    xfer_lock_release(&bulk_xfer_lock);
     if (out_bytes) {
         *out_bytes = (length >= residual) ? (uint32_t)length - residual : 0U;
     }

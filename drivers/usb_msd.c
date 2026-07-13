@@ -10,7 +10,9 @@
 #include <pureunix/arch.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
+#include <pureunix/task.h>
 #include <pureunix/usb_msd.h>
+#include <pureunix/wait.h>
 
 #define MSD_CBW_SIGNATURE 0x43425355U /* 'USBC', little-endian on the wire */
 #define MSD_CSW_SIGNATURE 0x53425355U /* 'USBS' */
@@ -46,6 +48,53 @@ typedef struct __attribute__((packed)) msd_csw {
 #define MSD_CSW_STATUS_FAILED      1U
 #define MSD_CSW_STATUS_PHASE_ERROR 2U
 
+/* Guards msd_transact()'s entire CBW->[data]->CSW sequence (including its
+ * own bounded retries) so a full logical SCSI command is atomic per device.
+ * Bulk-Only Transport is only sequential (spec sec 5.3: exactly one CBW
+ * outstanding at a time, its CSW always arrives before the next CBW may be
+ * sent) if nothing ever interleaves two commands on the wire -- true for a
+ * single task, but this driver's disk_device_t is shared by every VT's
+ * login-shell session (kernel/main.c), which can all be reading/exec'ing
+ * off the same USB-MSD-backed root filesystem concurrently right after
+ * boot. Without this lock, one task's msd_transact() can send its CBW
+ * while another task's is still mid-command, desyncing the transport (the
+ * device attributes a CSW to the wrong CBW) -- indistinguishable from
+ * silent data corruption on a real drive, and invisible under QEMU's
+ * usb-storage backend, which completes each transfer synchronously enough
+ * that this driver's own pit_sleep()-based bulk_transfer() wait (see
+ * drivers/xhci.c) never actually yields into a second task's command. */
+typedef struct msd_lock {
+    bool busy;
+    wait_queue_t wq;
+} msd_lock_t;
+
+static bool msd_lock_is_free(void *ctx)
+{
+    return !((msd_lock_t *)ctx)->busy;
+}
+
+static void msd_lock_acquire(msd_lock_t *lock)
+{
+    for (;;) {
+        uint32_t flags = arch_save_and_disable_interrupts();
+        if (!lock->busy) {
+            lock->busy = true;
+            arch_restore_interrupts(flags);
+            return;
+        }
+        arch_restore_interrupts(flags);
+        wait_queue_sleep(&lock->wq, msd_lock_is_free, lock);
+    }
+}
+
+static void msd_lock_release(msd_lock_t *lock)
+{
+    uint32_t flags = arch_save_and_disable_interrupts();
+    lock->busy = false;
+    arch_restore_interrupts(flags);
+    wait_queue_wake_one(&lock->wq);
+}
+
 typedef struct msd_device {
     bool present;
     const usb_hc_ops_t *hc;
@@ -54,6 +103,7 @@ typedef struct msd_device {
     uint8_t bulk_in_addr;
     uint8_t bulk_out_addr;
     uint32_t tag;
+    msd_lock_t lock;
     disk_device_t disk;
 } msd_device_t;
 
@@ -111,12 +161,63 @@ static void msd_reset_recovery(msd_device_t *d)
     msd_clear_halt(d, d->bulk_out_addr);
 }
 
+#define MSD_SENSE_KEY_NOT_READY     0x02U
+#define MSD_SENSE_KEY_UNIT_ATTENTION 0x06U
+
+/* REQUEST SENSE (opcode 0x03), fixed-format sense data (18 bytes) -- a raw,
+ * single-shot CBW->data->CSW transaction (no retry, no recursion into
+ * msd_transact_locked()) issued right after a CHECK CONDITION (CSW status
+ * "Failed") to learn *why*. Real SCSI targets -- including real USB flash
+ * controllers, unlike QEMU's usb-storage backend -- commonly answer the
+ * very first command after a reset/power-up with CHECK CONDITION and sense
+ * key UNIT ATTENTION (bus reset occurred), which the initiator is required
+ * to clear by issuing REQUEST SENSE before anything else will succeed; some
+ * also transiently report NOT READY (still spinning up/settling) the same
+ * way. Without ever issuing this, a real drive's UNIT ATTENTION can persist
+ * across every subsequent command, so usb_msd_try_attach()'s own TEST UNIT
+ * READY retry loop would fail all 5 attempts and give up -- invisible under
+ * QEMU, which never asserts CHECK CONDITION for either condition. Returns
+ * the sense key (byte 2, low nibble); ASC/ASCQ (bytes 12/13) are logged but
+ * not otherwise interpreted -- this driver only needs to tell "transient,
+ * retry" apart from "a real error." */
+static uint8_t msd_request_sense_raw(msd_device_t *d)
+{
+    uint8_t cdb[6] = { 0x03, 0, 0, 0, 18, 0 };
+    uint8_t sense[18];
+    memset(sense, 0, sizeof(sense));
+
+    msd_cbw_t cbw;
+    memset(&cbw, 0, sizeof(cbw));
+    cbw.dCBWSignature = MSD_CBW_SIGNATURE;
+    cbw.dCBWTag = ++d->tag;
+    cbw.dCBWDataTransferLength = sizeof(sense);
+    cbw.bmCBWFlags = MSD_CBW_FLAG_DATA_IN;
+    cbw.bCBWLUN = MSD_LUN;
+    cbw.bCBWCBLength = sizeof(cdb);
+    memcpy(cbw.CBWCB, cdb, sizeof(cdb));
+
+    if (!d->hc->bulk_transfer(d->slot_id, d->bulk_out_addr, &cbw, sizeof(cbw), NULL)) {
+        return 0xFFU; /* transport failure -- caller treats as "unknown, don't retry" */
+    }
+    d->hc->bulk_transfer(d->slot_id, d->bulk_in_addr, sense, sizeof(sense), NULL);
+    msd_csw_t csw;
+    d->hc->bulk_transfer(d->slot_id, d->bulk_in_addr, &csw, sizeof(csw), NULL);
+
+    uint8_t sense_key = sense[2] & 0x0FU;
+    printf("usb_msd: slot %u: REQUEST SENSE key=%x asc=%02x ascq=%02x\n", d->slot_id, sense_key,
+           sense[12], sense[13]);
+    return sense_key;
+}
+
 /* One full CBW -> [data stage] -> CSW transaction, bounded-retried on any
- * transport-level failure (a genuine SCSI command failure -- CSW status 1,
- * "Command Failed" -- is returned as false without retrying; that's a real
- * answer from the device, not a desync). */
-static bool msd_transact(msd_device_t *d, const uint8_t *cdb, uint8_t cdb_len, void *data,
-                          uint32_t data_len, bool data_in)
+ * transport-level failure or a transient CHECK CONDITION (UNIT ATTENTION /
+ * NOT READY -- see msd_request_sense_raw()'s comment; a genuine SCSI
+ * command failure otherwise is returned as false without further retrying,
+ * that's a real answer from the device, not a desync). Runs under d->lock
+ * (see msd_transact() below) so the whole thing, retries included, is
+ * atomic with respect to any other task's commands to the same device. */
+static bool msd_transact_locked(msd_device_t *d, const uint8_t *cdb, uint8_t cdb_len, void *data,
+                                 uint32_t data_len, bool data_in)
 {
     for (int attempt = 0; attempt < MSD_MAX_RETRIES; ++attempt) {
         msd_cbw_t cbw;
@@ -162,6 +263,13 @@ static bool msd_transact(msd_device_t *d, const uint8_t *cdb, uint8_t cdb_len, v
             return true;
         }
         if (csw.bCSWStatus == MSD_CSW_STATUS_FAILED) {
+            uint8_t sense_key = msd_request_sense_raw(d);
+            if (sense_key == MSD_SENSE_KEY_UNIT_ATTENTION || sense_key == MSD_SENSE_KEY_NOT_READY) {
+                /* Transient -- REQUEST SENSE above already cleared the
+                 * condition (UNIT ATTENTION) or the device just needs a
+                 * moment longer (NOT READY); retry the same command. */
+                continue;
+            }
             return false; /* a real SCSI-level answer, not a desync -- don't retry */
         }
         printf("usb_msd: slot %u: transport desync (csw_status=%u) -- resetting\n", d->slot_id,
@@ -171,6 +279,15 @@ static bool msd_transact(msd_device_t *d, const uint8_t *cdb, uint8_t cdb_len, v
     printf("usb_msd: slot %u: command failed after %d attempts, giving up\n", d->slot_id,
            MSD_MAX_RETRIES);
     return false;
+}
+
+static bool msd_transact(msd_device_t *d, const uint8_t *cdb, uint8_t cdb_len, void *data,
+                          uint32_t data_len, bool data_in)
+{
+    msd_lock_acquire(&d->lock);
+    bool ok = msd_transact_locked(d, cdb, cdb_len, data, data_len, data_in);
+    msd_lock_release(&d->lock);
+    return ok;
 }
 
 static bool msd_test_unit_ready(msd_device_t *d)
