@@ -80,6 +80,7 @@ enum {
     PU_SYS_MKDIR   = 17,
     PU_SYS_UNLINK  = 18,
     PU_SYS_RMDIR   = 19,
+    PU_SYS_RENAME  = 20,
     PU_SYS_READDIR = 13,
     PU_SYS_IOCTL   = 28,
     PU_SYS_TCGETATTR = 26,
@@ -1114,6 +1115,24 @@ int mkdir(const char *path, mode_t mode)
 int rmdir(const char *path)
 {
     int r = raw_syscall(PU_SYS_RMDIR, (int)path, 0, 0);
+    return r < 0 ? fail(r) : 0;
+}
+
+/* A real PU_SYS_RENAME call, not newlib's own generic rename() fallback
+ * (link() the new name, then unlink() the old one) -- that fallback is
+ * what this target got by default since no newlib-facing rename() was
+ * ever defined here (only libpure.h's lower-level pu_rename(), used by
+ * non-newlib programs like systest/ext2test). It silently "worked" for
+ * plain files, but renaming a *directory* always failed with a
+ * confusing EPERM ("Not owner"): ext2_link() (fs/ext2/write.c) correctly
+ * refuses to hard-link a directory, which is exactly what that fallback
+ * tried to do first. Found via PUFiles' own Rename button on a real
+ * folder -- see docs/pude.md. vfs_rename()/ext2_rename() already
+ * implement a real, atomic, directory-safe rename; this was just never
+ * wired up for any newlib-linked program (pude, PUTerm, BusyBox, ...). */
+int rename(const char *old_path, const char *new_path)
+{
+    int r = raw_syscall(PU_SYS_RENAME, (int)old_path, (int)new_path, 0);
     return r < 0 ? fail(r) : 0;
 }
 

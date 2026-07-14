@@ -93,4 +93,37 @@ static inline void pu_draw_string_centered(SDL_Surface *s, int x, int y, int w, 
     pu_draw_string(s, tx, ty, str, fg, bg);
 }
 
+/* Draws at most as many glyphs as fit within `max_w` pixels starting at
+ * (x0,y0) -- unlike pu_draw_string() (which only clips per-pixel against
+ * the *whole screen surface*, not any narrower rectangle), this is the
+ * primitive anything showing arbitrary-length, caller-controlled text
+ * (a file name, a full path) must use so it can never bleed into a
+ * neighboring window or off the edge of its own client rect. Truncates
+ * with a trailing "..." when the string doesn't fit, so it's visually
+ * obvious the text was cut rather than silently disappearing. */
+static inline void pu_draw_string_clipped(SDL_Surface *s, int x0, int y0, int max_w,
+                                            const char *str, Uint32 fg, Uint32 bg)
+{
+    if (max_w < FONT_CELL_W) {
+        return;
+    }
+    int len = 0;
+    for (const char *p = str; *p; p++) len++;
+    int max_chars = max_w / FONT_CELL_W;
+    if (len <= max_chars) {
+        pu_draw_string(s, x0, y0, str, fg, bg);
+        return;
+    }
+    int shown = max_chars > 3 ? max_chars - 3 : max_chars;
+    int x = x0;
+    for (int i = 0; i < shown; i++) {
+        pu_draw_glyph(s, x, y0, str[i], fg, bg);
+        x += FONT_CELL_W;
+    }
+    for (int i = shown; i < max_chars; i++) {
+        pu_draw_glyph(s, x, y0, '.', fg, bg);
+        x += FONT_CELL_W;
+    }
+}
+
 #endif

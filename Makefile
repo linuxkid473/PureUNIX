@@ -590,7 +590,37 @@ $(BUILD)/user/pude_calc.o: user/pude_calc.c user/pude_calc.h user/pude_app.h use
 
 DEPS += $(BUILD)/user/pude_calc.d
 
-$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_term.h user/pude_calc.h
+# pude_launch: the smallest general mechanism for a pude app to hand the
+# whole screen to a real external program (e.g. PUFiles opening a .png
+# with imgview) and cleanly resume afterward -- see pude_launch.c's own
+# comment for why blocking the WM's entire event loop is correct here, not
+# a shortcut. Plain fork()/execve()/waitpid(), no SDL dependency at all.
+$(BUILD)/user/pude_launch.o: user/pude_launch.c user/pude_launch.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_launch.d
+
+# pude_spawn: a tiny one-slot mailbox letting any pude app ask the WM to
+# open a new window of a given app class (optionally preloaded with a
+# startup command) -- see pude_spawn.h.
+$(BUILD)/user/pude_spawn.o: user/pude_spawn.c user/pude_spawn.h user/pude_app.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_spawn.d
+
+# pude_files: PUFiles, a real ring-3 graphical file manager (user/
+# pude_files.c/.h, docs/pude.md) -- browses PureUNIX's real filesystem via
+# ordinary opendir()/readdir()/stat()/mkdir()/rmdir()/unlink()/rename(),
+# plugged into the WM through the same app_class_t PUTerm/Calculator use.
+$(BUILD)/user/pude_files.o: user/pude_files.c user/pude_files.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_launch.h user/pude_spawn.h user/pude_term.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_files.d
+
+$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
 
@@ -598,10 +628,10 @@ DEPS += $(BUILD)/user/pude.d
 
 PUDE_ELF := $(BUILD)/user/pude.elf
 
-$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
-		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_font.o \
+		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_font.o \
 		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
 
 # Chocolate Doom 3.1.1 (vendored upstream source under

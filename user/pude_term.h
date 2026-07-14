@@ -95,4 +95,13 @@ void term_resize(term_t *t, int rows, int cols);
  * of all three (its own pty, its own shell process, its own term_t). */
 extern const app_class_t puterm_app_class;
 
+/* Queues a command to be typed into the *next* PUTerm window's shell the
+ * instant it's created (as if the user had typed it themselves, followed
+ * by Enter) -- e.g. PUFiles opening a text file spawns a PUTerm window
+ * and calls this with "neatvi '/path/to/file'" first (see pude_spawn.h,
+ * docs/pude.md's "Opening files" section). Consumed and cleared by the
+ * very next puterm_create() call; leave unset (or pass NULL/"") for an
+ * ordinary interactive shell. */
+void puterm_set_startup_command(const char *command);
+
 #endif

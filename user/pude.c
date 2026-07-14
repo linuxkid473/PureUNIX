@@ -24,7 +24,9 @@
 
 #include "pude_app.h"
 #include "pude_calc.h"
+#include "pude_files.h"
 #include "pude_gfx.h"
+#include "pude_spawn.h"
 #include "pude_term.h"
 
 /* ---- Chrome layout ------------------------------------------------------- */
@@ -64,6 +66,7 @@ static int spawn_count;
 static const app_class_t *const g_apps[] = {
     &puterm_app_class,
     &calc_app_class,
+    &pufiles_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 
@@ -460,6 +463,22 @@ int main(int argc, char *argv[])
             default:
                 break;
             }
+        }
+
+        /* Drains pude_spawn.h's one-slot mailbox -- e.g. PUFiles asking
+         * for a new PUTerm window preloaded with an editor command when
+         * the user opens a plain-text file (docs/pude.md's "Opening
+         * files" section). Only user/pude.c's spawn_window() may
+         * allocate a window-pool slot, so this is the one place any such
+         * request actually gets acted on. */
+        const app_class_t *spawn_cls = NULL;
+        char spawn_cmd[PUDE_SPAWN_CMD_MAX];
+        if (pude_take_spawn_request(&spawn_cls, spawn_cmd, sizeof(spawn_cmd))) {
+            if (spawn_cls == &puterm_app_class) {
+                puterm_set_startup_command(spawn_cmd);
+            }
+            spawn_window(spawn_cls, screen_w, screen_h);
+            had_event = true;
         }
 
         bool need_redraw = had_event || (drag_mode != DRAG_NONE);

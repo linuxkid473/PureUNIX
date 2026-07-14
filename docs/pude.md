@@ -17,18 +17,21 @@ same as `tty`/`ping`/`neatvi`).
     initially NO windows open at all)
 ```
 
-Two apps are registered today:
+Three apps are registered today:
 
 - **PUTerm** — a real terminal emulator (user/pude_term.c/.h) backed by a
   real PTY (include/pureunix/pty.h) and a real, forked+exec'd BusyBox ash.
 - **Calculator** — a real ring-3 GUI calculator (user/pude_calc.c/.h),
   pure userspace arithmetic, no kernel involvement.
+- **PUFiles** — a real ring-3 graphical file manager (user/pude_files.c/.h)
+  backed by PureUNIX's actual filesystem (see this document's "PUFiles"
+  section below).
 
-Both plug into the same generic window/app abstraction
-(`user/pude_app.h`) — `user/pude.c` itself contains **no PUTerm or
-Calculator logic whatsoever**, only window list management, chrome
-rendering/hit-testing, the launcher, and the top-level SDL event loop.
-Multiple windows can be open at once, of the same or different apps
+All three plug into the same generic window/app abstraction
+(`user/pude_app.h`) — `user/pude.c` itself contains **no PUTerm,
+Calculator, or PUFiles logic whatsoever**, only window list management,
+chrome rendering/hit-testing, the launcher, and the top-level SDL event
+loop. Multiple windows can be open at once, of the same or different apps
 (e.g. two PUTerm windows and a Calculator simultaneously), each fully
 independent.
 
@@ -67,11 +70,12 @@ Calculator) simply leaves those NULL. `pude_window_t` is the WM-owned
 per-instance record: whole-window geometry (chrome included) plus the
 app's own opaque `state` pointer returned by `create()`.
 
-**Adding a third app** means: write a `.c`/`.h` implementing this vtable
+**Adding another app** means: write a `.c`/`.h` implementing this vtable
 (see `user/pude_calc.c` for the smallest real example), add a build rule
-to the Makefile (pattern-matches `pude_term.o`/`pude_calc.o`'s existing
-rules exactly), link its `.o` into `PUDE_ELF`, and add one line to
-`user/pude.c`'s `g_apps[]` registry. Nothing else in the WM changes.
+to the Makefile (pattern-matches `pude_term.o`/`pude_calc.o`/
+`pude_files.o`'s existing rules exactly), link its `.o` into `PUDE_ELF`,
+and add one line to `user/pude.c`'s `g_apps[]` registry. Nothing else in
+the WM changes.
 
 ## Window manager: `user/pude.c`
 
@@ -141,6 +145,99 @@ newlib translation unit (`include/pureunix/font.h` transitively pulls in
 `include/pureunix/types.h`, whose kernel-style `uid_t`/`gid_t`/...
 typedefs collide with newlib's own `<sys/types.h>`), so `pude_gfx.h`
 forward-declares just the narrow piece it needs instead.
+
+Also has `pu_draw_string_clipped(s, x0, y0, max_w, str, fg, bg)` — draws
+at most as many glyphs as fit within `max_w` pixels, truncating with a
+trailing `"..."` if the string doesn't fit. `pu_draw_string`/
+`pu_draw_string_centered` only clip per-pixel against the *whole screen
+surface* (`pu_put_pixel`'s own bounds check), not any narrower rectangle
+— fine for PUTerm (bounded by its own cell grid) and Calculator (short,
+fixed button labels), but not for PUFiles, which draws arbitrary-length,
+filesystem-controlled text (file names, full paths) that must never
+bleed past its own window's edge into a neighboring window or the
+desktop. Added while building PUFiles; `pu_button_draw` (below) uses it
+too, for the same reason.
+
+## Shared widgets: `user/pude_widgets.h`
+
+Header-only, same convention as `pude_gfx.h`, added while building
+PUFiles once it became clear more than one app needed the same small
+pieces:
+
+- `pu_scancode_to_ascii(sc, mods)` — plain scancode→character mapping (no
+  escape sequences, unlike PUTerm's own terminal byte encoder) for typing
+  into a text field. PUTerm's `encode_key()` now calls this too instead
+  of keeping its own private copy of the same lookup table.
+- `pu_button_t` / `pu_button_hit()` / `pu_button_draw()` — a labeled
+  rectangle: hit-testing and drawing, no state of its own. Used by
+  PUFiles' toolbar and its New Folder/Rename/Delete dialogs.
+- `pu_textinput_t` / `pu_textinput_set/putc/backspace/draw()` — a
+  single-line text field that only appends/erases at the end (no
+  mid-string cursor placement — every current caller only ever needs to
+  type or correct a short name). Used by PUFiles' New Folder/Rename
+  dialogs.
+- `pu_list_visible_rows()` / `pu_list_row_at()` — trivial scrollable-list
+  arithmetic (how many rows fit, which row a click lands on) that owns no
+  item data itself, since every real caller's row content differs
+  completely.
+
+Deliberately not a full GUI toolkit: no layout engine, no widget tree, no
+event dispatch of its own — just the handful of pieces that were about to
+be duplicated a second time. Add more only when a third real app needs
+the same thing again.
+
+## Launching a foreground program: `user/pude_launch.c`/`.h`
+
+Some files PUFiles opens (see below) need a real external *fullscreen*
+program, not another chrome-decorated window — reusing the existing
+native PNG viewer, `imgview` (docs/imgview.md), rather than duplicating
+its libpng decoding inside PUFiles. `imgview` itself calls
+`pu_set_graphics_mode(1)` and draws straight to the hardware framebuffer
+via `pu_fb_mmap()`/`pu_fb_blit()`, and reads keyboard/mouse input directly
+via `pu_input_poll()` — exactly like `pude` itself does through SDL2.
+Naively `fork()`+`execve()`ing it from inside a PUFiles window while
+`pude`'s own main loop kept running would race it for that same input
+queue (SDL's `PUREUNIX_PumpEvents()` calls the identical `pu_input_poll()`
+every frame) and periodically paint `pude`'s own stale desktop surface
+right over imgview's freshly rendered frame.
+
+`pude_launch_foreground(path, argv)` is the smallest correct fix:
+`fork()`s, `execve()`s the target, and then **blocks the entire calling
+process** in a real `waitpid()` until the child exits — no `SDL_PollEvent`
+calls happen at all while it runs, so neither race is possible. This
+costs nothing extra: a fullscreen program legitimately owns the whole
+display until it exits, so there's nothing useful left for any other
+`pude` window to be doing on screen in the meantime anyway. It also needs
+no new kernel mechanism — `kernel/vt.c`'s `graphics_owner_stack` (added
+for Chocolate Doom, see this document's own history) already handles a
+child pushing a nested `SYS_SET_GRAPHICS_MODE(1)` and popping back to the
+parent's ownership on exit; the only actual gap was pude's own *process*
+still polling input/repainting during that window, which blocking closes.
+After the child exits, control returns to whatever `on_mouse_down`/
+`on_key` callback made the call, already inside `pude.c`'s own per-frame
+event handling, so the very next iteration's `need_redraw` naturally
+repaints the whole desktop fresh.
+
+## Cross-app window spawning: `user/pude_spawn.h`/`.c`
+
+A tiny one-slot mailbox letting an app ask the WM to open a *new window*
+of a different app class — e.g. PUFiles asking for a fresh PUTerm window
+preloaded with an editor command. Only `user/pude.c`'s own
+`spawn_window()` may allocate a window-pool slot/z-order entry, so an app
+can't do this directly; `pude_request_spawn(cls, startup_command)` queues
+a request, and `pude.c`'s main loop drains it once per frame via
+`pude_take_spawn_request()`, calling `puterm_set_startup_command()` first
+if the target is PUTerm. Real shared mutable state across two
+translation units, so (unlike `pude_gfx.h`/`pude_widgets.h`) it needs an
+actual `.c` file, not a header-only `static`.
+
+`puterm_set_startup_command(cmd)` (`user/pude_term.h`) queues a command
+to be typed into the *next* PUTerm window's shell the instant it's
+created, exactly as if the user had typed it themselves — consumed and
+cleared by that window's own `puterm_create()`. This is genuinely just
+"type ahead into a fresh pty", nothing PUTerm-specific about the
+mechanism: `puterm_create()` writes `cmd + "\n"` into the master fd right
+after forking the shell, before the WM ever calls `render()` on it.
 
 ## PUTerm: a real terminal emulator, not a snapshot viewer
 
@@ -213,6 +310,111 @@ Division by zero sets an error state (display shows `Error`); any button
 other than `C` pressed while in that state clears it first, like a real
 calculator.
 
+## PUFiles: a real graphical file manager
+
+`user/pude_files.c`/`.h` is a real ring-3 file manager backed entirely by
+PureUNIX's actual VFS/EXT2/FAT16 filesystem — every directory listing,
+navigation, create/rename/delete operation goes through ordinary newlib
+calls (`opendir`/`readdir`/`closedir`/`stat`/`mkdir`/`rmdir`/`unlink`/
+`rename`, `user/newlib_syscalls.c`) exactly as any real userspace program
+would. There is no mock directory tree, hardcoded listing, or kernel-side
+GUI logic anywhere in it. Starts at `/`.
+
+**Layout** (top to bottom): a path bar showing the current directory, a
+toolbar (Up / New Folder / Rename / Delete / Refresh — Up/Rename/Delete
+gray themselves out when meaningless, e.g. Rename with nothing selected),
+a scrollable entry list, and a status/error bar. All four regions and the
+button grid recompute from the window's *current* client size on every
+`render()`/`on_resize()`, the same "never stretch a fixed-size rendering"
+rule Calculator's button grid follows.
+
+**Listing a directory** (`pf_load_dir()`): one `opendir()`/`readdir()`
+loop per navigation, skipping `.` always and `..` only at `/` (nothing
+above root to navigate to). `readdir()`'s own `d_type` (DT_DIR/DT_REG/
+DT_LNK) is enough to tell files from directories for free; a `stat()` per
+non-directory entry additionally gets its real size, and a `stat()` (not
+`lstat()`) per symlink decides whether it *behaves* like a directory for
+navigation purposes (a broken link just stays a plain, non-navigable
+entry — opening it later reports that real failure). Entries sort
+directories-first (`..` always pinned above everything else), then
+case-insensitively alphabetical within each group — a `qsort()` over the
+one comparator `pf_compare()`, not a stable/insertion-order listing.
+
+**Navigation**: double-click or Enter opens the selected entry; Backspace
+or the Up button goes to the parent (`..`'s own row does the same via
+double-click/Enter). Up/Down/PageUp/PageDown/Home/End move the selection
+and keep it scrolled into view (`pf_ensure_visible()`); there is no mouse
+wheel or scrollbar-thumb drag on this platform at all (`pu_input_event_t`
+has no scroll event, and `app_class_t` has no mouse-motion callback for a
+drag-to-scroll gesture), so keyboard scrolling plus letting a newly
+created/renamed entry auto-scroll into view is the whole scrolling story
+in this first version.
+
+**Opening a file** (`pf_open_entry()`) is one small, general dispatch,
+not per-extension special casing sprinkled around:
+- a directory navigates in-place (or up, for `..`);
+- a `.png` (case-insensitive) hands the whole screen to the real,
+  unmodified `imgview` via `pude_launch_foreground()` — see that
+  section above; no PNG decoding duplicated here;
+- a file with **any** execute permission bit set is refused outright
+  (`"refusing to run an executable file"`, shown in the status bar) —
+  selecting a file must never execute it, full stop;
+- anything else is assumed to be plain text and opened with `neatvi` in a
+  brand-new PUTerm window (`pude_request_spawn(&puterm_app_class, cmd)`,
+  the path single-quote-escaped for the shell) — covers `.txt`/`.md`/
+  `.c`/`.h`/`.lua`/anything else that isn't flagged executable, reusing
+  existing PureUNIX software rather than building a text editor into
+  PUFiles itself.
+
+**Create/rename/delete** all go through a small, reusable modal built
+from `pude_widgets.h`'s button/text-input primitives (drawn centered over
+the window, not a separate WM-level dialog concept):
+- **New Folder** / **Rename** open a text-input dialog (pre-filled with
+  the current name for Rename); OK calls `mkdir()`/`rename()` and
+  re-selects the created/renamed entry; Cancel/Escape aborts with no
+  filesystem change.
+- **Delete** always shows a Cancel/Delete confirmation dialog first
+  (`"Delete 'name'? This cannot be undone."`) — no direct delete path
+  exists. A regular file calls `unlink()`; a directory calls `rmdir()`,
+  which is **not** recursive in this first version — deleting a
+  non-empty directory correctly fails with a real `ENOTEMPTY`
+  (`fs/ext2/write.c` already enforces this), shown in red in the status
+  bar exactly like any other error, not silently ignored or only logged
+  to the serial console.
+- Every operation's real result — success or a real `errno` via
+  `strerror()` (permission denied, path too long, name too long, no such
+  file, directory not empty, ...) — is shown in that same in-window
+  status bar, never only printed to the serial console.
+
+All name/path buffers are sized to this kernel's own real limits
+(`PUREUNIX_MAX_NAME` = 64, `PUREUNIX_MAX_PATH` = 256, `include/pureunix/
+config.h`) and every path built with `snprintf()` checked for truncation
+before use; every drawn string (path bar, list rows, dialog text) goes
+through `pu_draw_string_clipped()` (see `pude_gfx.h` above), so a name or
+path longer than the window is wide is truncated with `"..."` on screen
+rather than overflowing into a neighboring window — a too-long name is
+still rejected outright by `mkdir()`/`rename()` with a real
+`ENAMETOOLONG`.
+
+### A real bug this app found: newlib's `rename()` didn't exist
+
+Renaming a **directory** through PUFiles' own Rename dialog initially
+failed with a confusing `EPERM` ("Not owner"). The real cause: no
+newlib-facing `rename()` had ever been defined in `user/
+newlib_syscalls.c` (only the lower-level `pu_rename()` in `libpure.h`,
+used by non-newlib programs like `systest`/`ext2test`) — any newlib-linked
+program calling the standard POSIX `rename()` silently fell back to
+newlib's own generic implementation, `link()` the new name then
+`unlink()` the old one. That "worked" for plain files, but `ext2_link()`
+(`fs/ext2/write.c`) correctly refuses to hard-link a directory, which is
+exactly what that fallback tried first. Fixed with the smallest correct
+change: a real `rename()` wrapper in `user/newlib_syscalls.c` calling
+`PU_SYS_RENAME` directly, exactly like the existing `unlink()`/`mkdir()`/
+`rmdir()` wrappers already do — `vfs_rename()`/`ext2_rename()`
+(`fs/vfs.c`, `fs/ext2/write.c`) already implement a real, atomic,
+directory-safe rename; it just had never been reachable from any
+newlib-linked program (`pude`, PUTerm's shell, BusyBox, ...) before this.
+
 ## Testing
 
 `tools/test-pude.py` (rewritten for the multi-window desktop, same QMP
@@ -261,6 +463,32 @@ Exercises, all screenshot-verified against real rendered pixels:
 desktop rework didn't regress any physical-VT-based behavior it shares
 code with (font rendering, pty/job-control plumbing, etc).
 
+`tools/test-pufiles.py` (new, same QMP/HMP injection technique as
+`tools/test-pude.py`, plus `tools/test-imgview.py`'s "extract the real
+`make -n -W` recipe" trick for building a scratch disk with one added PNG
+fixture at `/pngtest.png`): boots the scratch disk, captures a real
+`ls -la /` from the outer ash shell as ground truth for exactly where
+each entry sorts in PUFiles' own listing (so the script never has to
+guess a row's on-screen position), then drives PUFiles end to end —
+launching it from the launcher; opening a real multi-file directory
+(`/testdir`) and a real text file (`alpha.txt`) into a fresh PUTerm
+running `neatvi`; Up-button parent navigation; `mkdir()`-ing a real
+folder and opening it with a real mouse double-click (correctly showing
+it as empty); creating 16 more real subfolders to force list overflow
+and scrolling it back to the top via the keyboard; drag-resizing the
+window and confirming more rows become visible; renaming a real folder
+(the operation that caught the real `rename()` bug above); deleting a
+real empty folder after a real confirmation dialog; confirming a
+non-empty folder's deletion visibly fails with `ENOTEMPTY`; opening a
+real `.png` (fullscreen `imgview` takeover, then a clean, uncorrupted
+return to the desktop); opening Calculator alongside PUFiles; closing
+and reopening PUFiles from the launcher; and finally confirming the
+renamed folder is visible both from the real outer ash shell in the same
+boot and from a **second, fully independent QEMU process** booting the
+identical on-disk image (real reboot persistence, not merely "the same
+process kept running"). All screenshot-verified; the two ash checks are
+also asserted against the real serial transcript.
+
 ## Known limitations
 
 - **Only the bottom-right corner resizes** — no edge/other-corner grips,
@@ -284,3 +512,21 @@ code with (font rendering, pty/job-control plumbing, etc).
   this app was built for only required mouse-driven buttons); its
   `on_key` is NULL. A future revision wanting numeric-keypad entry would
   just implement that callback.
+- **PUFiles has no scrollbar or mouse-wheel scrolling** — this platform's
+  input model has neither (`pu_input_event_t` has no scroll event, and
+  `app_class_t` has no mouse-motion callback for a drag-to-scroll
+  gesture); Up/Down/PageUp/PageDown/Home/End on the keyboard are the only
+  way to scroll a long listing.
+- **PUFiles' delete is never recursive** — `rmdir()` on a non-empty
+  directory correctly fails visibly (`ENOTEMPTY`) rather than deleting
+  its contents; deleting a whole tree needs deleting its contents first,
+  by design for this first version.
+- **PUFiles' text-input widget has no mid-string cursor** — typing only
+  appends, Backspace only removes the last character (`pude_widgets.h`'s
+  `pu_textinput_t`); enough for naming/renaming a file, not a general
+  text-editing widget.
+- **A `pude_launch_foreground()` call (opening a `.png`) blocks the whole
+  desktop**, not just the calling window — every other open window stops
+  updating until the external program exits. This is intentional (see
+  this document's own section on it above), not a bug: a fullscreen
+  program legitimately owns the entire display until it exits.

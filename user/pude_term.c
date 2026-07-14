@@ -5,6 +5,7 @@
  * SDL2 renderer. See pude_term.h and docs/pude.md. */
 #include "pude_term.h"
 #include "pude_gfx.h"
+#include "pude_widgets.h"
 #include "pureunix_pty.h"
 #include <fcntl.h>
 #include <signal.h>
@@ -506,34 +507,6 @@ static uint32_t color_for(unsigned char idx, uint32_t def)
  * physical console, so ncurses/vi/htop running under PUTerm see identical
  * input to what they'd see on a real VT. */
 
-static const struct { SDL_Scancode sc; char lo, hi; } printable_keys[] = {
-    { SDL_SCANCODE_A, 'a', 'A' }, { SDL_SCANCODE_B, 'b', 'B' },
-    { SDL_SCANCODE_C, 'c', 'C' }, { SDL_SCANCODE_D, 'd', 'D' },
-    { SDL_SCANCODE_E, 'e', 'E' }, { SDL_SCANCODE_F, 'f', 'F' },
-    { SDL_SCANCODE_G, 'g', 'G' }, { SDL_SCANCODE_H, 'h', 'H' },
-    { SDL_SCANCODE_I, 'i', 'I' }, { SDL_SCANCODE_J, 'j', 'J' },
-    { SDL_SCANCODE_K, 'k', 'K' }, { SDL_SCANCODE_L, 'l', 'L' },
-    { SDL_SCANCODE_M, 'm', 'M' }, { SDL_SCANCODE_N, 'n', 'N' },
-    { SDL_SCANCODE_O, 'o', 'O' }, { SDL_SCANCODE_P, 'p', 'P' },
-    { SDL_SCANCODE_Q, 'q', 'Q' }, { SDL_SCANCODE_R, 'r', 'R' },
-    { SDL_SCANCODE_S, 's', 'S' }, { SDL_SCANCODE_T, 't', 'T' },
-    { SDL_SCANCODE_U, 'u', 'U' }, { SDL_SCANCODE_V, 'v', 'V' },
-    { SDL_SCANCODE_W, 'w', 'W' }, { SDL_SCANCODE_X, 'x', 'X' },
-    { SDL_SCANCODE_Y, 'y', 'Y' }, { SDL_SCANCODE_Z, 'z', 'Z' },
-    { SDL_SCANCODE_1, '1', '!' }, { SDL_SCANCODE_2, '2', '@' },
-    { SDL_SCANCODE_3, '3', '#' }, { SDL_SCANCODE_4, '4', '$' },
-    { SDL_SCANCODE_5, '5', '%' }, { SDL_SCANCODE_6, '6', '^' },
-    { SDL_SCANCODE_7, '7', '&' }, { SDL_SCANCODE_8, '8', '*' },
-    { SDL_SCANCODE_9, '9', '(' }, { SDL_SCANCODE_0, '0', ')' },
-    { SDL_SCANCODE_MINUS, '-', '_' }, { SDL_SCANCODE_EQUALS, '=', '+' },
-    { SDL_SCANCODE_LEFTBRACKET, '[', '{' }, { SDL_SCANCODE_RIGHTBRACKET, ']', '}' },
-    { SDL_SCANCODE_BACKSLASH, '\\', '|' }, { SDL_SCANCODE_SEMICOLON, ';', ':' },
-    { SDL_SCANCODE_APOSTROPHE, '\'', '"' }, { SDL_SCANCODE_GRAVE, '`', '~' },
-    { SDL_SCANCODE_COMMA, ',', '<' }, { SDL_SCANCODE_PERIOD, '.', '>' },
-    { SDL_SCANCODE_SLASH, '/', '?' }, { SDL_SCANCODE_SPACE, ' ', ' ' },
-};
-#define NUM_PRINTABLE (int)(sizeof(printable_keys) / sizeof(printable_keys[0]))
-
 /* Returns the number of bytes written into `out` (0 if this scancode
  * produces nothing PUTerm forwards -- e.g. a bare modifier key). */
 static int encode_key(SDL_Scancode sc, key_mods_t mods, char *out)
@@ -576,11 +549,8 @@ static int encode_key(SDL_Scancode sc, key_mods_t mods, char *out)
     if (sc == SDL_SCANCODE_F11) { memcpy(out, "\033[23~", 5); return 5; }
     if (sc == SDL_SCANCODE_F12) { memcpy(out, "\033[24~", 5); return 5; }
 
-    for (int i = 0; i < NUM_PRINTABLE; i++) {
-        if (printable_keys[i].sc != sc) {
-            continue;
-        }
-        char base = mods.shift ? printable_keys[i].hi : printable_keys[i].lo;
+    char base = pu_scancode_to_ascii(sc, mods);
+    if (base != 0) {
         if (mods.ctrl && base >= 'a' && base <= 'z') {
             out[0] = (char)(base - 'a' + 1); /* Ctrl+letter -> control byte */
         } else if (mods.ctrl && base >= 'A' && base <= 'Z') {
@@ -653,6 +623,25 @@ typedef struct {
     pid_t child;
     bool child_alive;
 } puterm_state_t;
+
+/* See puterm_set_startup_command()'s doc comment in pude_term.h. A plain
+ * static, not a mailbox like pude_spawn.h's -- there is exactly one
+ * producer (whichever app called this right before requesting the
+ * spawn) and exactly one consumer (the very next puterm_create()), so a
+ * one-shot buffer is all that's needed. */
+static char g_startup_command[256];
+static bool g_has_startup_command;
+
+void puterm_set_startup_command(const char *command)
+{
+    if (command && command[0]) {
+        strncpy(g_startup_command, command, sizeof(g_startup_command) - 1);
+        g_startup_command[sizeof(g_startup_command) - 1] = '\0';
+        g_has_startup_command = true;
+    } else {
+        g_has_startup_command = false;
+    }
+}
 
 static pid_t spawn_shell(int slave_fd)
 {
@@ -739,6 +728,17 @@ static void *puterm_create(pude_window_t *win, int client_w, int client_h)
     }
     close(slave_fd); /* PUTerm only needs the master end */
     st->child_alive = true;
+
+    if (g_has_startup_command) {
+        /* Typed into the pty exactly as if the user had done it themselves
+         * -- the freshly forked shell just hasn't printed its prompt yet
+         * when this write happens, but the pty's own buffering means the
+         * bytes sit there until it's ready to read them, same as a human
+         * typing ahead of a slow prompt. */
+        write(st->master_fd, g_startup_command, strlen(g_startup_command));
+        write(st->master_fd, "\n", 1);
+        g_has_startup_command = false;
+    }
     return st;
 }
 
