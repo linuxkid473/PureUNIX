@@ -47,6 +47,26 @@ typedef struct vt {
     pu_input_event_t rawbuf[VT_RAWBUF_SIZE];
     volatile uint32_t raw_head;
     volatile uint32_t raw_tail;
+
+    /* Which task's SYS_SET_GRAPHICS_MODE(1) call put this VT into graphics
+     * mode -- see vt_get_graphics_owner()'s declaration (include/pureunix/
+     * vt.h) for why this matters once a graphics-mode app can have real
+     * children (PUTerm, docs/pude.md). 0 (never a valid task id) when not
+     * in graphics mode or no owner recorded. */
+    uint32_t graphics_owner;
+
+    /* Stack of previous graphics_owner values, one push per *nested*
+     * SYS_SET_GRAPHICS_MODE(1) call -- e.g. Chocolate Doom, itself a real
+     * SDL app, calling SET_GRAPHICS_MODE(1) from a shell running inside
+     * PUTerm (also a graphics-mode owner of the same vt_id). Without this,
+     * disabling graphics mode when the *nested* app exits/is killed wiped
+     * out graphics_owner and physically turned graphics mode off, even
+     * though the outer WM (PUTerm) was still alive and still wanted it on
+     * -- confirmed as the real cause of PUTerm permanently freezing (every
+     * subsequent SYS_FB_BLIT silently no-op'd by vt_is_graphics_mode())
+     * after Ctrl+S killed a nested Doom (docs/pude.md). */
+    uint32_t graphics_owner_stack[8];
+    int graphics_owner_depth;
 } vt_t;
 
 static vt_t vts[NUM_VTS];
@@ -148,6 +168,85 @@ void vt_input_push(int key)
     }
     vt_t *vt = &vts[active_vt];
 
+    if (vga_console_is_graphics_mode(vt->console)) {
+        /* Graphics mode is checked *before* ISIG interception below —
+         * a graphics-mode app (SDL games, and now PUTerm, docs/pude.md)
+         * owns this physical keystroke via the raw input queue instead of
+         * the ASCII queue's line discipline, and gets to decide for
+         * itself what Ctrl+C/Z/\ mean (PUTerm forwards them to its own
+         * pty's *own* independent ISIG interception, kernel/pty.c's
+         * pty_master_write() — exactly mirroring this function). Before
+         * this ordering existed, VT1's own fg_pgid (set to the graphics
+         * app's pgid by the shell's ordinary job control when it launched
+         * that app as a foreground job) intercepted the *same* physical
+         * Ctrl+C a *second* time and killed the app outright via SIGINT's
+         * default action — confirmed as the exact, reproducible cause of
+         * PUTerm's window vanishing the instant Ctrl+C was pressed on a
+         * job running *inside* it: the outer VT's own top-level line
+         * discipline was killing PUTerm itself before PUTerm's own pty
+         * ever saw the keystroke. Real terminal emulators have exactly
+         * this property too — the window system never independently
+         * signals a terminal emulator's process on Ctrl+C; only the
+         * terminal's own pty's line discipline does, targeting whatever
+         * job is in *its* foreground.
+         *
+         * Ctrl+S is repurposed, only while this VT is graphics-mode, as
+         * an unconditional emergency kill switch — deliberately *not*
+         * gated by ISIG the way Ctrl+C/Z/\ are: those now rely on the app
+         * handling them itself (true of every SDL/chocolate-doom program,
+         * which never touches ISIG, and now of PUTerm, which does handle
+         * them via its own pty), but this hotkey exists precisely so a
+         * wedged/misbehaving graphics app can never leave the console
+         * stuck. SIGKILL (not SIGTERM/SIGINT) because it cannot be
+         * blocked, ignored, or handled — "recursively close" every
+         * process in the foreground group, guaranteed. kernel/signal.c's
+         * SIGKILL handling already forces graphics_mode back off (only
+         * for the actual owner — vt_get_graphics_owner() — see that
+         * function's own comment) and repaints as part of tearing the
+         * target down, so this one keypress alone returns the VT straight
+         * back to its ash shell, synchronously, with no dependence on the
+         * app's own (possibly hung) cleanup path. Outside graphics mode
+         * this falls through unchanged to the ordinary ASCII queue below,
+         * so editor.c's existing KEY_CTRL_S ("save") meaning is completely
+         * unaffected. */
+        if (key == KEY_CTRL_S) {
+            /* Target the *actual current graphics owner*'s process group,
+             * not vt->fg_pgid -- those two can genuinely differ now that a
+             * graphics-mode app can itself have descendants that become a
+             * *different* graphics-mode app (PUTerm running a real shell,
+             * docs/pude.md, which can launch e.g. Chocolate Doom). vt-
+             * >fg_pgid reflects whatever the *outer* shell's ordinary job
+             * control set when it first launched the top-level app (e.g.
+             * PUTerm's own pgid) and is never updated again by anything
+             * nested underneath — using it here would SIGKILL the
+             * top-level app (PUTerm itself) while leaving the actually-
+             * wedged nested app (Doom) completely untouched and still
+             * rendering, defeating the entire point of this emergency
+             * kill switch. Confirmed as a real, reproducible bug this way:
+             * Ctrl+S while a nested Doom was running silently killed
+             * PUTerm instead. Falls back to vt->fg_pgid only if the
+             * recorded owner task somehow no longer exists (shouldn't
+             * normally happen — belt and suspenders, not worse than the
+             * previous behavior). */
+            task_t *owner = task_find((uint32_t)vts[active_vt].graphics_owner);
+            uint32_t target_pgid = owner ? owner->pgid : (uint32_t)vt->fg_pgid;
+            vt_write(active_vt, "\n^S: killing graphics app\n", 27);
+            signal_send_pgrp(target_pgid, SIGKILL);
+            return;
+        }
+        /* An SDL app owns this VT via the raw input queue (see
+         * vt_raw_input_push_key() below) instead of ordinary ASCII reads.
+         * Without this, every key typed during a graphics-mode session
+         * (movement keys during a game, etc.) would still pile up
+         * unread in this canonical queue, invisible until the app exits
+         * and the underlying shell resumes reading its tty — at which
+         * point the entire backlog replays at once as garbage input,
+         * corrupting whatever command the user types next. Matches the
+         * same graphics_mode gate drivers/vga.c already applies to
+         * output. */
+        return;
+    }
+
     /* Real terminal line-discipline behavior: Ctrl+C/Ctrl+Z/Ctrl+\ are
      * consumed by the tty layer itself the instant they arrive — not
      * queued as ordinary input data — and reach the *foreground process
@@ -159,7 +258,8 @@ void vt_input_push(int key)
      * cases). Respects ISIG exactly like drivers/tty.c's own read()
      * paths do for the same three characters when ISIG is off (e.g. a
      * raw-mode full-screen program that wants Ctrl+C delivered as
-     * literal data) — see docs/process-management.md. */
+     * literal data) — see docs/process-management.md. Only reached
+     * outside graphics mode — see that check above for why. */
     if (vt->termios.c_lflag & ISIG) {
         int b = key_to_signal_byte(key);
         int sig = 0;
@@ -184,42 +284,6 @@ void vt_input_push(int key)
             signal_send_pgrp((uint32_t)vt->fg_pgid, sig);
             return;
         }
-    }
-
-    if (vga_console_is_graphics_mode(vt->console)) {
-        /* Ctrl+S is repurposed, only while this VT is graphics-mode (an
-         * SDL app owns the screen), as an unconditional emergency kill
-         * switch — deliberately *not* gated by ISIG the way Ctrl+C/Z/\
-         * above are: those rely on the app leaving termios alone (true of
-         * every SDL/chocolate-doom program today, which never touches
-         * ISIG), but this hotkey exists precisely so a wedged/misbehaving
-         * graphics app can never leave the console stuck. SIGKILL (not
-         * SIGTERM/SIGINT) because it cannot be blocked, ignored, or
-         * handled — "recursively close" every process in the foreground
-         * group, guaranteed. kernel/signal.c's SIGKILL handling already
-         * forces graphics_mode back off and repaints as part of tearing
-         * the target down, so this one keypress alone returns the VT
-         * straight back to its ash shell, synchronously, with no
-         * dependence on the app's own (possibly hung) cleanup path.
-         * Outside graphics mode this falls through unchanged to the
-         * ordinary ASCII queue below, so editor.c's existing KEY_CTRL_S
-         * ("save") meaning is completely unaffected. */
-        if (key == KEY_CTRL_S) {
-            vt_write(active_vt, "\n^S: killing graphics app\n", 27);
-            signal_send_pgrp((uint32_t)vt->fg_pgid, SIGKILL);
-            return;
-        }
-        /* An SDL app owns this VT via the raw input queue (see
-         * vt_raw_input_push_key() below) instead of ordinary ASCII reads.
-         * Without this, every key typed during a graphics-mode session
-         * (movement keys during a game, etc.) would still pile up
-         * unread in this canonical queue, invisible until the app exits
-         * and the underlying shell resumes reading its tty — at which
-         * point the entire backlog replays at once as garbage input,
-         * corrupting whatever command the user types next. Matches the
-         * same graphics_mode gate drivers/vga.c already applies to
-         * output. */
-        return;
     }
 
     uint32_t next = (vt->key_head + 1) % VT_KEYBUF_SIZE;
@@ -428,7 +492,53 @@ void vt_set_graphics_mode(int vt_id, bool enable)
     if (!valid_vt(vt_id)) {
         return;
     }
-    vga_console_set_graphics_mode(vts[vt_id].console, enable);
+    vt_t *vt = &vts[vt_id];
+    if (enable) {
+        /* Entering graphics mode: discard whatever raw input events already
+         * queued *before* this app started polling for them -- the raw
+         * queue (unlike the ASCII queue, which vt_input_push() already
+         * stops filling once graphics_mode is set) is fed unconditionally
+         * by the keyboard IRQ regardless of graphics mode, so keystrokes
+         * used to *launch* this program (e.g. typing "pude\n" at the shell
+         * prompt) sit queued and get silently replayed as live input the
+         * instant SDL_PollEvent()/pu_input_poll() first drains them --
+         * confirmed as a real, reproducible bug this way (docs/pude.md):
+         * launching PUTerm made it immediately "type" its own launch
+         * command into the freshly-forked shell. Matches this VT's own
+         * "graphics mode starts with a clean slate" invariant, just
+         * extended to the second input queue. */
+        vts[vt_id].raw_head = vts[vt_id].raw_tail = 0;
+        /* Push whatever owner (possibly 0, meaning "none" -- this is the
+         * outermost enable) was already recorded, so a later disable can
+         * tell a nested app's exit from the outermost one's. */
+        if (vt->graphics_owner_depth < 8) {
+            vt->graphics_owner_stack[vt->graphics_owner_depth++] =
+                vt->graphics_owner;
+        }
+        task_t *t = task_current();
+        vt->graphics_owner = t ? t->id : 0;
+        vga_console_set_graphics_mode(vt->console, true);
+    } else {
+        uint32_t prev_owner = 0;
+        bool had_prev = false;
+        if (vt->graphics_owner_depth > 0) {
+            prev_owner = vt->graphics_owner_stack[--vt->graphics_owner_depth];
+            had_prev = true;
+        }
+        vt->graphics_owner = prev_owner;
+        if (had_prev && prev_owner != 0) {
+            /* A nested graphics app is exiting, but an outer owner (e.g.
+             * PUTerm) is still alive and still wants graphics mode on --
+             * leave the hardware/console graphics_mode flag untouched so
+             * the outer owner's own SYS_FB_BLIT calls keep succeeding
+             * instead of silently no-op'ing forever (see vt_is_graphics_
+             * mode() gate in arch/i386/syscall.c's SYS_FB_BLIT handler).
+             * The outer owner's own render loop redraws the next frame;
+             * nothing here needs to repaint anything. */
+            return;
+        }
+        vga_console_set_graphics_mode(vt->console, false);
+    }
     if (!enable && vt_id == active_vt) {
         /* Leaving graphics mode while still on screen: force the console
          * back into view immediately rather than waiting for whatever
@@ -436,7 +546,7 @@ void vt_set_graphics_mode(int vt_id, bool enable)
          * "clean exit" comment. vga_bind_active() would no-op here (it
          * only repaints on an actual g_active change), so this calls the
          * repaint directly, same as vga_bind_active() does internally. */
-        vga_console_repaint(vts[vt_id].console);
+        vga_console_repaint(vt->console);
     }
 }
 
@@ -446,6 +556,14 @@ bool vt_is_graphics_mode(int vt_id)
         return false;
     }
     return vga_console_is_graphics_mode(vts[vt_id].console);
+}
+
+uint32_t vt_get_graphics_owner(int vt_id)
+{
+    if (!valid_vt(vt_id)) {
+        return 0;
+    }
+    return vts[vt_id].graphics_owner;
 }
 
 void vt_signal_resize(void)

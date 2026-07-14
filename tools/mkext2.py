@@ -727,6 +727,12 @@ def add_bin(fs, programs, dir_cache: dict):
     if any(os.path.basename(p).lower() == 'tty.elf' for p in programs):
         fs.add_symlink(bin_ino, 'tty', 'tty.elf')
 
+    # Same idea for pude (user/pude.c -- the graphical desktop shell +
+    # PUTerm terminal emulator, docs/pude.md) -- a plain name-without-.elf
+    # symlink so typing "pude" at the BusyBox ash prompt launches it.
+    if any(os.path.basename(p).lower() == 'pude.elf' for p in programs):
+        fs.add_symlink(bin_ino, 'pude', 'pude.elf')
+
     # BusyBox multi-call binary: one ELF, dispatched by argv[0]'s basename
     # (applets/applets.c's find_applet_by_name()) — every applet name is
     # just a symlink to the same busybox.elf, exactly like a real BusyBox

@@ -122,6 +122,7 @@ enum {
     PU_SYS_SET_GRAPHICS_MODE = 60,
     PU_SYS_FB_MMAP = 61,
     PU_SYS_SBRK = 62,
+    PU_SYS_PTY_CREATE = 63,
 };
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
@@ -2280,4 +2281,11 @@ void *pu_fb_mmap(void)
 {
     int r = raw_syscall(PU_SYS_FB_MMAP, 0, 0, 0);
     return r < 0 ? NULL : (void *)r;
+}
+
+/* ---- PTY (include/pureunix/pty.h, docs/pude.md) ---- */
+
+int pu_pty_create(int fds[2])
+{
+    return raw_syscall(PU_SYS_PTY_CREATE, (int)fds, 0, 0);
 }

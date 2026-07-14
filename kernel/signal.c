@@ -21,7 +21,15 @@
  * path that skips task_exit() entirely. */
 static void force_graphics_mode_off_if_owned(task_t *target)
 {
-    if (target->vt_id >= 0 && vt_is_graphics_mode(target->vt_id)) {
+    /* Must also check *target actually owns* this vt_id's graphics-mode
+     * session (vt_get_graphics_owner()), not just "shares this vt_id" —
+     * see kernel/task.c's task_exit() identical check for the full
+     * explanation (PUTerm, docs/pude.md, is the first program here to
+     * fork() real children while its own VT is in graphics mode; killing
+     * one of those children, e.g. Ctrl+C on a foreground job PUTerm ran,
+     * must not force PUTerm itself out of graphics mode). */
+    if (target->vt_id >= 0 && vt_is_graphics_mode(target->vt_id) &&
+        vt_get_graphics_owner(target->vt_id) == target->id) {
         vt_set_graphics_mode(target->vt_id, false);
     }
 }
@@ -96,6 +104,23 @@ void signal_send(task_t *target, int sig)
         case SIGCONT:
             /* Default action for both is "ignore" (SIGCONT's resume side
              * effect above already happened unconditionally). */
+            return;
+        case SIGWINCH:
+            /* Real POSIX/Linux/BSD default action is "ignore", not the
+             * catch-all "terminate" below -- a program that cares about
+             * window-size changes installs its own handler (ash's
+             * job-control-aware line editor does when it wants to), but
+             * SIGWINCH must never kill a program that hasn't. This was a
+             * real, previously-latent gap: kernel/vt.c's vt_signal_resize()
+             * (TIOCSFONT on a physical VT) and this pty's own TIOCSWINSZ
+             * (docs/pude.md, PUTerm's drag-to-resize) both send SIGWINCH to
+             * a job's foreground process group -- without this case,
+             * *any* resize killed the shell outright the instant it fired,
+             * for any shell that hadn't happened to install a handler.
+             * Confirmed as the actual, reproducible cause of PUTerm's
+             * window vanishing (a clean process exit, not a crash) the
+             * first time a window resize actually reached a running ash
+             * session. */
             return;
         case SIGTSTP:
             if (target->state != TASK_ZOMBIE && target->state != TASK_STOPPED) {

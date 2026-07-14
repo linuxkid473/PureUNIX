@@ -14,6 +14,10 @@ small line-oriented instruction file:
     WAIT <regex>          blocks until <regex> matches new serial output
                           (Python re, searched against the full log)
     SLEEP <seconds>       fixed pause (float)
+    SCREENSHOT <path>     QMP screendump (PPM) to a host path -- the only
+                          way to verify a graphics-mode program (pude/
+                          PUTerm, sdltest, ...), whose rendered pixels never
+                          reach the serial log the way the text console does
 
 Blank lines and lines starting with # are ignored. See docs/
 process-management.md for the job-control scenarios this exists for
@@ -142,6 +146,15 @@ class QemuSession:
         keys = [{"type": "qcode", "data": part} for part in combo.split("+")]
         self.send_keys(keys)
 
+    def screendump(self, path):
+        """Writes a PPM screenshot of the current framebuffer to `path` (a
+        host path, since QMP's screendump runs inside the QEMU process
+        itself). Needed for anything whose output never reaches the serial
+        log -- a graphics-mode program like pude/PUTerm (docs/pude.md) or
+        sdltest doesn't mirror its rendered pixels to serial the way the
+        text console does, so a screenshot is the only way to verify it."""
+        self._cmd("screendump", filename=os.path.abspath(path))
+
     def tail(self):
         try:
             with open(self.serial_log, "rb") as f:
@@ -203,6 +216,8 @@ def run_script(qemu, lines):
                 qemu.wait_for(rest)
             elif cmd == "SLEEP":
                 time.sleep(float(rest))
+            elif cmd == "SCREENSHOT":
+                qemu.screendump(rest)
             else:
                 raise ValueError(f"unknown instruction {cmd!r}")
         except Exception as e:

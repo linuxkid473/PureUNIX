@@ -25,6 +25,11 @@
  * cause of a real busybox rebuild failure, not a hypothetical. */
 #define TIOCGPGRP 5
 #define TIOCSPGRP 6
+/* PTY-only requests (include/pureunix/pty.h, kernel/pty.c) — see that
+ * header's own comment. PUTerm (docs/pude.md) is the only newlib-linked
+ * consumer of either. */
+#define TIOCSWINSZ 7
+#define TIOCSCTTY  8
 
 struct winsize {
     unsigned short ws_row;

@@ -9,6 +9,7 @@
 #include <pureunix/input.h>
 #include <pureunix/ioctl.h>
 #include <pureunix/memory.h>
+#include <pureunix/pty.h>
 #include <pureunix/signal.h>
 #include <pureunix/stat.h>
 #include <pureunix/stdio.h>
@@ -146,8 +147,10 @@ static int tty_fd_check(int fd)
     }
     /* An explicit /dev/ttyN fd (SYS_OPEN's /dev/tty interception above) is
      * a real open_file_t, but a real tty all the same -- unlike a
-     * FD_KIND_FILE/FD_KIND_PIPE fd, which never is. */
-    if (f && f->kind == FD_KIND_TTY) {
+     * FD_KIND_FILE/FD_KIND_PIPE fd, which never is. Same for either end of
+     * a real PTY pair (include/pureunix/pty.h) -- a pty is a real tty too,
+     * it just isn't one of the 6 physical VTs. */
+    if (f && (f->kind == FD_KIND_TTY || f->kind == FD_KIND_PTY)) {
         return 0;
     }
     return f ? -ENOTTY : -EBADF;
@@ -360,6 +363,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_write(f, buf, len);
         }
+        if (f->kind == FD_KIND_PTY) {
+            int r = f->pty_is_master ? pty_master_write(f->pty, buf, len)
+                                       : pty_slave_write(f->pty, buf, len);
+            return (uint32_t)r;
+        }
         if (f->kind == FD_KIND_NULL) {
             /* /dev/null: every byte is accepted and discarded — see
              * include/pureunix/task.h's FD_KIND_NULL comment. */
@@ -434,6 +442,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_read(f, buf, len);
         }
+        if (f->kind == FD_KIND_PTY) {
+            int r = f->pty_is_master ? pty_master_read(f->pty, buf, len)
+                                       : pty_slave_read(f->pty, buf, len);
+            return (uint32_t)r;
+        }
         if (f->kind == FD_KIND_NULL) {
             /* /dev/null: always reports EOF — see
              * include/pureunix/task.h's FD_KIND_NULL comment. */
@@ -501,6 +514,38 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             t->fds[fd].cloexec = false;
             t->fds[fd].file = f;
             return (uint32_t)fd;
+        }
+
+        if (strcmp(path, "/dev/tty") == 0) {
+            task_t *ct = task_current();
+            if (ct && ct->ctty_pty) {
+                /* This task's controlling terminal is a real PTY
+                 * (include/pureunix/pty.h), not one of the 6 physical VTs
+                 * -- e.g. a shell PUTerm spawned (docs/pude.md). Must be
+                 * checked before dev_tty_path_vt() below, which otherwise
+                 * unconditionally treats "/dev/tty" as naming a VT (BusyBox
+                 * ash's setjobctl() opens exactly this path for its own
+                 * job-control ioctls -- without this, it would silently
+                 * get a VT-bound fd instead of its real controlling
+                 * terminal). */
+                int fd = find_free_fd(ct, 0);
+                if (fd < 0) {
+                    return (uint32_t)-EMFILE;
+                }
+                open_file_t *f = open_file_alloc(FD_KIND_PTY);
+                if (!f) {
+                    return (uint32_t)-ENOSPC;
+                }
+                f->flags = flags;
+                f->pty = ct->ctty_pty;
+                f->pty_is_master = false;
+                pty_slave_ref(f->pty);
+                ct->fds[fd].used = true;
+                ct->fds[fd].closed_explicitly = false;
+                ct->fds[fd].cloexec = false;
+                ct->fds[fd].file = f;
+                return (uint32_t)fd;
+            }
         }
 
         int dev_vt = dev_tty_path_vt(path);
@@ -1422,6 +1467,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (chk != 0) {
             return (uint32_t)chk;
         }
+        open_file_t *f = task_current()->fds[fd].file;
+        if (f && f->kind == FD_KIND_PTY) {
+            return (uint32_t)pty_get_termios(f->pty, out);
+        }
         return (uint32_t)tty_get_termios(out);
     }
     case SYS_TCSETATTR: {
@@ -1435,6 +1484,10 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (actions != TCSANOW && actions != TCSADRAIN && actions != TCSAFLUSH) {
             return (uint32_t)-EINVAL;
         }
+        open_file_t *f = task_current()->fds[fd].file;
+        if (f && f->kind == FD_KIND_PTY) {
+            return (uint32_t)pty_set_termios(f->pty, in);
+        }
         return (uint32_t)tty_set_termios(in);
     }
     case SYS_IOCTL: {
@@ -1445,6 +1498,109 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (chk != 0) {
             return (uint32_t)chk;
         }
+
+        open_file_t *pty_f = task_current()->fds[fd].file;
+        if (pty_f && pty_f->kind == FD_KIND_PTY) {
+            /* A real PTY fd (include/pureunix/pty.h) -- handled entirely
+             * separately from the VT-based requests below, since
+             * fd_to_vt_id() has no meaning for it. */
+            pty_t *pt = pty_f->pty;
+            if (request == TIOCGWINSZ) {
+                if (!argp) {
+                    return (uint32_t)-EINVAL;
+                }
+                struct winsize *ws = (struct winsize *)argp;
+                unsigned short rows, cols;
+                pty_get_winsize(pt, &rows, &cols);
+                ws->ws_row = rows;
+                ws->ws_col = cols;
+                ws->ws_xpixel = 0;
+                ws->ws_ypixel = 0;
+                return 0;
+            }
+            if (request == TIOCSWINSZ) {
+                if (!argp) {
+                    return (uint32_t)-EINVAL;
+                }
+                const struct winsize *ws = (const struct winsize *)argp;
+                pty_set_winsize(pt, ws->ws_row, ws->ws_col);
+                /* Real pty semantics: setting the window size signals the
+                 * foreground job so a termios-aware program (ash's line
+                 * editor, vi, ncurses apps) actually notices and re-queries
+                 * TIOCGWINSZ, exactly matching kernel/vt.c's own
+                 * vt_signal_resize() for TIOCSFONT on a physical VT.
+                 * Harmless no-op if nothing has claimed this pty's
+                 * foreground group yet (pgid 0 never matches any real
+                 * task). */
+                int fg_pgid = pty_get_fg_pgid(pt);
+                if (fg_pgid > 0) {
+                    signal_send_pgrp((uint32_t)fg_pgid, SIGWINCH);
+                }
+                return 0;
+            }
+            if (request == TIOCGPGRP) {
+                if (!argp) {
+                    return (uint32_t)-EINVAL;
+                }
+                int pgid = pty_get_fg_pgid(pt);
+                if (pgid == 0) {
+                    return (uint32_t)-ENOTTY;
+                }
+                *(int *)argp = pgid;
+                return 0;
+            }
+            if (request == TIOCSPGRP) {
+                if (!argp) {
+                    return (uint32_t)-EINVAL;
+                }
+                task_t *caller = task_current();
+                if (pty_get_fg_pgid(pt) == 0 || caller->sid == 0) {
+                    return (uint32_t)-ENOTTY;
+                }
+                int pgid = *(int *)argp;
+                if (pgid <= 0) {
+                    return (uint32_t)-EINVAL;
+                }
+                task_t *member = task_find((uint32_t)pgid);
+                bool same_session_group = member && member->sid == caller->sid &&
+                                           (uint32_t)pgid == member->pgid;
+                if (!same_session_group) {
+                    return (uint32_t)-EPERM;
+                }
+                pty_set_fg_pgid(pt, pgid);
+                return 0;
+            }
+            if (request == TIOCSCTTY) {
+                /* Real POSIX rule: only a session leader may acquire a
+                 * controlling terminal. task_t.ctty_pty starts NULL for
+                 * every task, so this is the only way it's ever set. */
+                task_t *caller = task_current();
+                if (caller->sid != caller->id) {
+                    return (uint32_t)-EPERM;
+                }
+                caller->ctty_pty = pt;
+                if (pty_get_sid(pt) == 0) {
+                    pty_set_sid(pt, (int)caller->sid);
+                    /* Real POSIX/kernel/vt.c's vt_claim_session() behavior:
+                     * acquiring a fresh controlling terminal makes the
+                     * acquiring process's own group the foreground one --
+                     * without this, pty_get_fg_pgid() stays 0 forever
+                     * (pty_alloc()'s kcalloc default), which is
+                     * indistinguishable from "no controlling terminal" to
+                     * TIOCGPGRP/TIOCSPGRP. A real caller (BusyBox ash's
+                     * setjobctl()) calling tcgetpgrp() right after this
+                     * ioctl would otherwise always get -ENOTTY and
+                     * conclude "can't access tty; job control turned
+                     * off" -- confirmed as the actual, reproducible cause
+                     * of that exact message the first time PUTerm ran a
+                     * real shell under this pty. */
+                    pty_set_fg_pgid(pt, (int)caller->id);
+                }
+                return 0;
+            }
+            return (uint32_t)-EINVAL;
+        }
+
         if (request == TIOCGWINSZ) {
             if (!argp) {
                 return (uint32_t)-EINVAL;
@@ -1773,6 +1929,63 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         t->heap_used = new_used;
         return old_break;
+    }
+    case SYS_PTY_CREATE: {
+        int *fds_out = (int *)regs->ebx;
+        if (!fds_out) {
+            return (uint32_t)-EINVAL;
+        }
+        task_t *t = task_current();
+        int master_fd = -1, slave_fd = -1;
+        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+            bool console_reclaimable = i < 3 && !t->fds[i].file && t->fds[i].closed_explicitly;
+            if (!t->fds[i].used || console_reclaimable) {
+                if (master_fd < 0) {
+                    master_fd = i;
+                } else {
+                    slave_fd = i;
+                    break;
+                }
+            }
+        }
+        if (master_fd < 0 || slave_fd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+
+        pty_t *pt = pty_alloc();
+        if (!pt) {
+            return (uint32_t)-ENOSPC;
+        }
+        open_file_t *mf = open_file_alloc(FD_KIND_PTY);
+        open_file_t *sf = open_file_alloc(FD_KIND_PTY);
+        if (!mf || !sf) {
+            if (mf) {
+                open_file_unref(mf);
+            }
+            if (sf) {
+                open_file_unref(sf);
+            }
+            return (uint32_t)-ENOSPC;
+        }
+        mf->pty = pt;
+        mf->pty_is_master = true;
+        pty_master_ref(pt);
+        sf->pty = pt;
+        sf->pty_is_master = false;
+        pty_slave_ref(pt);
+
+        t->fds[master_fd].used = true;
+        t->fds[master_fd].closed_explicitly = false;
+        t->fds[master_fd].cloexec = false;
+        t->fds[master_fd].file = mf;
+        t->fds[slave_fd].used = true;
+        t->fds[slave_fd].closed_explicitly = false;
+        t->fds[slave_fd].cloexec = false;
+        t->fds[slave_fd].file = sf;
+
+        fds_out[0] = master_fd;
+        fds_out[1] = slave_fd;
+        return 0;
     }
     case SYS_DEBUG_SETCRED: {
         /* Test-only credential override — see the comment on

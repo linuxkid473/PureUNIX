@@ -456,6 +456,33 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
     pack_comm(t->name, sizeof(t->name), path);
     t->mapped_bytes = mapped_bytes;
 
+    /* heap_used/heap_mapped (SYS_SBRK) and fb_shadow_mapped (SYS_FB_MMAP,
+     * docs/sdl-port.md) describe *this address space's* current layout —
+     * task_fork() correctly copies them alongside its own deep copy of the
+     * whole user window (a forked child's address space really does still
+     * have whatever heap/fb pages the parent had), but exec() replaces the
+     * entire address space with a brand new one from elf_load_into() that
+     * has none of that. Leaving these stale meant a program launched via
+     * fork()+exec() (every external command any real shell runs) could
+     * inherit e.g. fb_shadow_mapped=true from an ancestor that had already
+     * mapped its own framebuffer shadow before forking, with nothing
+     * actually mapped at FB_SHADOW_VA in *this* fresh address space at
+     * all. SYS_FB_MMAP's own idempotency check (`if (t->fb_shadow_mapped)
+     * return FB_SHADOW_VA;`) then skips the real mapping entirely, handing
+     * the program back a VA that faults the instant it's written to.
+     * Confirmed as the actual, reproducible cause of a real crash: any
+     * SDL2 program (Chocolate Doom) launched from a real shell running
+     * *inside* PUTerm (docs/pude.md) — itself forked from `pude`, which
+     * had already mapped its own framebuffer shadow before forking that
+     * shell — page-faulted at exactly FB_SHADOW_VA on its very first
+     * render. heap_used/heap_mapped have the identical bug class (a
+     * stale-high heap_mapped could make SYS_SBRK's own "map more pages"
+     * loop never run for a program whose fresh address space has no heap
+     * pages at all yet) even though no concrete repro surfaced it first. */
+    t->heap_used = 0;
+    t->heap_mapped = 0;
+    t->fb_shadow_mapped = false;
+
     /* POSIX close-on-exec: any fd fcntl(F_DUPFD_CLOEXEC)'d (e.g. BusyBox
      * ash's setjobctl() — see fd_entry_t.cloexec's own comment) must not
      * survive into the new program image. Every other fd (the common

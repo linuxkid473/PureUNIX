@@ -131,6 +131,22 @@ bool vt_raw_input_try_get(int vt_id, pu_input_event_t *out);
 void vt_set_graphics_mode(int vt_id, bool enable);
 bool vt_is_graphics_mode(int vt_id);
 
+/* Which task actually *owns* this VT's graphics-mode session (the one
+ * whose SYS_SET_GRAPHICS_MODE(1) call turned it on -- 0 if none/not in
+ * graphics mode). PUTerm (docs/pude.md) is the first program in this
+ * kernel to fork() real child processes (a shell, and everything *it*
+ * forks+execs, e.g. `ls`) while its own VT is in graphics mode -- every
+ * one of those descendants inherits the same task_t.vt_id its ancestor
+ * had (exactly like a real shell's children inherit their controlling
+ * terminal), so kernel/task.c's task_exit() and kernel/signal.c's signal
+ * killpath can no longer assume "this exiting task's vt_id is in graphics
+ * mode" means "this exiting task is the one that put it there" -- an
+ * unrelated grandchild (`ls`) exiting normally must not force the whole
+ * VT out of graphics mode out from under the SDL app (PUTerm) that's
+ * still actually running. Callers compare this against their own task id
+ * before tearing down graphics mode on exit. */
+uint32_t vt_get_graphics_owner(int vt_id);
+
 /* Broadcasts SIGWINCH to every VT's foreground process group. The console
  * grid (drivers/vga.c's vga_cols/vga_rows) is one hardware-wide size shared
  * by every VT, so a resize (currently only TIOCSFONT — see SYS_IOCTL,

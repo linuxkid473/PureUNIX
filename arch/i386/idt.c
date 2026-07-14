@@ -205,6 +205,23 @@ void isr_dispatch(interrupt_regs_t *regs)
             handlers[regs->int_no][i](regs);
         }
     } else if (regs->int_no < 32) {
+        if (regs->int_no == 14) {
+            /* Page fault: CR2 holds the faulting linear address (the CPU's
+             * own contract, independent of anything the trap frame itself
+             * carries) -- essential for diagnosing *what* was being
+             * accessed, not just *where the code was* (regs->eip alone
+             * leaves "wrote through a bad pointer" and "jumped to garbage"
+             * indistinguishable). This kernel has no per-process fault
+             * isolation yet (any ring-3 page fault panics the whole
+             * system, same as a kernel one), so this is the only diagnostic
+             * a ring-3 crash like a stack overflow or a bad pointer
+             * ever gets. */
+            uint32_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            panic("CPU exception %u (%s), err=%x eip=%p cr2=%p",
+                  regs->int_no, exception_names[regs->int_no], regs->err_code,
+                  (void *)regs->eip, (void *)cr2);
+        }
         panic("CPU exception %u (%s), err=%x eip=%p",
               regs->int_no, exception_names[regs->int_no], regs->err_code, (void *)regs->eip);
     } else {

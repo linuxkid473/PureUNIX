@@ -24,7 +24,14 @@ typedef enum fd_kind {
      * ash job control (M9): backgrounding a job with no explicit
      * redirection (`cmd &`) redirects its stdin to /dev/null. */
     FD_KIND_NULL = 3,
+    /* One end of a real PTY pair (include/pureunix/pty.h, kernel/pty.c) —
+     * `pty` names which pair, `pty_is_master` which end this description
+     * represents, exactly like FD_KIND_PIPE's pipe_buf/pipe_is_write_end
+     * above. Created only by SYS_PTY_CREATE. */
+    FD_KIND_PTY = 4,
 } fd_kind_t;
+
+struct pty;
 
 /* Ring buffer shared by both ends of one pipe() call — allocated once per
  * pipe() (SYS_PIPE, arch/i386/syscall.c) and freed once both ends' last
@@ -82,6 +89,12 @@ typedef struct open_file {
      * vt_id: e.g. a shell on VT1 opening /dev/tty3 gets a descriptor bound
      * to VT3 regardless of where it was opened from. */
     int tty_vt_id;
+
+    /* FD_KIND_PTY: which pty pair this end belongs to, and which end (see
+     * include/pureunix/pty.h). Both ends of one SYS_PTY_CREATE call share
+     * the same `pty` pointer, exactly like FD_KIND_PIPE's pipe_buf above. */
+    struct pty *pty;
+    bool pty_is_master;
 } open_file_t;
 
 /* One slot in a task's file descriptor table. Slots 0/1/2 start out with
@@ -307,6 +320,17 @@ typedef struct task {
      * a shell and every process it launches (ping, seq, make, ...) bound to
      * the VT it was started on regardless of which VT is active later. */
     int vt_id;
+    /* Controlling-terminal pty, if this task's terminal is a PTY
+     * (include/pureunix/pty.h) rather than one of the 6 physical VTs above
+     * — NULL for every task that predates PUTerm/pude (the overwhelming
+     * common case). Set explicitly via ioctl(fd, TIOCSCTTY) (only allowed
+     * for a session leader, real POSIX semantics), inherited unchanged
+     * across fork()/exec() exactly like vt_id, and consulted by SYS_OPEN's
+     * "/dev/tty" interception (arch/i386/syscall.c) so a shell running
+     * under a pty still gets *its own* controlling terminal back, not a
+     * physical VT's, when it opens /dev/tty (BusyBox ash's setjobctl()
+     * does exactly this — see docs/pude.md). */
+    struct pty *ctty_pty;
     /* Working directory, used to resolve relative paths a syscall hands
      * the VFS (see SYS_CHDIR/SYS_GETCWD in arch/i386/syscall.c). Always an
      * absolute, normalized path (vfs_normalize()'s output). A child
@@ -373,9 +397,11 @@ void task_close_cloexec_fds(task_t *t);
  * third_party/newlib/i686-elf/include/sys/wait.h) so
  * user/newlib_syscalls.c's waitpid() can pass its own `options` argument
  * straight through the SYS_WAIT syscall with no translation. WNOHANG is
- * accepted but not yet implemented (task_waitpid() always blocks) — no
- * current caller needs non-blocking wait; flagged rather than silently
- * ignored so a future WNOHANG caller fails loudly instead of hanging. */
+ * real (task_waitpid(), kernel/task.c): returns 0 immediately if a
+ * matching child exists but hasn't changed state yet, instead of
+ * blocking — needed by PUTerm's WM (docs/pude.md), which must keep
+ * servicing its own render/input loop while polling for its forked shell's
+ * exit rather than blocking on it. */
 #define PU_WNOHANG   1
 #define PU_WUNTRACED 2
 

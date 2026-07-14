@@ -3,6 +3,7 @@
 #include <pureunix/fcntl.h>
 #include <pureunix/flock.h>
 #include <pureunix/memory.h>
+#include <pureunix/pty.h>
 #include <pureunix/signal.h>
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
@@ -146,6 +147,18 @@ int open_file_unref(open_file_t *f)
                 kfree(p);
             }
         }
+    } else if (f->kind == FD_KIND_PTY) {
+        /* Real PTY pair (include/pureunix/pty.h) — the pty_t itself lives
+         * in kernel/pty.c's own fixed pool (not kmalloc'd), so there's
+         * nothing to kfree() here; pty_master_unref()/pty_slave_unref()
+         * handle waking the opposite end's blocked reader/writer and
+         * reclaiming the pool slot once both ends are gone, exactly like
+         * the pipe_buf_t case above. */
+        if (f->pty_is_master) {
+            pty_master_unref(f->pty);
+        } else {
+            pty_slave_unref(f->pty);
+        }
     }
     /* FD_KIND_TTY: a /dev/ttyN descriptor owns no buffer of its own (reads/
      * writes go straight through to kernel/vt.c) — nothing to flush or
@@ -202,6 +215,12 @@ static task_t *task_alloc(const char *name)
     task->uid = current ? current->uid : 0;
     task->gid = current ? current->gid : 0;
     task->vt_id = current ? current->vt_id : -1;
+    /* A controlling-terminal pty (include/pureunix/pty.h) is inherited
+     * across fork()/exec() exactly like vt_id above — real POSIX ctty
+     * semantics (only setsid() or an explicit TIOCSCTTY changes it). NULL
+     * (the kcalloc() default) for every task whose creator has none, which
+     * is every task except PUTerm's own forked child (docs/pude.md). */
+    task->ctty_pty = current ? current->ctty_pty : NULL;
     strcpy(task->cwd, current && current->cwd[0] ? current->cwd : "/");
     task->ppid = current ? current->id : 0;
     /* A fresh task starts in its creator's process group/session — real
@@ -473,8 +492,21 @@ void task_exit(int code)
      * but exits some other way (_exit() bypassing its own atexit/SDL
      * teardown, a bug, ...) must not leave that VT's console permanently
      * suppressed and its ASCII input queue permanently dropping every
-     * keystroke — see kernel/vt.c's vt_input_push() graphics_mode gate. */
-    if (current->vt_id >= 0 && vt_is_graphics_mode(current->vt_id)) {
+     * keystroke — see kernel/vt.c's vt_input_push() graphics_mode gate.
+     *
+     * Must also check *this task is the one that turned graphics mode on*
+     * (vt_get_graphics_owner()), not just "shares this vt_id" — every
+     * child PUTerm forks (a shell, and everything *it* forks+execs, e.g.
+     * `ls`) inherits the same task_t.vt_id its ancestor had, exactly like
+     * a real shell's children inherit their controlling terminal. Before
+     * this check existed, an ordinary, successful `ls` exiting normally
+     * forced the whole VT out of graphics mode out from under PUTerm,
+     * which was still very much alive and running — confirmed as the
+     * actual, reproducible cause of PUTerm's window vanishing back to the
+     * plain text console the instant any real external (fork+exec'd, not
+     * an ash builtin) command finished (docs/pude.md). */
+    if (current->vt_id >= 0 && vt_is_graphics_mode(current->vt_id) &&
+        vt_get_graphics_owner(current->vt_id) == current->id) {
         vt_set_graphics_mode(current->vt_id, false);
     }
 
@@ -647,6 +679,20 @@ int task_waitpid(int pid, int *status, int options)
 
         if (!have_child) {
             return -1;
+        }
+        if (options & PU_WNOHANG) {
+            /* Real POSIX WNOHANG semantics: a matching child exists but
+             * hasn't changed state yet -- return 0 (never a valid pid,
+             * since ids start at 1) instead of blocking. A caller that
+             * needs to poll for a child's exit without stalling its own
+             * event loop (PUTerm's WM, docs/pude.md -- it must keep
+             * servicing its own render/input loop regardless of whether
+             * the shell it forked has exited yet) needs exactly this; it
+             * was accepted-but-not-implemented until this was the first
+             * real caller (include/pureunix/task.h's PU_WNOHANG comment).
+             * user/newlib_syscalls.c's waitpid() already passes an rc of 0
+             * straight through unmodified — no translation needed there. */
+            return 0;
         }
         /* Real block on current->child_wait — see that field's own
          * comment for why the old task_yield()-only loop this replaced

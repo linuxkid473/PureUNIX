@@ -35,6 +35,16 @@
 #define TIOCGPGRP 5 /* argp: pid_t * (out) */
 #define TIOCSPGRP 6 /* argp: const pid_t * (in) */
 
+/* PTY-only requests (include/pureunix/pty.h, kernel/pty.c) — a physical
+ * VT's TIOCGWINSZ already reflects the one shared hardware grid and can't
+ * be resized per-fd, but a pty's size is whatever its master (PUTerm) says
+ * it is, and there's no controlling-terminal auto-assignment heuristic in
+ * this kernel to grant one implicitly, so a real ioctl exists for it. */
+#define TIOCSWINSZ 7 /* argp: const struct winsize * (in) — PTY fds only */
+#define TIOCSCTTY  8 /* argp: unused (pass NULL) — makes this fd's pty the
+                      * caller's controlling terminal; caller must be a
+                      * session leader (sid == own pid), real POSIX rule */
+
 struct winsize {
     unsigned short ws_row;
     unsigned short ws_col;

@@ -237,6 +237,20 @@ enum {
      * syscall's own negative-errno convention throughout) if growing would
      * exceed HEAP_MAX, or -EINVAL if EBX would shrink the break below 0. */
     SYS_SBRK = 62,
+
+    /* Creates a real PTY pair (include/pureunix/pty.h, kernel/pty.c) — the
+     * general primitive a userspace terminal emulator (PUTerm, docs/
+     * pude.md) needs: a detached tty whose "hardware" is another ordinary
+     * process instead of one of the 6 physical VTs (kernel/vt.c).
+     * EBX: pointer to an int[2] output, [0] = master fd, [1] = slave fd
+     * (same shape as SYS_PIPE's int[2], master first since it's the
+     * "creating" end conceptually, mirroring a real posix_openpt()+
+     * grantpt()+unlockpt()+ptsname()->open() sequence collapsed into one
+     * call — there's no /dev/pts filesystem here to name the slave by
+     * path). Returns 0 on success, or -EINVAL (null pointer) / -EMFILE
+     * (fewer than two free fd slots) / -ENOSPC (kernel/pty.c's fixed pty
+     * pool, MAX_PTYS, is full). */
+    SYS_PTY_CREATE = 63,
 };
 
 #endif
