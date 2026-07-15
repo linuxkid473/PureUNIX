@@ -859,4 +859,7 @@ const app_class_t pufiles_app_class = {
     .on_resize = pufiles_on_resize,
     .poll = NULL,
     .is_alive = NULL,
+    .icon_draw = pu_icon_pufiles,
+    .graphical = true,
+    .pinned_default = true,
 };

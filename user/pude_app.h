@@ -18,6 +18,7 @@
  * user/pude.c always NULL-checks before calling): on_key, on_mouse_down,
  * on_mouse_up, poll, is_alive. create/destroy/render are mandatory.
  */
+#include "pude_icon.h"
 #include <SDL.h>
 #include <stdbool.h>
 
@@ -105,6 +106,34 @@ typedef struct {
      * win->self_close_request (below) from whatever click/key handler
      * resolves that modal; the WM notices it on the very next frame. */
     bool (*confirm_close)(pude_window_t *win, void *state);
+
+    /* ---- Desktop-shell metadata (user/pude_dock.c/.h) -- describes how
+     * this app appears in the dock and app drawer. Living here (rather
+     * than a second, separately-maintained list keyed by app name)
+     * guarantees the shell can never drift out of sync with the app
+     * registry itself: every app_class_t already IS the one source of
+     * truth user/pude.c's g_apps[] iterates. ---- */
+
+    /* Procedural icon (user/pude_icon.h) used by both the dock and the
+     * app drawer, scaled to whatever box each draws it into. NULL means
+     * "don't show this app in either" (the WM skips it rather than
+     * falling back to a text-only tile, since the whole point of this
+     * shell is that launching never needs to fall back to text). */
+    pude_icon_draw_fn icon_draw;
+
+    /* Whether this app has an actual graphical UI at all -- true for
+     * every app_class_t today (PUTerm/Calculator/PUFiles/PUText all
+     * render their own window). Exists so the app drawer's "graphical
+     * apps only" listing stays correct if a future non-graphical
+     * app_class_t (e.g. a headless helper) is ever registered in
+     * g_apps[] for some other reason. */
+    bool graphical;
+
+    /* Whether this app ships pinned to the dock by default. Exactly four
+     * app_class_t values have this set today (PUText, Calculator,
+     * PUFiles, PUTerm) -- see docs/pude.md's "Dock and app drawer"
+     * section for why those four and how to change the pinned set. */
+    bool pinned_default;
 } app_class_t;
 
 struct pude_window {

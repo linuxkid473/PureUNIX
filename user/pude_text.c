@@ -1374,4 +1374,7 @@ const app_class_t putext_app_class = {
     .poll = NULL,
     .is_alive = NULL,
     .confirm_close = putext_confirm_close,
+    .icon_draw = pu_icon_putext,
+    .graphical = true,
+    .pinned_default = true,
 };

@@ -4,12 +4,16 @@
 
 **`pude`** is PureUNIX's ring-3 desktop shell: a real SDL2 fullscreen
 window manager (docs/sdl-port.md) that draws a dark desktop with a
-top-left **Menu** control. Clicking it opens an application launcher;
-selecting an entry spawns a real, chrome-decorated window (title bar,
-close button, resize grip) running that app. Typing `pude` at any
-BusyBox ash prompt launches it, exactly like any other installed program
-(`tools/mkext2.py` stages `/bin/pude.elf` with a plain `pude` symlink,
-same as `tty`/`ping`/`neatvi`).
+top-left **Menu** control, a bottom-centered **dock** of pinned app
+icons, and a graphical **app drawer** button next to Menu that opens an
+icon-grid popup of every available app (see "Dock, app drawer, and icon
+infrastructure" below). All three are just different entry points into
+the same underlying spawn path — clicking any of them opens a real,
+chrome-decorated window (title bar, close button, resize grip) running
+that app. Typing `pude` at any BusyBox ash prompt launches it, exactly
+like any other installed program (`tools/mkext2.py` stages
+`/bin/pude.elf` with a plain `pude` symlink, same as `tty`/`ping`/
+`neatvi`).
 
 ```
 # pude
@@ -65,6 +69,10 @@ typedef struct {
     bool  (*poll)(pude_window_t *win, void *state);
     bool  (*is_alive)(pude_window_t *win, void *state);
     bool  (*confirm_close)(pude_window_t *win, void *state);
+
+    pude_icon_draw_fn icon_draw; /* see "Dock, app drawer, and icon infrastructure" below */
+    bool graphical;
+    bool pinned_default;
 } app_class_t;
 
 struct pude_window {
@@ -112,7 +120,189 @@ window pool/z-order itself.
 to the Makefile (pattern-matches `pude_term.o`/`pude_calc.o`/
 `pude_files.o`/`pude_text.o`'s existing rules exactly), link its `.o` into
 `PUDE_ELF`, and add one line to `user/pude.c`'s `g_apps[]` registry.
-Nothing else in the WM changes.
+Nothing else in the WM changes. To also make it discoverable from the
+dock/app drawer, set the three trailing metadata fields described in the
+next section — `icon_draw`, `graphical`, `pinned_default`.
+
+## Dock, app drawer, and icon infrastructure
+
+Two desktop-shell surfaces sit on top of the launcher menu above (which is
+unchanged and still works exactly as before): a **dock** (a bar of pinned
+app icons, bottom-center) and an **app drawer** (a graphical button that
+opens a popup icon grid of every graphical app). Both are shell chrome —
+drawn directly by `user/pude.c`'s own `render_frame()`, not separate
+`app_class_t` instances — since they're WM UI, not applications with their
+own window/state lifecycle.
+
+### App metadata, not a second registry
+
+`app_class_t` (above) carries three extra fields the dock/drawer read
+directly off the *same* `g_apps[]` array the launcher menu already
+iterates, so there is no second, independently-maintained list that could
+drift out of sync with what's actually registered:
+
+- **`icon_draw`** (`pude_icon_draw_fn`, `user/pude_icon.h`) — the app's
+  procedural icon. `NULL` means "don't show this app in the dock or
+  drawer" (there is no text-label fallback — see "Icon drawing
+  infrastructure" below for why).
+- **`graphical`** — true for every app with a real windowed UI (all four
+  today). Drives app-drawer membership. Exists so a hypothetical future
+  non-graphical `app_class_t` (a headless helper registered in `g_apps[]`
+  for some unrelated reason) can opt out of the drawer without needing a
+  parallel filter list.
+- **`pinned_default`** — true for exactly PUTerm, Calculator, PUFiles,
+  and PUText today. Drives dock membership.
+
+`user/pude.c`'s `build_shell_app_lists()` (called once at startup) filters
+`g_apps[]` into `pinned_apps[]`/`drawer_apps[]` by these two booleans
+(also requiring `icon_draw != NULL`), preserving `g_apps[]`'s own order.
+**To pin a new app to the dock or add it to the drawer**: give it an
+`icon_draw` function and set `pinned_default`/`graphical` on its
+`app_class_t` literal — nothing in `user/pude.c` itself needs to change.
+
+### Icon drawing infrastructure: `user/pude_icon.h`
+
+Header-only (`static inline`, same convention as `pude_gfx.h`/
+`pude_widgets.h`), so registering an icon never needs a new Makefile
+object rule. An icon is a plain function pointer:
+
+```c
+typedef void (*pude_icon_draw_fn)(SDL_Surface *s, int x, int y, int w, int h,
+                                   bool hovered, bool pressed);
+```
+
+Every icon draws itself procedurally into the `(x, y, w, h)` box it's
+given — rects, outlines, and raw pixels via `pude_gfx.h`'s existing
+primitives, the same triangle-stipple technique `draw_window_chrome()`'s
+resize grip already uses for PUText's folded-page corner — scaled by
+simple integer fractions of `min(w, h)`, not a fixed-size bitmap asset.
+That's deliberate: this environment is software-rendered (no icon
+toolkit, no image decoder dependency beyond what PUFiles' PNG viewing
+already needs), and a vector-like procedural icon scales cleanly from
+dock size (44px) to the drawer's larger grid tiles (64px) or any future
+size with zero extra work. Text glyphs are never used as icon content
+(only as the drawer's name *labels*, drawn separately) — a font glyph at
+icon scale reads as a letter, not a shape, and doesn't restyle with
+hover/press state the way a drawn shape does.
+
+`pu_icon_tile()` is the shared background every icon in the file draws
+itself onto first — flat face, lightened on hover, darkened with an inset
+border when pressed — so the whole icon set reads as one consistent
+button language rather than four unrelated drawings; it also returns the
+largest centered square sub-rect so each icon's own content-drawing code
+never has to re-derive it. The four app icons (`pu_icon_putext`,
+`pu_icon_calc`, `pu_icon_pufiles`, `pu_icon_puterm`) and the drawer
+toggle's own icon (`pu_icon_drawer`, a 3×3 grid of dots) all follow this
+same pattern; adding a fifth app's icon means adding one more function
+here in the same style, not touching the dock/drawer's own drawing code
+at all.
+
+### Dock: `user/pude.c`'s `dock_rect()`/`draw_dock()`
+
+Bottom-centered (`dock_rect()`) — the launcher menu already owns the
+top-left corner, so bottom-center is the one placement that can never
+collide with it regardless of how many apps end up pinned. Geometry
+(`DOCK_ICON`/`DOCK_GAP`/`DOCK_PAD`/`DOCK_MARGIN_B`) is computed from
+`num_pinned` and the *current* screen size every frame (`screen_w`,
+`screen_h` are read from the live SDL surface, never cached at a fixed
+resolution), so it stays centered and fully on-screen across whatever
+resolution PureUNIX's SDL backend hands `pude` — see "Framebuffer
+resolution handling" in project memory / `pureunix_gfx.h`'s
+`pu_fb_info_t`.
+
+- **Hover**: recomputed every frame from the current mouse position
+  (`dock_hit_test()`) — no stored hover state, same "recompute from
+  current input" pattern Calculator's button grid already uses. A small
+  floating name tooltip appears above the hovered icon (a nicety, not
+  how launching is identified — the dock stays icon-only either way).
+- **Press/launch**: mouse-down over an icon just *arms* it
+  (`dock_press_idx`); the actual `spawn_window()` call happens on
+  mouse-up **only if the pointer is still over that same icon**. A
+  press-drag-off-the-icon-then-release, or a click on empty dock
+  background space (`dock_bar_hit()` true, `dock_hit_test()` returns -1),
+  cancels cleanly instead of launching — mirrors the WM's own existing
+  `mouse_down_target`/`on_mouse_up` pattern for window click-drags, just
+  applied to a shell button instead of an app.
+- **Click ownership**: `dock_bar_hit()` is checked before the window
+  hit-test loop in `SDL_MOUSEBUTTONDOWN`, so a click anywhere on the
+  dock's background bar is consumed there — it can never "pass through"
+  to a window whose bounding rect happens to extend underneath the dock's
+  fixed screen position.
+- **Launching**: `spawn_window(pinned_apps[idx], screen_w, screen_h)` —
+  the exact same function and cascade-position logic the launcher menu's
+  own click handler already calls. The dock is only a second entry point
+  into the one existing spawn path; multi-instance behavior (each click
+  opens another independent window, cascaded 26px like every other spawn)
+  is identical to launching the same app from the menu.
+
+### App drawer: `drawer_btn_rect()`/`drawer_popup_rect()`/`draw_app_drawer()`
+
+The toggle button lives at a fixed position next to the launcher menu
+button (`DRAWER_BTN_X/Y`, same row, same height) — reads as part of the
+same top-left shell cluster rather than an unrelated new control. Its own
+icon (`pu_icon_drawer`) is drawn "pressed" for as long as the popup is
+open, so the toggle itself gives feedback on the drawer's current state.
+
+The popup (`drawer_popup_rect()`) is centered on the current screen size
+(clamped to fit within `MARGIN` of every edge, so it can't run off-screen
+at a small resolution) and lays out `drawer_apps[]` as a fixed 4-column
+icon grid (`DRAWER_COLS`), each cell a large icon (`DRAWER_ICON` = 64px)
+with the app's name drawn beneath it via `pu_draw_string_clipped()` (same
+clipping primitive PUFiles uses for file names, so an unexpectedly long
+future app name truncates with `...` instead of bleeding into the next
+cell).
+
+**Modal input while open** — mirrors the existing launcher menu's own
+"open means every click either hits something in the popup or closes it"
+precedent (`user/pude.c`'s pre-existing `if (menu_open) { ...; break; }`
+block) rather than introducing a new interaction pattern:
+
+- Click on a drawer icon: same arm-on-down/launch-on-up pattern as the
+  dock (`drawer_press_idx`); a successful launch also closes the popup.
+- Click on the drawer toggle button: closes the popup (same button that
+  opened it).
+- Click anywhere else: closes the popup **and consumes the click** — it
+  is not forwarded to whatever window happens to be underneath that
+  screen point. This is what guarantees "click outside dismisses the
+  drawer without also activating the window under it," since the WM
+  never reaches its own window hit-test loop while `drawer_open` is true.
+- Keyboard: the existing focused-window keydown forwarding is gated on
+  `!menu_open && !drawer_open`, so typing while the drawer is open never
+  leaks into whatever window is focused underneath.
+
+**Overlay z-order**: `render_frame()` draws, in order, the desktop
+background, every window (back-to-front), the launcher menu, the dock,
+the drawer toggle button, then — only if `drawer_open` — the drawer popup
+itself, and finally the cursor. The popup is therefore always the topmost
+thing on screen while open (above every application window and above the
+dock), and drawing the *entire* popup rect fresh each frame (background
+fill + outline + every icon + every label) means closing it needs no
+special "restore what was underneath" logic: the very next `render_frame()`
+call (same full-desktop-redraw model described below) simply doesn't draw
+it, and everything that was genuinely underneath — windows, dock, desktop
+background — repaints correctly on its own.
+
+### Performance
+
+This tree's `render_frame()` has **no damage-rect compositor** — it
+redraws the whole desktop surface on any frame with `need_redraw` set
+(any SDL event, including plain mouse motion, or a window drag in
+progress), the same model every other piece of `pude` chrome (window
+chrome, the launcher menu, the cursor) already uses. The dock and drawer
+follow this exact same model rather than inventing a separate,
+partial-redraw path: hovering a dock/drawer icon doesn't cost anything
+beyond what hovering *anywhere* on the desktop already costs today, since
+a full `render_frame()` was already going to run for that same
+`SDL_MOUSEMOTION` event regardless of where the cursor is. Both
+`draw_dock()` and `draw_app_drawer()` are cheap in absolute terms
+(at most a handful of ~44–64px icon tiles and short text labels per
+frame, nowhere near PUTerm's full character-grid render cost), so neither
+one measurably changes this tree's existing per-frame cost. (An earlier,
+separate investigation into desktop-wide cursor-motion redraw cost —
+`tools/test-pude-perf.py` — designed a `render_cursor_only()` partial-
+redraw fast path, but that C-side change was never actually landed in
+this tree; see the project memory that tracks it. `pude.c` today is the
+plain full-redraw model described above.)
 
 ## Window manager: `user/pude.c`
 
@@ -737,6 +927,22 @@ Exercises, all screenshot-verified against real rendered pixels:
   with a fresh, working shell (`echo reopened_ok`)
 - `Ctrl+F12` (emergency whole-desktop quit) cleanly returns control to
   the outer ash shell that launched `pude`
+
+`tools/test-pude-dock.py` (new, same QMP/HMP injection technique): boots
+the persistent disk image, launches `pude`, and drives the dock and app
+drawer end to end — hovering all four pinned dock icons; confirming a
+click on empty dock background space launches nothing; launching PUText,
+Calculator, PUFiles, and PUTerm from the dock one at a time (proving
+multi-window coexistence exactly like the launcher menu's own test);
+typing into the dock-launched PUTerm to confirm it's a fully working
+instance, not a stub; closing all four via their close buttons; opening
+the app drawer via its graphical (grid-of-dots) button and confirming the
+icon grid (not a text list); hovering multiple drawer entries; launching
+PUText from the drawer and confirming the popup auto-closes; reopening
+the drawer over that now-open window to confirm it renders above it
+(z-order); and clicking outside the popup to confirm it dismisses cleanly
+without also activating the window underneath. All screenshot-verified
+for stale pixels, icon legibility, and correct z-order.
 
 **Full regression suite unaffected**: `make run-test` — `systest`
 343/345 (the same 2 pre-existing, unrelated console-geometry failures,

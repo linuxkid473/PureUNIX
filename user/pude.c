@@ -26,6 +26,7 @@
 #include "pude_calc.h"
 #include "pude_files.h"
 #include "pude_gfx.h"
+#include "pude_icon.h"
 #include "pude_spawn.h"
 #include "pude_term.h"
 #include "pude_text.h"
@@ -45,6 +46,36 @@
 #define MENU_BTN_H 26
 #define MENU_ITEM_W 170
 #define MENU_ITEM_H 28
+
+/* ---- Dock: a bottom-centered bar of pinned app icons -- the desktop
+ * shell's primary, icon-driven launch surface (docs/pude.md's "Dock and
+ * app drawer" section). Bottom-center is a deliberate choice, not the
+ * only option this layout supports: the launcher menu already owns the
+ * top-left corner, so a bottom bar is the one placement that can never
+ * overlap it regardless of how many apps get pinned. ---- */
+#define DOCK_ICON       44
+#define DOCK_GAP        10
+#define DOCK_PAD        10
+#define DOCK_MARGIN_B   14
+
+/* ---- App-drawer button: a small graphical (grid-of-dots) toggle sitting
+ * next to the existing launcher menu button -- same row, same height, so
+ * it reads as part of the same top-left shell cluster rather than a
+ * random new control. ---- */
+#define DRAWER_BTN_X (MENU_BTN_X + MENU_BTN_W + 8)
+#define DRAWER_BTN_Y MENU_BTN_Y
+#define DRAWER_BTN_W MENU_BTN_H
+#define DRAWER_BTN_H MENU_BTN_H
+
+/* ---- App-drawer popup: a centered grid of large icons + name labels,
+ * discovered from the same app_class_t metadata the dock uses (see
+ * build_shell_app_lists() below) rather than a second hand-maintained
+ * list. ---- */
+#define DRAWER_ICON     64
+#define DRAWER_CELL_W   96
+#define DRAWER_CELL_H   96
+#define DRAWER_COLS     4
+#define DRAWER_PAD      16
 
 static int titlebar_h(void)
 {
@@ -71,6 +102,37 @@ static const app_class_t *const g_apps[] = {
     &putext_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
+
+/* Filtered views into g_apps[] for the dock (pinned_default) and the app
+ * drawer (graphical) -- built once at startup by build_shell_app_lists()
+ * rather than re-filtered every frame, and rebuilt from the very same
+ * app_class_t array the launcher menu already iterates, so the shell can
+ * never list an app the menu doesn't know about (or vice versa). An app
+ * with pinned_default/graphical set but no icon_draw is silently excluded
+ * from both -- the point of this shell is that launching is never
+ * text-only, so there is no "show it with a placeholder tile" fallback. */
+static const app_class_t *pinned_apps[NUM_APPS];
+static int num_pinned;
+static const app_class_t *drawer_apps[NUM_APPS];
+static int num_drawer_apps;
+
+static void build_shell_app_lists(void)
+{
+    num_pinned = 0;
+    num_drawer_apps = 0;
+    for (int i = 0; i < NUM_APPS; i++) {
+        const app_class_t *cls = g_apps[i];
+        if (!cls->icon_draw) {
+            continue;
+        }
+        if (cls->pinned_default) {
+            pinned_apps[num_pinned++] = cls;
+        }
+        if (cls->graphical) {
+            drawer_apps[num_drawer_apps++] = cls;
+        }
+    }
+}
 
 static void window_client_rect(const pude_window_t *win, int *cx, int *cy, int *cw, int *ch)
 {
@@ -227,6 +289,191 @@ static void draw_menu(SDL_Surface *s, bool menu_open)
     }
 }
 
+/* ---- Dock geometry/hit-testing -------------------------------------------- */
+
+static void dock_rect(int screen_w, int screen_h, int *x, int *y, int *w, int *h)
+{
+    int dw = DOCK_PAD * 2 + num_pinned * DOCK_ICON +
+             (num_pinned > 0 ? (num_pinned - 1) * DOCK_GAP : 0);
+    int dh = DOCK_PAD * 2 + DOCK_ICON;
+    if (dw > screen_w) dw = screen_w;
+    *w = dw;
+    *h = dh;
+    *x = (screen_w - dw) / 2;
+    *y = screen_h - dh - DOCK_MARGIN_B;
+    if (*x < 0) *x = 0;
+}
+
+static void dock_icon_rect(int i, int screen_w, int screen_h, int *x, int *y, int *w, int *h)
+{
+    int dx, dy, dw, dh;
+    dock_rect(screen_w, screen_h, &dx, &dy, &dw, &dh);
+    *x = dx + DOCK_PAD + i * (DOCK_ICON + DOCK_GAP);
+    *y = dy + DOCK_PAD;
+    *w = DOCK_ICON;
+    *h = DOCK_ICON;
+}
+
+/* Whether (mx,my) lands anywhere on the dock's background bar, icon or
+ * not -- used so a click on empty dock space is consumed there (the dock
+ * visually covers that screen area) rather than falling through to
+ * whatever window happens to be underneath it. */
+static bool dock_bar_hit(int mx, int my, int screen_w, int screen_h)
+{
+    int x, y, w, h;
+    dock_rect(screen_w, screen_h, &x, &y, &w, &h);
+    return point_in(mx, my, x, y, w, h);
+}
+
+/* Returns the pinned-app index under (mx,my), or -1 if the point isn't
+ * over any single icon (including "on the bar but between icons"). */
+static int dock_hit_test(int mx, int my, int screen_w, int screen_h)
+{
+    for (int i = 0; i < num_pinned; i++) {
+        int x, y, w, h;
+        dock_icon_rect(i, screen_w, screen_h, &x, &y, &w, &h);
+        if (point_in(mx, my, x, y, w, h)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void draw_dock(SDL_Surface *s, int screen_w, int screen_h,
+                       int mouse_x, int mouse_y, int press_idx)
+{
+    if (num_pinned == 0) {
+        return;
+    }
+    int dx, dy, dw, dh;
+    dock_rect(screen_w, screen_h, &dx, &dy, &dw, &dh);
+    pu_fill_rect(s, dx, dy, dw, dh, SDL_MapRGB(s->format, 30, 33, 42));
+    pu_draw_rect_outline(s, dx, dy, dw, dh, 1, SDL_MapRGB(s->format, 90, 95, 108));
+
+    int hover_idx = dock_hit_test(mouse_x, mouse_y, screen_w, screen_h);
+    for (int i = 0; i < num_pinned; i++) {
+        int x, y, w, h;
+        dock_icon_rect(i, screen_w, screen_h, &x, &y, &w, &h);
+        bool hovered = (hover_idx == i);
+        bool pressed = hovered && (press_idx == i);
+        pinned_apps[i]->icon_draw(s, x, y, w, h, hovered, pressed);
+    }
+
+    /* A small floating name tooltip above the hovered icon -- a nicety
+     * for confirming what an icon launches, not how launching is
+     * identified (docs/pude.md); the dock stays icon-driven either way. */
+    if (hover_idx >= 0) {
+        int x, y, w, h;
+        dock_icon_rect(hover_idx, screen_w, screen_h, &x, &y, &w, &h);
+        const char *name = pinned_apps[hover_idx]->name;
+        int tw = (int)strlen(name) * FONT_CELL_W + 8;
+        int th = FONT_CELL_H + 6;
+        int tx = x + w / 2 - tw / 2;
+        int ty = y - th - 6;
+        if (tx < 0) tx = 0;
+        if (tx + tw > screen_w) tx = screen_w - tw;
+        if (ty < 0) ty = 0;
+        Uint32 tip_bg = SDL_MapRGB(s->format, 20, 22, 28);
+        pu_fill_rect(s, tx, ty, tw, th, tip_bg);
+        pu_draw_rect_outline(s, tx, ty, tw, th, 1, SDL_MapRGB(s->format, 150, 155, 165));
+        pu_draw_string_centered(s, tx, ty, tw, th, name, 0xFFFFFF, tip_bg);
+    }
+}
+
+/* ---- App drawer geometry/hit-testing --------------------------------------
+ * The button lives permanently at a fixed top-left position (like the
+ * launcher menu button next to it); the popup it opens is centered on
+ * whatever the current screen size is, so it stays usable across every
+ * resolution PureUNIX's SDL backend can hand `pude` (docs/pude.md's
+ * "Framebuffer resolution handling" section). */
+
+static void drawer_btn_rect(int *x, int *y, int *w, int *h)
+{
+    *x = DRAWER_BTN_X;
+    *y = DRAWER_BTN_Y;
+    *w = DRAWER_BTN_W;
+    *h = DRAWER_BTN_H;
+}
+
+static void drawer_popup_rect(int screen_w, int screen_h, int *x, int *y, int *w, int *h)
+{
+    int cols = DRAWER_COLS;
+    int rows = (num_drawer_apps + cols - 1) / cols;
+    if (rows < 1) rows = 1;
+    int pw = DRAWER_PAD * 2 + cols * DRAWER_CELL_W;
+    int ph = DRAWER_PAD * 2 + rows * DRAWER_CELL_H;
+    if (pw > screen_w - 2 * MARGIN) pw = screen_w - 2 * MARGIN;
+    if (ph > screen_h - 2 * MARGIN) ph = screen_h - 2 * MARGIN;
+    *w = pw;
+    *h = ph;
+    *x = (screen_w - pw) / 2;
+    *y = (screen_h - ph) / 2;
+}
+
+static void drawer_icon_rect(int i, int screen_w, int screen_h, int *x, int *y, int *w, int *h)
+{
+    int px, py, pw, ph;
+    drawer_popup_rect(screen_w, screen_h, &px, &py, &pw, &ph);
+    (void)pw;
+    (void)ph;
+    int col = i % DRAWER_COLS;
+    int row = i / DRAWER_COLS;
+    int cx = px + DRAWER_PAD + col * DRAWER_CELL_W;
+    int cy = py + DRAWER_PAD + row * DRAWER_CELL_H;
+    *w = DRAWER_ICON;
+    *h = DRAWER_ICON;
+    *x = cx + (DRAWER_CELL_W - DRAWER_ICON) / 2;
+    *y = cy;
+}
+
+static int drawer_hit_test(int mx, int my, int screen_w, int screen_h)
+{
+    for (int i = 0; i < num_drawer_apps; i++) {
+        int x, y, w, h;
+        drawer_icon_rect(i, screen_w, screen_h, &x, &y, &w, &h);
+        if (point_in(mx, my, x, y, w, h)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void draw_drawer_button(SDL_Surface *s, int mouse_x, int mouse_y, bool drawer_open)
+{
+    int x, y, w, h;
+    drawer_btn_rect(&x, &y, &w, &h);
+    bool hovered = point_in(mouse_x, mouse_y, x, y, w, h);
+    /* Stays visually "pressed" for as long as the popup is open -- reads
+     * as a toggle, matching how the popup itself is dismissed (clicking
+     * this same button again). */
+    pu_icon_drawer(s, x, y, w, h, hovered, drawer_open);
+}
+
+static void draw_app_drawer(SDL_Surface *s, int screen_w, int screen_h,
+                             int mouse_x, int mouse_y, int press_idx)
+{
+    int px, py, pw, ph;
+    drawer_popup_rect(screen_w, screen_h, &px, &py, &pw, &ph);
+    Uint32 popup_bg = SDL_MapRGB(s->format, 32, 35, 44);
+    pu_fill_rect(s, px, py, pw, ph, popup_bg);
+    pu_draw_rect_outline(s, px, py, pw, ph, 2, SDL_MapRGB(s->format, 150, 155, 165));
+
+    int hover_idx = drawer_hit_test(mouse_x, mouse_y, screen_w, screen_h);
+    for (int i = 0; i < num_drawer_apps; i++) {
+        int x, y, w, h;
+        drawer_icon_rect(i, screen_w, screen_h, &x, &y, &w, &h);
+        bool hovered = (hover_idx == i);
+        bool pressed = hovered && (press_idx == i);
+        drawer_apps[i]->icon_draw(s, x, y, w, h, hovered, pressed);
+
+        int col = i % DRAWER_COLS;
+        int cell_x = px + DRAWER_PAD + col * DRAWER_CELL_W;
+        int label_y = y + h + 6;
+        pu_draw_string_clipped(s, cell_x + 2, label_y, DRAWER_CELL_W - 4,
+                                drawer_apps[i]->name, 0xFFFFFF, popup_bg);
+    }
+}
+
 /* A simple, unmistakable arrow pointer -- this environment has no host
  * compositor drawing a cursor overlay (real PS/2 mouse input, no window
  * system chrome, see docs/sdl-port.md), so without this the pointer
@@ -245,7 +492,9 @@ static void draw_cursor(SDL_Surface *s, int x, int y)
     }
 }
 
-static void render_frame(SDL_Window *sdl_win, SDL_Surface *s, bool menu_open, int mouse_x, int mouse_y)
+static void render_frame(SDL_Window *sdl_win, SDL_Surface *s, bool menu_open,
+                          bool drawer_open, int dock_press_idx, int drawer_press_idx,
+                          int mouse_x, int mouse_y)
 {
     SDL_Rect full = { 0, 0, s->w, s->h };
     SDL_FillRect(s, &full, SDL_MapRGB(s->format, 20, 24, 34));
@@ -255,6 +504,16 @@ static void render_frame(SDL_Window *sdl_win, SDL_Surface *s, bool menu_open, in
     }
 
     draw_menu(s, menu_open);
+    draw_dock(s, s->w, s->h, mouse_x, mouse_y, dock_press_idx);
+    draw_drawer_button(s, mouse_x, mouse_y, drawer_open);
+
+    /* Drawn last (aside from the cursor) so it's the one desktop-shell
+     * overlay guaranteed to sit above every application window and above
+     * the dock -- see docs/pude.md's "Overlay z-order" note. */
+    if (drawer_open) {
+        draw_app_drawer(s, s->w, s->h, mouse_x, mouse_y, drawer_press_idx);
+    }
+
     draw_cursor(s, mouse_x, mouse_y);
     SDL_UpdateWindowSurface(sdl_win);
 }
@@ -302,6 +561,7 @@ int main(int argc, char *argv[])
     win_count = 0;
     spawn_count = 0;
     memset(pool_used, 0, sizeof(pool_used));
+    build_shell_app_lists();
 
     key_mods_t mods = { false, false };
     bool menu_open = false;
@@ -317,7 +577,18 @@ int main(int argc, char *argv[])
     pude_window_t *mouse_down_target = NULL;
     int mouse_down_cx = 0, mouse_down_cy = 0; /* target window's client origin at press time */
 
-    render_frame(win, surface, menu_open, mouse_x, mouse_y);
+    /* Desktop-shell (dock/app-drawer) input state -- deliberately as
+     * minimal as the WM's own drag_mode above: an "armed" index set on
+     * mouse-down and only actually launched on mouse-up if the pointer is
+     * still over the same icon (docs/pude.md), so a press-drag-release
+     * off the icon (or off the whole dock/popup) cancels cleanly instead
+     * of launching from wherever the cursor ended up. */
+    bool drawer_open = false;
+    int dock_press_idx = -1;
+    int drawer_press_idx = -1;
+
+    render_frame(win, surface, menu_open, drawer_open, dock_press_idx, drawer_press_idx,
+                 mouse_x, mouse_y);
 
     while (!quit) {
         bool had_event = false;
@@ -343,7 +614,7 @@ int main(int argc, char *argv[])
                     if (mods.ctrl && sc == SDL_SCANCODE_F12) {
                         /* Emergency whole-desktop quit -- see docs/pude.md. */
                         quit = true;
-                    } else if (!menu_open && win_count > 0) {
+                    } else if (!menu_open && !drawer_open && win_count > 0) {
                         pude_window_t *top = win_order[win_count - 1];
                         if (top->cls->on_key) {
                             top->cls->on_key(top, top->state, sc, mods, true);
@@ -388,6 +659,48 @@ int main(int argc, char *argv[])
                     break;
                 }
                 int mx = ev.button.x, my = ev.button.y;
+
+                /* The app drawer is modal while open (same precedent as
+                 * the launcher menu just below): every click either hits
+                 * an icon (armed, not launched yet -- see mouse-up),
+                 * re-hits the toggle button (closes), or lands anywhere
+                 * else (closes without touching whatever window is
+                 * underneath, consuming the click either way so it can
+                 * never "pass through" to activate that window). */
+                if (drawer_open) {
+                    int dbx, dby, dbw, dbh;
+                    drawer_btn_rect(&dbx, &dby, &dbw, &dbh);
+                    if (point_in(mx, my, dbx, dby, dbw, dbh)) {
+                        drawer_open = false;
+                        break;
+                    }
+                    int idx = drawer_hit_test(mx, my, screen_w, screen_h);
+                    if (idx >= 0) {
+                        drawer_press_idx = idx;
+                    } else {
+                        drawer_open = false;
+                    }
+                    break;
+                }
+
+                {
+                    int dbx, dby, dbw, dbh;
+                    drawer_btn_rect(&dbx, &dby, &dbw, &dbh);
+                    if (point_in(mx, my, dbx, dby, dbw, dbh)) {
+                        drawer_open = true;
+                        break;
+                    }
+                }
+
+                if (dock_bar_hit(mx, my, screen_w, screen_h)) {
+                    /* Armed like the drawer's own icons above: launching
+                     * happens on mouse-up only if the pointer is still
+                     * over the same icon, so a press followed by a drag
+                     * off it (or a click on empty dock space, idx==-1)
+                     * never launches anything. */
+                    dock_press_idx = dock_hit_test(mx, my, screen_w, screen_h);
+                    break;
+                }
 
                 if (menu_open) {
                     int py = MENU_BTN_Y + MENU_BTN_H + 4;
@@ -459,6 +772,23 @@ int main(int argc, char *argv[])
                 if (ev.button.button != SDL_BUTTON_LEFT) {
                     break;
                 }
+                if (dock_press_idx >= 0) {
+                    int idx = dock_hit_test(ev.button.x, ev.button.y, screen_w, screen_h);
+                    if (idx == dock_press_idx) {
+                        spawn_window(pinned_apps[idx], screen_w, screen_h);
+                    }
+                    dock_press_idx = -1;
+                    break;
+                }
+                if (drawer_press_idx >= 0) {
+                    int idx = drawer_hit_test(ev.button.x, ev.button.y, screen_w, screen_h);
+                    if (idx == drawer_press_idx) {
+                        spawn_window(drawer_apps[idx], screen_w, screen_h);
+                        drawer_open = false;
+                    }
+                    drawer_press_idx = -1;
+                    break;
+                }
                 if (drag_mode == DRAG_RESIZE && drag_win) {
                     int cx, cy, cw, ch;
                     window_client_rect(drag_win, &cx, &cy, &cw, &ch);
@@ -518,7 +848,8 @@ int main(int argc, char *argv[])
         }
 
         if (need_redraw) {
-            render_frame(win, surface, menu_open, mouse_x, mouse_y);
+            render_frame(win, surface, menu_open, drawer_open, dock_press_idx, drawer_press_idx,
+                         mouse_x, mouse_y);
         }
 
         SDL_Delay(16);

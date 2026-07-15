@@ -283,4 +283,7 @@ const app_class_t calc_app_class = {
     .on_resize = calc_on_resize,
     .poll = NULL,
     .is_alive = NULL,
+    .icon_draw = pu_icon_calc,
+    .graphical = true,
+    .pinned_default = true,
 };

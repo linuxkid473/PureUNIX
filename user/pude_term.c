@@ -857,4 +857,7 @@ const app_class_t puterm_app_class = {
     .on_resize = puterm_on_resize,
     .poll = puterm_poll,
     .is_alive = puterm_is_alive,
+    .icon_draw = pu_icon_puterm,
+    .graphical = true,
+    .pinned_default = true,
 };

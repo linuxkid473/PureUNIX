@@ -575,7 +575,7 @@ $(BUILD)/user/pude_font.o: drivers/font.c
 
 DEPS += $(BUILD)/user/pude_font.d
 
-$(BUILD)/user/pude_term.o: user/pude_term.c user/pude_term.h user/pude_app.h user/pude_gfx.h user/pureunix_pty.h
+$(BUILD)/user/pude_term.o: user/pude_term.c user/pude_term.h user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pureunix_pty.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
 
@@ -584,7 +584,7 @@ DEPS += $(BUILD)/user/pude_term.d
 # pude_calc: the ring-3 GUI calculator app (user/pude_calc.c/.h, docs/pude.md)
 # -- pure userspace arithmetic + rendering, plugged into the WM through the
 # same app_class_t (user/pude_app.h) PUTerm uses.
-$(BUILD)/user/pude_calc.o: user/pude_calc.c user/pude_calc.h user/pude_app.h user/pude_gfx.h
+$(BUILD)/user/pude_calc.o: user/pude_calc.c user/pude_calc.h user/pude_app.h user/pude_gfx.h user/pude_icon.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
 
@@ -614,7 +614,7 @@ DEPS += $(BUILD)/user/pude_spawn.d
 # pude_files.c/.h, docs/pude.md) -- browses PureUNIX's real filesystem via
 # ordinary opendir()/readdir()/stat()/mkdir()/rmdir()/unlink()/rename(),
 # plugged into the WM through the same app_class_t PUTerm/Calculator use.
-$(BUILD)/user/pude_files.o: user/pude_files.c user/pude_files.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_launch.h user/pude_spawn.h user/pude_text.h
+$(BUILD)/user/pude_files.o: user/pude_files.c user/pude_files.h user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_widgets.h user/pude_launch.h user/pude_spawn.h user/pude_text.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
 
@@ -634,13 +634,13 @@ DEPS += $(BUILD)/user/pude_clipboard.d
 # real Open/Save/Save-As via the embedded pude_filepicker.h widget, and the
 # shared pude_clipboard.h for Copy/Cut/Paste, plugged into the WM through
 # the same app_class_t PUTerm/Calculator/PUFiles use.
-$(BUILD)/user/pude_text.o: user/pude_text.c user/pude_text.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_filepicker.h user/pude_clipboard.h
+$(BUILD)/user/pude_text.o: user/pude_text.c user/pude_text.h user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_widgets.h user/pude_filepicker.h user/pude_clipboard.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
 
 DEPS += $(BUILD)/user/pude_text.d
 
-$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h user/pude_text.h
+$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h user/pude_text.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
 
