@@ -14,7 +14,7 @@
 #include "pude_widgets.h"
 #include "pude_launch.h"
 #include "pude_spawn.h"
-#include "pude_term.h"
+#include "pude_text.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -358,26 +358,13 @@ static void pf_refresh(pufiles_state_t *st)
  * imgview via pude_launch_foreground() (docs/imgview.md) -- no PNG
  * decoding duplicated here; an executable bit refuses to run the file
  * (selecting a file must never execute it); everything else is assumed to
- * be plain text and opened with neatvi in a fresh PUTerm window via the
- * pude_spawn.h mailbox. */
-static void pf_build_edit_command(char *out, size_t cap, const char *path)
-{
-    char escaped[PF_PATH_MAX * 4];
-    size_t o = 0;
-    for (const char *p = path; *p && o + 4 < sizeof(escaped); p++) {
-        if (*p == '\'') {
-            escaped[o++] = '\'';
-            escaped[o++] = '\\';
-            escaped[o++] = '\'';
-            escaped[o++] = '\'';
-        } else {
-            escaped[o++] = *p;
-        }
-    }
-    escaped[o] = '\0';
-    snprintf(out, cap, "neatvi '%s'", escaped);
-}
-
+ * be plain text and opened in a fresh PUText window via the pude_spawn.h
+ * mailbox -- the desired "double-click README.txt -> PUText opens it"
+ * association (docs/pude.md's "PUText" section), covering .txt/.md/.c/.h/
+ * .lua/.conf/.cfg/.ini/.sh and anything else that isn't flagged
+ * executable, exactly like the previous neatvi-in-PUTerm default did (this
+ * is the same "not directory, not .png, not exec -> text" bucket, just
+ * opened in PUText's own graphical editor now instead of a terminal). */
 static void pf_open_entry(pufiles_state_t *st, int index)
 {
     if (index < 0 || index >= st->entry_count) {
@@ -415,10 +402,8 @@ static void pf_open_entry(pufiles_state_t *st, int index)
         return;
     }
 
-    char cmd[PUDE_SPAWN_CMD_MAX];
-    pf_build_edit_command(cmd, sizeof(cmd), full);
-    pude_request_spawn(&puterm_app_class, cmd);
-    pf_status_info(st, "opening in a new PUTerm window...");
+    pude_request_spawn(&putext_app_class, full);
+    pf_status_info(st, "opening in PUText...");
 }
 
 /* ---- toolbar + modal actions ------------------------------------------------ */

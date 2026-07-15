@@ -64,6 +64,19 @@ typedef struct {
     void (*on_mouse_down)(pude_window_t *win, void *state, int x, int y);
     void (*on_mouse_up)(pude_window_t *win, void *state, int x, int y);
 
+    /* Forwarded on every mouse-motion event for as long as the left button
+     * is held down *and* it was pressed inside this window's client area
+     * in the first place (the WM tracks "which window owns this drag" from
+     * its own on_mouse_down bookkeeping, same as on_mouse_up) -- never
+     * called while the WM itself is using the drag for window move/resize.
+     * Coordinates are client-relative like on_mouse_down/up but are NOT
+     * clamped to the client rect (a drag can go past a window's own edge,
+     * e.g. selecting text down to the last visible row); an app that cares
+     * should clamp itself. This is the one general mechanism a click-and-
+     * drag gesture (PUText's text selection) needs and PUFiles' click-only
+     * interactions never did. */
+    void (*on_mouse_move)(pude_window_t *win, void *state, int x, int y);
+
     /* Called once, after a mouse-driven resize completes, with the new
      * client-area size -- the one general-purpose mechanism every app uses
      * to learn its new drawable dimensions and re-layout/reflow. */
@@ -79,6 +92,19 @@ typedef struct {
      * exited) makes the WM close the window automatically, exactly like a
      * user-initiated close. */
     bool (*is_alive)(pude_window_t *win, void *state);
+
+    /* Optional gate on the close button (NULL = always OK to close right
+     * away, the old behavior every existing app keeps). Called once when
+     * the user clicks the close button; returning true lets the WM close
+     * the window immediately exactly as before. Returning false tells the
+     * WM to leave the window open -- the app is expected to have reacted
+     * by switching into its own in-window confirmation modal (e.g.
+     * PUText's "Discard unsaved changes?") as a side effect of this same
+     * call. There is no second callback for "the user confirmed" -- an app
+     * that wants to actually close after the user picks "Discard" sets
+     * win->self_close_request (below) from whatever click/key handler
+     * resolves that modal; the WM notices it on the very next frame. */
+    bool (*confirm_close)(pude_window_t *win, void *state);
 } app_class_t;
 
 struct pude_window {
@@ -86,6 +112,15 @@ struct pude_window {
     void *state;
     char title[48];
     int x, y, w, h; /* whole window, chrome included; owned by the WM */
+
+    /* WM-owned storage an app may set from any of its own callbacks (e.g.
+     * a "Discard & Close" button inside its own confirm_close modal) to
+     * ask the WM to close this exact window on its next frame -- the
+     * general escape hatch for "I already got the user's confirmation
+     * myself, now actually close me", since only user/pude.c's own
+     * close_window_at() may ever remove a window from the pool. Bypasses
+     * confirm_close entirely (it already did its job). */
+    bool self_close_request;
 };
 
 #endif

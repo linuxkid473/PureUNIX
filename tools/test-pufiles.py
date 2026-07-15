@@ -286,6 +286,9 @@ PF_NUM_BUTTONS = 5
 PF_DEFAULT_CW, PF_DEFAULT_CH = 480, 360
 PF_DIALOG_W, PF_DIALOG_H = 340, 116
 
+# ---- PUText's own default client size (user/pude_text.c) -----------------
+PUTEXT_DEFAULT_CW, PUTEXT_DEFAULT_CH = 560, 420
+
 
 def whole_size(client_w, client_h):
     return client_w + 2 * BORDER, client_h + 2 * BORDER + TITLEBAR_H
@@ -490,17 +493,17 @@ def main():
             shot(qemu, "04-testdir-real-files.ppm")
             transcript_check = qemu.tail()  # unused directly; screenshot is the proof
 
-            print("=== opening alpha.txt (real text file -> new PUTerm + neatvi) ===")
+            print("=== opening alpha.txt (real text file -> new PUText window) ===")
             qemu.send_key_combo("down")  # ".." is index 0; alpha.txt is index 1
             time.sleep(0.2)
             qemu.send_key_combo("ret")
             time.sleep(1.5)
-            shot(qemu, "05-alpha-txt-in-neatvi.ppm")
+            shot(qemu, "05-alpha-txt-in-putext.ppm")
 
-            print("=== closing the neatvi/PUTerm window ===")
-            puterm_x, puterm_y = spawn_position(1)
-            puterm_w, puterm_h = whole_size(80 * 8, 24 * FONT_CELL_H)
-            qemu.click_at(*close_button_center(puterm_x, puterm_y, puterm_w))
+            print("=== closing the PUText window ===")
+            putext_x, putext_y = spawn_position(1)
+            putext_w, putext_h = whole_size(PUTEXT_DEFAULT_CW, PUTEXT_DEFAULT_CH)
+            qemu.click_at(*close_button_center(putext_x, putext_y, putext_w))
             time.sleep(0.8)
             shot(qemu, "06-back-to-pufiles.ppm")
 

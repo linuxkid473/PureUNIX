@@ -28,6 +28,7 @@
 #include "pude_gfx.h"
 #include "pude_spawn.h"
 #include "pude_term.h"
+#include "pude_text.h"
 
 /* ---- Chrome layout ------------------------------------------------------- */
 
@@ -67,6 +68,7 @@ static const app_class_t *const g_apps[] = {
     &puterm_app_class,
     &calc_app_class,
     &pufiles_app_class,
+    &putext_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 
@@ -354,6 +356,12 @@ int main(int argc, char *argv[])
             case SDL_MOUSEMOTION:
                 mouse_x = ev.motion.x;
                 mouse_y = ev.motion.y;
+                if (drag_mode == DRAG_NONE && mouse_down_target &&
+                    mouse_down_target->cls->on_mouse_move) {
+                    mouse_down_target->cls->on_mouse_move(mouse_down_target, mouse_down_target->state,
+                                                           mouse_x - mouse_down_cx,
+                                                           mouse_y - mouse_down_cy);
+                }
                 if (drag_mode == DRAG_MOVE && drag_win) {
                     drag_win->x = mouse_x - drag_off_x;
                     drag_win->y = mouse_y - drag_off_y;
@@ -414,7 +422,14 @@ int main(int argc, char *argv[])
 
                     if (point_in(mx, my, bx, by, bw, bh)) {
                         int z = win_count - 1; /* just brought to front */
-                        close_window_at(z);
+                        /* confirm_close == NULL keeps every existing app's
+                         * old behavior (close immediately); an app that
+                         * has one and returns false is expected to have
+                         * put up its own in-window modal as a side effect
+                         * of this same call -- see pude_app.h. */
+                        if (!w->cls->confirm_close || w->cls->confirm_close(w, w->state)) {
+                            close_window_at(z);
+                        }
                     } else if (point_in(mx, my, gx0, gy0, RESIZE_GRIP, RESIZE_GRIP)) {
                         drag_mode = DRAG_RESIZE;
                         drag_win = w;
@@ -476,6 +491,8 @@ int main(int argc, char *argv[])
         if (pude_take_spawn_request(&spawn_cls, spawn_cmd, sizeof(spawn_cmd))) {
             if (spawn_cls == &puterm_app_class) {
                 puterm_set_startup_command(spawn_cmd);
+            } else if (spawn_cls == &putext_app_class) {
+                putext_set_startup_path(spawn_cmd);
             }
             spawn_window(spawn_cls, screen_w, screen_h);
             had_event = true;
@@ -494,7 +511,7 @@ int main(int argc, char *argv[])
          * and never takes the rest of the desktop down with it. */
         for (int i = win_count - 1; i >= 0; i--) {
             pude_window_t *w = win_order[i];
-            if (w->cls->is_alive && !w->cls->is_alive(w, w->state)) {
+            if ((w->cls->is_alive && !w->cls->is_alive(w, w->state)) || w->self_close_request) {
                 close_window_at(i);
                 need_redraw = true;
             }

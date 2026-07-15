@@ -17,7 +17,7 @@ same as `tty`/`ping`/`neatvi`).
     initially NO windows open at all)
 ```
 
-Three apps are registered today:
+Four apps are registered today:
 
 - **PUTerm** — a real terminal emulator (user/pude_term.c/.h) backed by a
   real PTY (include/pureunix/pty.h) and a real, forked+exec'd BusyBox ash.
@@ -26,14 +26,17 @@ Three apps are registered today:
 - **PUFiles** — a real ring-3 graphical file manager (user/pude_files.c/.h)
   backed by PureUNIX's actual filesystem (see this document's "PUFiles"
   section below).
+- **PUText** — a real ring-3 graphical text editor (user/pude_text.c/.h)
+  with a dynamic document buffer, real Open/Save/Save-As, clipboard, and
+  mouse/keyboard selection (see this document's "PUText" section below).
 
-All three plug into the same generic window/app abstraction
+All four plug into the same generic window/app abstraction
 (`user/pude_app.h`) — `user/pude.c` itself contains **no PUTerm,
-Calculator, or PUFiles logic whatsoever**, only window list management,
-chrome rendering/hit-testing, the launcher, and the top-level SDL event
-loop. Multiple windows can be open at once, of the same or different apps
-(e.g. two PUTerm windows and a Calculator simultaneously), each fully
-independent.
+Calculator, PUFiles, or PUText logic whatsoever**, only window list
+management, chrome rendering/hit-testing, the launcher, and the top-level
+SDL event loop. Multiple windows can be open at once, of the same or
+different apps (e.g. two PUTerm windows and a Calculator simultaneously,
+or two independent PUText documents), each fully independent.
 
 ## Architecture: the app_class_t abstraction
 
@@ -57,10 +60,20 @@ typedef struct {
                      key_mods_t mods, bool down);
     void  (*on_mouse_down)(pude_window_t *win, void *state, int x, int y);
     void  (*on_mouse_up)(pude_window_t *win, void *state, int x, int y);
+    void  (*on_mouse_move)(pude_window_t *win, void *state, int x, int y);
     void  (*on_resize)(pude_window_t *win, void *state, int new_client_w, int new_client_h);
     bool  (*poll)(pude_window_t *win, void *state);
     bool  (*is_alive)(pude_window_t *win, void *state);
+    bool  (*confirm_close)(pude_window_t *win, void *state);
 } app_class_t;
+
+struct pude_window {
+    const app_class_t *cls;
+    void *state;
+    char title[48];
+    int x, y, w, h;
+    bool self_close_request; /* app-settable; see confirm_close below */
+};
 ```
 
 Only `create`/`destroy`/`render` are mandatory — everything else is
@@ -70,12 +83,36 @@ Calculator) simply leaves those NULL. `pude_window_t` is the WM-owned
 per-instance record: whole-window geometry (chrome included) plus the
 app's own opaque `state` pointer returned by `create()`.
 
+**`on_mouse_move`** (added for PUText's click-and-drag text selection —
+PUFiles' own click-only toolbar/list interactions never needed it) is
+forwarded on every mouse-motion event for as long as the left button is
+held down *and* it was originally pressed inside this same window's
+client area — never called while the WM itself is using the drag for
+window move/resize. Coordinates are client-relative like `on_mouse_down`/
+`on_mouse_up` but not clamped to the client rect (a drag can go past a
+window's own edge); an app that cares clamps itself.
+
+**`confirm_close`** (added for PUText's unsaved-change protection) is an
+optional gate on the close button — `NULL` keeps every existing app's old
+behavior (close immediately). Returning `true` lets the WM close the
+window right away, same as before; returning `false` tells the WM to
+leave the window open, and the app is expected to have reacted by
+switching into its own in-window confirmation modal as a side effect of
+that same call (PUText's "Discard unsaved changes?"). There is no second
+callback for "the user confirmed" — an app that wants to actually close
+after the user picks Discard sets **`win->self_close_request = true`**
+from whatever click/key handler resolves that modal; the WM notices it on
+its very next frame and closes the window, bypassing `confirm_close`
+entirely (it already did its job). This mirrors `pude_spawn.h`'s existing
+"app requests, WM acts" pattern rather than letting an app mutate the
+window pool/z-order itself.
+
 **Adding another app** means: write a `.c`/`.h` implementing this vtable
 (see `user/pude_calc.c` for the smallest real example), add a build rule
 to the Makefile (pattern-matches `pude_term.o`/`pude_calc.o`/
-`pude_files.o`'s existing rules exactly), link its `.o` into `PUDE_ELF`,
-and add one line to `user/pude.c`'s `g_apps[]` registry. Nothing else in
-the WM changes.
+`pude_files.o`/`pude_text.o`'s existing rules exactly), link its `.o` into
+`PUDE_ELF`, and add one line to `user/pude.c`'s `g_apps[]` registry.
+Nothing else in the WM changes.
 
 ## Window manager: `user/pude.c`
 
@@ -185,6 +222,65 @@ Deliberately not a full GUI toolkit: no layout engine, no widget tree, no
 event dispatch of its own — just the handful of pieces that were about to
 be duplicated a second time. Add more only when a third real app needs
 the same thing again.
+
+## Reusable file picker: `user/pude_filepicker.h`
+
+Added while building PUText, which needed a real graphical Open and
+Save-As flow and found nothing reusable: PUFiles (`user/pude_files.c`) is
+a whole `app_class_t`, not something another app can embed, and
+`pu_textinput_t` has no directory listing/navigation of its own. Rather
+than duplicate PUFiles' browsing logic a second time inside PUText, this
+is a small, generic, embeddable widget — header-only (`static inline`),
+same convention as `pude_gfx.h`/`pude_widgets.h` — that any app can drop
+into its own state struct and draw/hit-test as a centered modal over its
+own client area (the same convention PUFiles' own New Folder/Rename/
+Delete dialogs already use, taken one step further into a real directory
+browser).
+
+`pu_filepicker_t` owns: the current directory, a real `opendir()`/
+`readdir()`/`stat()`-backed entry listing (dirs-first, case-insensitive —
+same sort as PUFiles' `pf_compare()`), a selection/scroll position, and
+(Save mode only) a `pu_textinput_t` for the filename. Two constructors —
+`pu_filepicker_open_init()` / `pu_filepicker_save_init()` — pick the mode;
+`pu_filepicker_on_mouse_down()` / `pu_filepicker_on_key()` handle
+navigation (Up button, double-click/Enter into a directory, Home/End/
+PageUp/PageDown/arrow-key selection, typing into the filename field in
+Save mode) and return a `pu_fp_result_t` (`PU_FP_NONE` /
+`PU_FP_CONFIRMED` / `PU_FP_CANCELLED`) the embedding app checks after
+every call; `pu_filepicker_draw()` renders it; `pu_filepicker_result_path()`
+joins the current directory with the selected entry (Open) or typed
+filename (Save) into the caller's own buffer. There is no filesystem
+mutation anywhere in this widget — it only ever reads a directory and
+hands back a path string, exactly the boundary PUText's own Open/Save
+logic (real `fopen()`/`fwrite()`) needs on the other side of it.
+
+Like `pude_widgets.h`, deliberately not a full toolkit: no drag-to-resize,
+no breadcrumbs, no favorites/recents list — just enough to browse to a
+file or type a new filename, which is the whole job Save-As and Open need
+done.
+
+## Cross-app clipboard: `user/pude_clipboard.h`/`.c`
+
+A tiny desktop-session-local, text-only clipboard shared by every `pude`
+app — the general mechanism PUText's Ctrl+C/X/V need, built the same way
+`pude_spawn.h`'s cross-app mailbox was: real shared mutable state in its
+own `.c` file (not header-only), because this genuinely is shared state
+between translation units, not a stateless helper. `pude_clipboard_set(text,
+len)` replaces the clipboard's contents (freeing the old buffer);
+`pude_clipboard_get(&len)` returns a pointer to the current contents (valid
+until the next `set()`, so a caller that needs to keep it copies it out);
+`pude_clipboard_has_data()` reports whether anything is stored.
+
+"Desktop-session-local" means the data lives in `pude`'s own process
+memory for as long as it's running — there is no cross-reboot persistence
+and no host-OS clipboard integration (this environment has neither),
+exactly like every other cross-window mechanism in this desktop
+(`pude_spawn.h`'s mailbox, the window pool itself). Because it's real
+shared state in one process's address space (not private per-instance
+state inside PUText), Ctrl+C in one PUText window and Ctrl+V in a
+*different* PUText window round-trips correctly today, and any future app
+(PUTerm selection, PUFiles multi-select copy/paste, ...) can read/write
+the same clipboard without PUText knowing anything about it.
 
 ## Launching a foreground program: `user/pude_launch.c`/`.h`
 
@@ -359,12 +455,14 @@ not per-extension special casing sprinkled around:
 - a file with **any** execute permission bit set is refused outright
   (`"refusing to run an executable file"`, shown in the status bar) —
   selecting a file must never execute it, full stop;
-- anything else is assumed to be plain text and opened with `neatvi` in a
-  brand-new PUTerm window (`pude_request_spawn(&puterm_app_class, cmd)`,
-  the path single-quote-escaped for the shell) — covers `.txt`/`.md`/
-  `.c`/`.h`/`.lua`/anything else that isn't flagged executable, reusing
-  existing PureUNIX software rather than building a text editor into
-  PUFiles itself.
+- anything else is assumed to be plain text and opened in a brand-new
+  **PUText** window (`pude_request_spawn(&putext_app_class, full)`, this
+  document's "PUText" section below) — covers `.txt`/`.md`/`.c`/`.h`/
+  `.lua`/`.conf`/`.cfg`/`.ini`/`.sh`/anything else that isn't flagged
+  executable, the desired "double-click a text file → PUText opens it
+  already loaded" flow. (Before PUText existed, this same bucket opened
+  `neatvi` in a fresh PUTerm window instead — same dispatch rule, just a
+  real graphical editor on the other end of it now.)
 
 **Create/rename/delete** all go through a small, reusable modal built
 from `pude_widgets.h`'s button/text-input primitives (drawn centered over
@@ -414,6 +512,192 @@ change: a real `rename()` wrapper in `user/newlib_syscalls.c` calling
 (`fs/vfs.c`, `fs/ext2/write.c`) already implement a real, atomic,
 directory-safe rename; it just had never been reachable from any
 newlib-linked program (`pude`, PUTerm's shell, BusyBox, ...) before this.
+
+## PUText: a real graphical text editor
+
+`user/pude_text.c`/`.h` is a real ring-3 text editor, plugged into the WM
+through the same `app_class_t` PUTerm/Calculator/PUFiles use. It replaces
+PUFiles' previous default of opening a plain text file with `neatvi`
+inside a fresh PUTerm window (see "Opening files" below) — the same
+"assumed to be text, not an extension allowlist" dispatch rule as before,
+just handed to a real graphical editor now instead of a terminal one.
+
+### Document buffer
+
+`pt_doc_t` is a dynamic array of dynamically-grown lines (`pt_line_t`) —
+deliberately not `neatvi`'s `lbuf.c` (inspected for ideas, not embedded:
+that structure is built around `ex`/regex/undo machinery this editor
+doesn't need) and deliberately not a fixed-size buffer. Each line grows
+via `realloc()` doubling with no built-in ceiling on length; the line
+array itself grows the same way, so there is no built-in ceiling on
+document size either, beyond real available heap — the ring-3 `sbrk()`
+heap (`include/pureunix/vmm.h`) is a real, incrementally-grown 32 MiB
+region (added during the Chocolate Doom port), more than enough for any
+reasonable text file with nothing PUText-specific needed to reach it.
+
+Core operations, all working directly on byte offsets within lines:
+- `pt_doc_split_line(doc, row, col)` / `pt_doc_join_line(doc, row)` — the
+  two primitives Enter and Backspace-at-column-0/Delete-at-end-of-line
+  are built from; split creates a new line holding the tail past `col`,
+  join appends the next line onto the end of this one and removes it.
+- `pt_doc_delete_range(doc, r0,c0,r1,c1)` — deletes an arbitrary
+  (possibly multi-line) range in one call: same-line is a simple
+  substring delete, multi-line truncates the first line at `c0`, appends
+  the last line's tail past `c1`, and removes every line strictly between.
+- `pt_doc_insert_text(doc, row, col, text, len)` — inserts arbitrary text
+  that may contain embedded `'\n'`s, splitting lines as needed; the one
+  primitive both typed-Enter (a single `'\n'`) and a multi-line paste
+  share.
+- `pt_doc_get_range(doc, r0,c0,r1,c1)` — extracts a range as one malloc'd
+  buffer (embedded lines joined with `'\n'`) for Copy/Cut.
+
+**Load/save and the trailing-newline edge case**: `pt_doc_load()` reads
+the whole file, then splits on `'\n'` — an empty file becomes one empty
+line; a file whose last byte isn't `'\n'` becomes lines with no implied
+trailing one; any number of consecutive `'\n'`s becomes that many empty
+lines; all uniformly, no special-casing. A `trailing_newline` flag
+(learned from whether the *last* byte of the loaded file was `'\n'`,
+`false` for a brand-new document) is reproduced exactly on save, so a
+fresh empty document saves as a real 0-byte file, a file loaded without a
+trailing newline round-trips without gaining one, and a normal file
+round-trips byte-for-byte.
+
+### Cursor and selection model
+
+`(row, col)` byte-offset pairs. A selection is just an anchor `(row,col)`
+plus the live cursor — normalized on demand via `pt_sel_range()` (returns
+`(r0,c0) <= (r1,c1)`), not a separate object kept in sync. Every cursor
+movement (arrow keys, Home/End, Page Up/Down, mouse click/drag) goes
+through one function, `pt_move_cursor_to()`, which starts a new anchor
+the first time Shift is held (and only then), so keyboard and mouse
+selection share exactly the same extend/collapse logic — there is no
+separate "mouse selection" code path from "keyboard selection". Vertical
+movement (Up/Down/Page Up/Down) tracks a `desired_col` ("goal column")
+separately from the live cursor column, so moving down through a short
+line and back up doesn't lose the original horizontal position — standard
+editor behavior, cheap to get right once the anchor/cursor split already
+exists.
+
+Mouse click-and-drag selection needed one real, general WM change:
+`app_class_t` had no mouse-motion callback at all before this (PUFiles'
+own interactions are all single-click; see `pude_app.h`'s `on_mouse_move`
+in the architecture section above) — added rather than worked around,
+since a text editor without drag-to-select would not be a real editor.
+
+### Scrolling
+
+`scroll_top` (first visible line) and `scroll_col` (first visible
+column, in characters — the font is fixed-width, so this is exact, no
+sub-character scrolling to reason about) are kept in sync with the cursor
+by `pt_ensure_visible()`, called after every edit and every cursor move:
+clamps `scroll_top`/`scroll_col` to bring the live cursor back into the
+visible `rows × cols` window whenever it would otherwise leave it,
+exactly like PUFiles' own `pf_ensure_visible()`. A resize
+(`putext_on_resize`) recomputes visible rows/cols from the new client
+size and re-clamps — the same "never stretch a fixed-size rendering, only
+re-lay-out" rule Calculator's button grid and PUFiles' list already
+follow.
+
+### Clipboard
+
+Ctrl+C/X/V go through `user/pude_clipboard.h`'s real cross-app clipboard
+(see that section above), not private per-window state — copying in one
+PUText window and pasting in a second, independent PUText window works
+today, and any future app can read/write the same clipboard.
+
+### File picker (Open / Save As)
+
+Both flows use the embeddable `user/pude_filepicker.h` widget (see that
+section above), drawn as a modal centered over PUText's own client area —
+never a hardcoded path. **Open**: if the current document has unsaved
+changes, a "Discard unsaved changes?" confirm modal appears first (see
+"Unsaved-change protection" below); otherwise the picker opens directly
+in Open mode rooted at the current file's directory (or `/` for a new
+document). Selecting a real file (double-click, or Enter with something
+selected) loads it and resets cursor/scroll/selection/modified state.
+**Save**: `Ctrl+S`/the Save button writes directly to the already-known
+path if the document has one; a brand-new Untitled document (or explicit
+**Save As** / `Ctrl+Shift+S`) opens the same picker in Save mode instead,
+pre-filled with the current filename if any, with a filename text field
+alongside the directory listing — typing a name and clicking Save (or
+pressing Enter) writes there. There is no overwrite-confirmation dialog
+in this first version (a known limitation, see below) — Save-As onto an
+existing name just overwrites it, same as many simple editors.
+
+### Unsaved-change protection
+
+Two independent paths, both driven by the same `st->modified` flag (set
+by every editing operation, cleared by a successful Open/Save):
+**New/Open** check it directly and switch into an in-window "Discard
+unsaved changes?" modal before proceeding if it's set (Cancel returns to
+editing untouched, Discard proceeds with New or Open). **Closing the
+window** uses the general `confirm_close` mechanism added to
+`app_class_t` for exactly this (see the architecture section above):
+`putext_confirm_close()` returns `true` immediately (close now, no modal)
+if the document is unmodified, or switches into the same confirm modal
+and returns `false` (leave the window open) if it isn't — clicking
+"Discard & Close" inside that modal sets `win->self_close_request = true`,
+which the WM notices on its next frame and closes for real. Both a
+just-saved (unmodified) window closing with no modal at all, and a
+modified window's Cancel/Discard both working correctly, are exercised by
+`tools/test-putext.py`.
+
+### Performance: a solid, not blinking, caret
+
+This tree has no damage-rect compositor — `user/pude.c`'s `render_frame()`
+redraws the whole desktop surface whenever anything changes; every other
+app in this desktop already only causes a redraw in response to real
+input (PUTerm's `poll()` redraws only when the pty actually produced
+output; Calculator and PUFiles have no `poll()` at all). A traditional
+*blinking* caret would need a periodic timer forcing a full-desktop
+repaint roughly twice a second for as long as any PUText window stayed
+open, purely to toggle a caret — exactly the kind of needless redraw
+traffic this project has fought before (see the framebuffer/cursor-lag
+project history). PUText's caret is deliberately **solid, not blinking**:
+it's still a real, visible, correctly-positioned text cursor (satisfying
+the actual requirement), but it sidesteps the performance question by
+construction rather than by adding a WM-wide damage-tracking system this
+one app doesn't otherwise need — zero *additional* redraw traffic beyond
+what typing/moving/scrolling already causes. Building a real damage-rect
+compositor for the whole WM remains open future work if a future app
+genuinely needs partial-frame redraws; nothing about PUText's own
+rendering (`render()` is already scoped to its own `cx,cy,cw,ch` client
+rect by the existing `app_class_t` contract) would need to change if one
+is added later.
+
+### Testing: `tools/test-putext.py`
+
+Same QMP/HMP injection technique as `tools/test-pude.py`/
+`tools/test-pufiles.py`, against a scratch copy of the real `make iso`
+disk image. Exercises, screenshot- and/or real-file-content-verified:
+launching PUText from the launcher; typing multiple lines; moving the
+cursor into previously-typed text (Home/Up/Up); inserting text in the
+middle of a line (arrow-key navigation + typing); deleting text
+(Backspace); selecting text with the keyboard (Home, Shift+End); Copy/
+paste elsewhere in the document; selecting text with the mouse (click +
+drag); Cut then immediately Paste back at the same spot (verified via the
+invariant that this must reproduce the exact original document,
+regardless of exactly which on-screen region the drag landed on — this
+environment's synthetic PS/2 mouse motion isn't pixel-exact, so the test
+doesn't lean on that precision anywhere); saving a brand-new Untitled
+document through the graphical Save-As picker; closing PUText; a second,
+independent PUText window/document open at the same time as the first;
+unsaved-change protection (a modified window's close button shows a real
+modal; an unmodified one closes immediately with none); opening a real
+text file from PUFiles (keyboard-navigated to bring an off-screen row
+into view first, since PUFiles has no scrollbar/mouse-wheel — see its own
+known limitations) and confirming PUText launches with it already loaded;
+resizing the reopened window and confirming it stays correct (typing one
+more character post-resize); and, the strongest check, the exact expected
+file content verified via a real BusyBox ash `cat` both in the same boot
+and after a completely separate second QEMU process reboots the same
+on-disk image (real persistence, not just "the process kept running" —
+same technique `tools/test-pufiles.py` uses). One real, unrelated project
+gotcha rediscovered while writing this test: `drivers/vga.c`'s always-on
+scroll-perf reporter can splice `PERF scroll ...` lines into `cat`'s own
+output on this shared serial console; the test runs `clear` first and
+filters any such lines before comparing content, rather than asserting an
+exact contiguous transcript match.
 
 ## Testing
 
@@ -471,8 +755,10 @@ fixture at `/pngtest.png`): boots the scratch disk, captures a real
 each entry sorts in PUFiles' own listing (so the script never has to
 guess a row's on-screen position), then drives PUFiles end to end —
 launching it from the launcher; opening a real multi-file directory
-(`/testdir`) and a real text file (`alpha.txt`) into a fresh PUTerm
-running `neatvi`; Up-button parent navigation; `mkdir()`-ing a real
+(`/testdir`) and a real text file (`alpha.txt`) into a fresh PUText
+window (this document's "PUText" section — the file-association path
+`tools/test-putext.py` also exercises in more depth); Up-button parent
+navigation; `mkdir()`-ing a real
 folder and opening it with a real mouse double-click (correctly showing
 it as empty); creating 16 more real subfolders to force list overflow
 and scrolling it back to the top via the keyboard; drag-resizing the
@@ -513,10 +799,12 @@ also asserted against the real serial transcript.
   `on_key` is NULL. A future revision wanting numeric-keypad entry would
   just implement that callback.
 - **PUFiles has no scrollbar or mouse-wheel scrolling** — this platform's
-  input model has neither (`pu_input_event_t` has no scroll event, and
-  `app_class_t` has no mouse-motion callback for a drag-to-scroll
-  gesture); Up/Down/PageUp/PageDown/Home/End on the keyboard are the only
-  way to scroll a long listing.
+  input model has no scroll event (`pu_input_event_t`); Up/Down/PageUp/
+  PageDown/Home/End on the keyboard are the only way to scroll a long
+  listing. (`app_class_t` gained a mouse-motion callback, `on_mouse_move`,
+  for PUText's click-and-drag text selection — but nothing about PUFiles'
+  own click-only list interaction uses it, and drag-to-scroll would still
+  need a real scroll gesture or a scrollbar thumb neither exists yet.)
 - **PUFiles' delete is never recursive** — `rmdir()` on a non-empty
   directory correctly fails visibly (`ENOTEMPTY`) rather than deleting
   its contents; deleting a whole tree needs deleting its contents first,
@@ -530,3 +818,32 @@ also asserted against the real serial transcript.
   updating until the external program exits. This is intentional (see
   this document's own section on it above), not a bug: a fullscreen
   program legitimately owns the entire display until it exits.
+- **PUText's caret is solid, not blinking** — a deliberate choice, not an
+  oversight; see this document's "PUText" section for the reasoning
+  (there is no damage-rect compositor in this tree, so a blinking caret
+  would mean a periodic full-desktop repaint for as long as any PUText
+  window stayed open).
+- **PUText assumes single-byte/ASCII text** — cursor columns and file
+  I/O are plain byte offsets; a valid UTF-8 file loads and saves its
+  bytes correctly (nothing mutates them), but multi-byte characters
+  render and count as multiple single-byte glyph cells rather than one
+  visually-correct character, the same limitation `drivers/vga.c`'s own
+  console and PUTerm's cell grid already have.
+- **No word-wrap** — a long line simply scrolls horizontally
+  (`scroll_col`), it never breaks onto a second visual row.
+- **Tab inserts 4 literal spaces**, not a real tab stop — there is no
+  tab-aware column math anywhere in the renderer; simplest correct choice
+  given the fixed-width font already in use everywhere else in this
+  desktop.
+- **No undo/redo, no syntax highlighting, no find/replace** — out of
+  scope for this first version; nothing about the document buffer
+  (`pt_doc_t`) or cursor/selection model would need to change to add any
+  of these later (undo in particular would layer naturally on top of the
+  existing insert/delete/split/join primitives).
+- **Save-As has no overwrite confirmation** — typing the name of a file
+  that already exists and clicking Save just overwrites it, same as many
+  simple editors; a known, deliberate scope cut, not a bug.
+- **`pude_filepicker.h` has no create-new-folder** (unlike PUFiles' own
+  New Folder dialog) — Save-As can only save into a directory that
+  already exists; navigate to/create the target directory in PUFiles
+  first if it doesn't.

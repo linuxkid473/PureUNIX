@@ -614,13 +614,33 @@ DEPS += $(BUILD)/user/pude_spawn.d
 # pude_files.c/.h, docs/pude.md) -- browses PureUNIX's real filesystem via
 # ordinary opendir()/readdir()/stat()/mkdir()/rmdir()/unlink()/rename(),
 # plugged into the WM through the same app_class_t PUTerm/Calculator use.
-$(BUILD)/user/pude_files.o: user/pude_files.c user/pude_files.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_launch.h user/pude_spawn.h user/pude_term.h
+$(BUILD)/user/pude_files.o: user/pude_files.c user/pude_files.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_launch.h user/pude_spawn.h user/pude_text.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
 
 DEPS += $(BUILD)/user/pude_files.d
 
-$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h
+# pude_clipboard: a tiny desktop-session-local, text-only clipboard shared
+# by every pude app (user/pude_clipboard.c/.h, docs/pude.md's "PUText"
+# section) -- real shared mutable state, same convention as pude_spawn.c.
+$(BUILD)/user/pude_clipboard.o: user/pude_clipboard.c user/pude_clipboard.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_clipboard.d
+
+# pude_text: PUText, a real ring-3 graphical text editor (user/
+# pude_text.c/.h, docs/pude.md) -- a dynamic line-array document buffer,
+# real Open/Save/Save-As via the embedded pude_filepicker.h widget, and the
+# shared pude_clipboard.h for Copy/Cut/Paste, plugged into the WM through
+# the same app_class_t PUTerm/Calculator/PUFiles use.
+$(BUILD)/user/pude_text.o: user/pude_text.c user/pude_text.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pude_filepicker.h user/pude_clipboard.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_text.d
+
+$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h user/pude_text.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
 
@@ -628,10 +648,10 @@ DEPS += $(BUILD)/user/pude.d
 
 PUDE_ELF := $(BUILD)/user/pude.elf
 
-$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
-		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_font.o \
+		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o \
 		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
 
 # Chocolate Doom 3.1.1 (vendored upstream source under
