@@ -21,7 +21,7 @@ like any other installed program (`tools/mkext2.py` stages
     initially NO windows open at all)
 ```
 
-Four apps are registered today:
+Five apps are registered today:
 
 - **PUTerm** — a real terminal emulator (user/pude_term.c/.h) backed by a
   real PTY (include/pureunix/pty.h) and a real, forked+exec'd BusyBox ash.
@@ -33,14 +33,18 @@ Four apps are registered today:
 - **PUText** — a real ring-3 graphical text editor (user/pude_text.c/.h)
   with a dynamic document buffer, real Open/Save/Save-As, clipboard, and
   mouse/keyboard selection (see this document's "PUText" section below).
+- **Settings** — a small ring-3 GUI app (user/pude_settings.c/.h) exposing
+  exactly one setting today, the desktop wallpaper (see this document's
+  "Settings" section below).
 
-All four plug into the same generic window/app abstraction
+All five plug into the same generic window/app abstraction
 (`user/pude_app.h`) — `user/pude.c` itself contains **no PUTerm,
-Calculator, PUFiles, or PUText logic whatsoever**, only window list
-management, chrome rendering/hit-testing, the launcher, and the top-level
-SDL event loop. Multiple windows can be open at once, of the same or
-different apps (e.g. two PUTerm windows and a Calculator simultaneously,
-or two independent PUText documents), each fully independent.
+Calculator, PUFiles, PUText, or Settings logic whatsoever**, only window
+list management, chrome rendering/hit-testing, the launcher, and the
+top-level SDL event loop. Multiple windows can be open at once, of the
+same or different apps (e.g. two PUTerm windows and a Calculator
+simultaneously, or two independent PUText documents), each fully
+independent.
 
 ## Architecture: the app_class_t abstraction
 
@@ -145,13 +149,13 @@ drift out of sync with what's actually registered:
   procedural icon. `NULL` means "don't show this app in the dock or
   drawer" (there is no text-label fallback — see "Icon drawing
   infrastructure" below for why).
-- **`graphical`** — true for every app with a real windowed UI (all four
+- **`graphical`** — true for every app with a real windowed UI (all five
   today). Drives app-drawer membership. Exists so a hypothetical future
   non-graphical `app_class_t` (a headless helper registered in `g_apps[]`
   for some unrelated reason) can opt out of the drawer without needing a
   parallel filter list.
 - **`pinned_default`** — true for exactly PUTerm, Calculator, PUFiles,
-  and PUText today. Drives dock membership.
+  PUText, and Settings today. Drives dock membership.
 
 `user/pude.c`'s `build_shell_app_lists()` (called once at startup) filters
 `g_apps[]` into `pinned_apps[]`/`drawer_apps[]` by these two booleans
@@ -188,12 +192,14 @@ hover/press state the way a drawn shape does.
 `pu_icon_tile()` is the shared background every icon in the file draws
 itself onto first — flat face, lightened on hover, darkened with an inset
 border when pressed — so the whole icon set reads as one consistent
-button language rather than four unrelated drawings; it also returns the
+button language rather than unrelated drawings; it also returns the
 largest centered square sub-rect so each icon's own content-drawing code
-never has to re-derive it. The four app icons (`pu_icon_putext`,
-`pu_icon_calc`, `pu_icon_pufiles`, `pu_icon_puterm`) and the drawer
+never has to re-derive it. The five app icons (`pu_icon_putext`,
+`pu_icon_calc`, `pu_icon_pufiles`, `pu_icon_puterm`, `pu_icon_settings` — a
+gear, teeth built the same "nested `pu_fill_rect()`" way as every other
+icon here since `pude_gfx.h` has no circle primitive) and the drawer
 toggle's own icon (`pu_icon_drawer`, a 3×3 grid of dots) all follow this
-same pattern; adding a fifth app's icon means adding one more function
+same pattern; adding a sixth app's icon means adding one more function
 here in the same style, not touching the dock/drawer's own drawing code
 at all.
 
@@ -889,6 +895,113 @@ output on this shared serial console; the test runs `clear` first and
 filters any such lines before comparing content, rather than asserting an
 exact contiguous transcript match.
 
+## Settings: `user/pude_settings.c`/`.h`, `user/pude_wallpaper.c`/`.h`
+
+A small, real ring-3 GUI app exposing exactly one setting today: the
+desktop wallpaper. Plugs into the WM through the same `app_class_t` every
+other app uses (`settings_app_class`, pinned to the dock by default). Its
+own logic is a thin UI layer — a "Wallpaper" section showing the current
+wallpaper path, and a "Choose..." button that opens the same embedded
+`pude_filepicker.h` widget PUText's own Open uses (OPEN mode, started in
+the current wallpaper's directory if one is set, `/` otherwise) — every
+real piece of wallpaper handling (decode, scale, cache, persist) lives in
+`user/pude_wallpaper.c`/`.h` instead, so it can be driven from `user/
+pude.c`'s own startup path too, not just from Settings.
+
+`pu_filepicker_t` has no extension filtering of its own (it lists every
+entry in a directory, same as PUText's Open/Save pickers), so "only allow
+PNG images" is a plain case-insensitive `.png` suffix check on the
+confirmed path (`settings_has_png_ext()`) — a non-`.png` selection sets
+the picker's own `status_msg` to an error and leaves it open, exactly like
+a real Open dialog rejecting an unsupported type, rather than a new
+filtering parameter threaded through the shared widget for one caller.
+
+### Wallpaper decode/scale/cache: `user/pude_wallpaper.c`
+
+Real upstream libpng/zlib (`third_party/libpng`, `third_party/zlib`,
+docs/imgview.md) — the identical decode recipe `user/imgview.c`'s
+`load_png()` already uses (normalize every PNG color type/bit depth/
+transparency form to plain 8-bit RGBA via libpng's own documented
+transform chain), duplicated rather than shared because imgview is a
+separate freestanding ELF built without SDL at all, while this file is
+one more translation unit linked into the SDL-based `pude` binary. No
+hand-rolled PNG decoding anywhere, and wallpapers are never embedded as C
+arrays — every wallpaper is a real file loaded from the filesystem at
+runtime.
+
+Decoding only ever happens **once per wallpaper change** (a user picking
+a new one in Settings) **or once at `pude` startup** (loading whatever
+`/etc/pude.conf` already names from a previous boot) — never per frame.
+`pude_wallpaper_set()`/`pude_wallpaper_init()` decode the PNG, scale it
+**aspect-fill** ("cover": `scale = max(screen_w/img_w, screen_h/img_h)`,
+centered and cropped on whichever axis overflows — the opposite of
+`imgview.c`'s own aspect-*fit* letterboxing, since a desktop wallpaper
+should fill the screen, not letterbox) to the real screen size with a
+one-time nearest-neighbour resample, and cache the result as a plain
+`Uint32[]` buffer already in the screen surface's native pixel format
+(`SDL_MapRGB()` called once per output pixel during this one-time scale,
+not per frame). Any genuine alpha in the source PNG is blended against
+the same solid color `render_frame()` falls back to, so a wallpaper with
+transparency never exposes uninitialized pixels.
+
+`user/pude.c`'s `render_frame()` calls `pude_wallpaper_render(s)` in place
+of its old unconditional `SDL_FillRect()`: a cached wallpaper is a
+straight `memcpy()` of the pre-scaled buffer into the screen surface (a
+row-by-row copy if the surface's pitch has padding, one `memcpy()` if
+not); no wallpaper cached (nothing configured, or the configured one
+failed to decode) falls back to the exact same solid desktop color as
+before. Both paths cost the same O(screen pixels) `render_frame()` was
+already paying for its old flat fill, and `render_frame()` itself still
+only runs when the WM's existing `need_redraw` gating says a frame needs
+compositing (see "Performance" above) — this feature adds no new redraw
+frequency, and does not touch the cursor-only-redraw discussion there at
+all.
+
+**Failure handling**: `pude_wallpaper_set()`/`_init()` return false on any
+failure (bad path, not a real PNG, corrupt data, allocation failure) and
+leave whatever was cached before **untouched** — Settings shows an error
+and the desktop keeps showing the last-known-good wallpaper (or the solid
+fallback, if none was ever successfully applied), never a blank/corrupt
+frame.
+
+### Configuration file: `/etc/pude.conf`
+
+A single `key=value` line, the smallest format that can express one
+setting:
+
+```
+wallpaper=/home/photo.png
+```
+
+Read once by `pude_wallpaper_init()` at `pude` startup (real `fopen()`/
+`fgets()` against PureUNIX's real EXT2 `/etc`, same directory `/etc/
+passwd` already lives in — no new filesystem convention). Written by
+`pude_wallpaper_set()` every time a wallpaper is successfully applied
+(real `fopen(..., "w")`/`fprintf()`), so the most recently chosen
+wallpaper is exactly what the next boot restores. A missing file, or a
+file that names a wallpaper that no longer loads, just leaves nothing
+cached (solid-color fallback) — never a startup failure. Extending this
+format later (a second setting) only ever needs one more `strncmp()`
+prefix check in `wp_read_config_path()`, not a format change.
+
+### Testing: `tools/test-pude-settings.py`
+
+Same QMP/HMP injection technique as `tools/test-pude-dock.py`, plus a
+real second/independent QEMU process against the same on-disk image to
+prove reboot persistence (`tools/test-imgview.py`'s own technique).
+Pre-seeds `/etc/pude.conf` and a `/wallpapers/` directory with four
+fixtures (`tools/gen-test-pngs.py`'s PNG writer, plus one deliberately
+invalid `.png` and one non-image file) with a known, deterministic sort
+order, so every row in the picker's listing has a fixed screen position —
+avoiding the need to guess/scan a real root directory's contents. Exercises,
+with real screendump pixel checks (not just "no crash"): `pude` applying
+the seeded wallpaper at startup with no user interaction at all; opening
+Settings from its dock icon; rejecting a non-PNG selection without closing
+the picker; a same-extension-but-corrupt file failing to apply and falling
+back to the previous wallpaper; a second, valid, distinctly-colored PNG
+applying immediately; and the newly-chosen wallpaper (not just the
+originally-seeded one) surviving a real reboot.
+
 ## Testing
 
 `tools/test-pude.py` (rewritten for the multi-window desktop, same QMP
@@ -930,10 +1043,11 @@ Exercises, all screenshot-verified against real rendered pixels:
 
 `tools/test-pude-dock.py` (new, same QMP/HMP injection technique): boots
 the persistent disk image, launches `pude`, and drives the dock and app
-drawer end to end — hovering all four pinned dock icons; confirming a
+drawer end to end — hovering all five pinned dock icons; confirming a
 click on empty dock background space launches nothing; launching PUText,
 Calculator, PUFiles, and PUTerm from the dock one at a time (proving
-multi-window coexistence exactly like the launcher menu's own test);
+multi-window coexistence exactly like the launcher menu's own test;
+Settings has its own dedicated driver below, so isn't launched here);
 typing into the dock-launched PUTerm to confirm it's a fully working
 instance, not a stub; closing all four via their close buttons; opening
 the app drawer via its graphical (grid-of-dots) button and confirming the
@@ -943,6 +1057,9 @@ the drawer over that now-open window to confirm it renders above it
 (z-order); and clicking outside the popup to confirm it dismisses cleanly
 without also activating the window underneath. All screenshot-verified
 for stale pixels, icon legibility, and correct z-order.
+
+`tools/test-pude-settings.py` — see this document's "Settings" section
+above.
 
 **Full regression suite unaffected**: `make run-test` — `systest`
 343/345 (the same 2 pre-existing, unrelated console-geometry failures,
@@ -1053,3 +1170,14 @@ also asserted against the real serial transcript.
   New Folder dialog) — Save-As can only save into a directory that
   already exists; navigate to/create the target directory in PUFiles
   first if it doesn't.
+- **Settings has exactly one setting (wallpaper)** — a deliberate scope
+  cut for this first version, not a placeholder; nothing about
+  `settings_app_class`'s layout or `pude_wallpaper.h`'s API assumes it
+  can't grow a second section later.
+- **The wallpaper file picker's `.png`-only filtering happens after
+  confirming, not while browsing** — `pu_filepicker_t` itself has no
+  extension-filtering parameter (it lists every entry, same as PUText's
+  Open/Save pickers), so a directory listing still shows non-PNG files;
+  picking one just re-shows the picker with an error instead of closing
+  it, rather than threading a new filter option through a widget every
+  other caller already uses unfiltered.

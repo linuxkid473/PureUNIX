@@ -27,9 +27,11 @@
 #include "pude_files.h"
 #include "pude_gfx.h"
 #include "pude_icon.h"
+#include "pude_settings.h"
 #include "pude_spawn.h"
 #include "pude_term.h"
 #include "pude_text.h"
+#include "pude_wallpaper.h"
 
 /* ---- Chrome layout ------------------------------------------------------- */
 
@@ -100,6 +102,7 @@ static const app_class_t *const g_apps[] = {
     &calc_app_class,
     &pufiles_app_class,
     &putext_app_class,
+    &settings_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 
@@ -496,8 +499,12 @@ static void render_frame(SDL_Window *sdl_win, SDL_Surface *s, bool menu_open,
                           bool drawer_open, int dock_press_idx, int drawer_press_idx,
                           int mouse_x, int mouse_y)
 {
-    SDL_Rect full = { 0, 0, s->w, s->h };
-    SDL_FillRect(s, &full, SDL_MapRGB(s->format, 20, 24, 34));
+    /* Cached wallpaper blit (user/pude_wallpaper.h) if one is configured,
+     * or the same solid desktop color this used to fill unconditionally
+     * otherwise -- pude_wallpaper_render() never decodes/scales here, only
+     * copies an already-scaled buffer, so this redraw stays exactly as
+     * cheap as the flat fill it replaces. */
+    pude_wallpaper_render(s);
 
     for (int i = 0; i < win_count; i++) {
         draw_window_chrome(s, win_order[i], i == win_count - 1);
@@ -555,6 +562,12 @@ int main(int argc, char *argv[])
     }
 
     int screen_w = surface->w, screen_h = surface->h;
+
+    /* Must run before the first render_frame() below (and before any
+     * window can open) -- it caches the real screen size/pixel format
+     * pude_wallpaper_set() needs later, and applies whatever wallpaper
+     * /etc/pude.conf already names from a previous boot. */
+    pude_wallpaper_init(surface);
 
     /* The desktop starts with no windows open at all -- the launcher is
      * the only way to open one. */

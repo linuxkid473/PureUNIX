@@ -10,6 +10,12 @@ graphify-out/
 
 __pycache__/
 
+# extra-files/: local drop-in files staged onto the OS image by the
+# Makefile's EXTRA_FILES_ARGS (see Makefile's own comment above $(DISK2))
+# -- personal, not version-controlled.
+extra-files/*
+!extra-files/.gitkeep
+
 # macOS
 .DS_Store
 

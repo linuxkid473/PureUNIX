@@ -1,5 +1,6 @@
 CROSS ?= i686-elf-
 CC := $(CROSS)gcc
+CXX := $(CROSS)g++
 AS := $(CROSS)gcc
 LD := $(CROSS)gcc
 AR := $(CROSS)ar
@@ -54,6 +55,26 @@ NEWLIB_DIR := third_party/newlib/i686-elf
 # "compat headers shadow the vendored ones" trick user/vi/compat/ uses.
 NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include
 NEWLIB_LDFLAGS := $(USER_LDFLAGS) -L$(NEWLIB_DIR)/lib
+
+# Vendored libstdc++-v3 (see third_party/libstdcxx/README.md and
+# tools/build-libstdcxx.sh) — cross-built from real upstream GCC 16.1.0
+# source against the vendored newlib above, since i686-elf-g++ (Homebrew)
+# was built --without-headers and never got a target libstdc++ of its own
+# (docs/qt-port.md section 1). libstdc++'s own include dirs must come
+# *before* NEWLIB_CFLAGS: headers like <cstdlib> do `#include_next
+# <stdlib.h>`, which needs newlib's real stdlib.h to still be later in the
+# search path, not already consumed by this same directory.
+LIBSTDCXX_DIR := third_party/libstdcxx/i686-elf
+LIBSTDCXX_CFLAGS := -isystem $(LIBSTDCXX_DIR)/include/c++/16.1.0 \
+	-isystem $(LIBSTDCXX_DIR)/include/c++/16.1.0/i686-elf \
+	$(NEWLIB_CFLAGS)
+LIBSTDCXX_LDFLAGS := $(NEWLIB_LDFLAGS) -L$(LIBSTDCXX_DIR)/lib
+# No -ffreestanding (unlike USER_CFLAGS): it makes GCC predefine
+# __STDC_HOSTED__=0, which libstdc++ headers read to decide whether to
+# expose the real hosted library at all — PureUnix genuinely is hosted here
+# (real newlib libc, real syscalls), see docs/qt-port.md section 1.
+USER_CXXFLAGS := -std=gnu++17 -O2 -Wall -Wextra -Wno-unused-parameter \
+	-fno-stack-protector -fno-pic -fno-pie -m32 -march=i686 -Iinclude
 
 KERNEL_C_SRCS := $(shell find kernel arch drivers fs libc shell editor net -name '*.c' | sort)
 KERNEL_AS_SRCS := $(shell find boot arch -name '*.S' | sort)
@@ -640,7 +661,18 @@ $(BUILD)/user/pude_text.o: user/pude_text.c user/pude_text.h user/pude_app.h use
 
 DEPS += $(BUILD)/user/pude_text.d
 
-$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_spawn.h user/pude_text.h
+# pude_settings: Settings, the ring-3 GUI app exposing the desktop
+# wallpaper setting (user/pude_settings.c/.h, docs/pude.md) -- plugged
+# into the WM through the same app_class_t PUTerm/Calculator/PUFiles/
+# PUText use. Drives user/pude_wallpaper.h's public API; never touches
+# libpng/zlib itself (that dependency is confined to pude_wallpaper.o).
+$(BUILD)/user/pude_settings.o: user/pude_settings.c user/pude_settings.h user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_widgets.h user/pude_filepicker.h user/pude_wallpaper.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_settings.d
+
+$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_settings.h user/pude_spawn.h user/pude_text.h user/pude_wallpaper.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
 
@@ -648,11 +680,20 @@ DEPS += $(BUILD)/user/pude.d
 
 PUDE_ELF := $(BUILD)/user/pude.elf
 
-$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
-		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o \
-		-Wl,--start-group $(SDL_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o \
+		-Wl,--start-group $(SDL_LIB) $(LIBPNG_LIB) $(ZLIB_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
+
+# $(LIBPNG_LIB)/$(ZLIB_LIB) aren't defined until further down this file
+# (see the zlib/libpng port section) -- this second, recipe-less rule for
+# the same target only adds them as *prerequisites* (so `make` rebuilds
+# pude.elf if either static lib changes); the actual link recipe above
+# already references both by name, which is safe regardless of where in
+# this file they're defined (recipes expand at build time, once the whole
+# Makefile has been read, unlike a prerequisite list).
+$(PUDE_ELF): $(LIBPNG_LIB) $(ZLIB_LIB)
 
 # Chocolate Doom 3.1.1 (vendored upstream source under
 # third_party/chocolate-doom/ -- see that directory's README.md and
@@ -825,6 +866,18 @@ $(LIBPNG_LIB): $(LIBPNG_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIBPNG_OBJS)
 
+# pude_wallpaper: `pude`'s desktop wallpaper (user/pude_wallpaper.c/.h,
+# docs/pude.md's "Settings" section) -- decodes a user-chosen PNG with the
+# same real upstream libpng/zlib ports above (not a copy: same $(LIBPNG_LIB)/
+# $(ZLIB_LIB) archives imgview links against), so it has to be compiled
+# after both are defined here rather than alongside the rest of `pude`'s
+# other app_class_t object rules further up this file.
+$(BUILD)/user/pude_wallpaper.o: user/pude_wallpaper.c user/pude_wallpaper.h $(LIBPNG_BUILD)/pnglibconf.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -I$(LIBPNG_BUILD) -I$(LIBPNG_SRC) -I$(ZLIB_SRC) -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_wallpaper.d
+
 # Real zlib/libpng headers + static libs installed onto the EXT2 image at
 # the same /usr/include, /usr/lib TCC_SYSROOT_FILES already populates with
 # newlib's own headers/libc.a (TCC_USR_INCLUDE/TCC_USR_LIB above) -- so both
@@ -881,7 +934,7 @@ $(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_as
 
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -935,6 +988,26 @@ $(NEWLIB_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_crt0
 	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $< \
 		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
 
+# C++ programs (see NEWLIB_CXX_PROGRAMS below): same newlib_crt0/
+# newlib_syscalls startup as the C newlib programs above, but compiled with
+# $(CXX) against the vendored libstdc++ (LIBSTDCXX_CFLAGS/LDFLAGS) and
+# linked with $(CXX) as the driver rather than $(LD)=$(CC), so it pulls in
+# libstdc++/libsupc++'s own exception-handling glue correctly.
+NEWLIB_CXX_PROGRAMS := cxxtest
+NEWLIB_CXX_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(NEWLIB_CXX_PROGRAMS)))
+NEWLIB_CXX_PROG_OBJS := $(addprefix $(BUILD)/user/,$(addsuffix .o,$(NEWLIB_CXX_PROGRAMS)))
+
+$(NEWLIB_CXX_PROG_OBJS): $(BUILD)/user/%.o: user/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) -MMD -MP -c $< -o $@
+
+$(NEWLIB_CXX_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(CXX) $(LIBSTDCXX_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $< \
+		-Wl,--start-group -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -o $@
+
+DEPS += $(NEWLIB_CXX_PROG_OBJS:.o=.d)
+
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -MMD -MP -c $< -o $@
@@ -946,12 +1019,26 @@ $(BUILD)/%.o: %.S
 DOCS_DIR := docs
 DOCS_MD := $(shell find $(DOCS_DIR) -name '*.md' 2>/dev/null)
 
-$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) tools/mkfat16.py $(DOCS_MD)
-	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS)
+# extra-files/: a local drop-in directory for staging arbitrary host files
+# (e.g. a custom desktop wallpaper PNG for Settings, docs/pude.md's
+# "Settings" section) onto the OS image with no Makefile edit needed --
+# every file found under here is copied onto the image at the same path
+# relative to /, e.g. extra-files/wallpaper.png lands at /wallpaper.png,
+# extra-files/home/photo.png lands at /home/photo.png. Uses tools/
+# mkext2.py's existing generic --extra-file HOST:DEST mechanism (the same
+# one $(CHOCDOOM_IWAD)/$(ZLIB_LIBPNG_EXTRA_FILES) already use above), so
+# there's no second copy of that logic. Not version-controlled (see
+# .gitignore) -- purely a local convenience directory, empty by default.
+EXTRA_FILES_DIR := extra-files
+EXTRA_FILES_HOST := $(shell find $(EXTRA_FILES_DIR) -type f -not -name '.*' 2>/dev/null | sort)
+EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubst $(EXTRA_FILES_DIR)/%,%,$(f)))
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES)
+$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
+	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
+
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 disk: $(DISK) $(DISK2)
 
@@ -962,9 +1049,9 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES)
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the

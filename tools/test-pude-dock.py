@@ -11,8 +11,11 @@ actually moves this environment's real PS/2 mouse). Captures QMP
 pixels, icon legibility, cursor trails, z-order).
 
 Exercises, in order:
-  1. The dock is visible on the plain desktop with exactly four pinned
-     icons (PUTerm, Calculator, PUFiles, PUText) -- no auto-opened window.
+  1. The dock is visible on the plain desktop with its five pinned icons
+     (PUTerm, Calculator, PUFiles, PUText, Settings) -- no auto-opened
+     window. Only the original four are individually launched/verified
+     below; Settings has its own dedicated driver, tools/test-pude-
+     settings.py.
   2. Hovering each dock icon in turn (visual-only, screenshotted).
   3. Launching PUText, Calculator, PUFiles, and PUTerm from the dock, one
      at a time -- each produces a real chrome-decorated window using the
@@ -222,7 +225,12 @@ DOCK_ICON = 44
 DOCK_GAP = 10
 DOCK_PAD = 10
 DOCK_MARGIN_B = 14
-NUM_PINNED = 4  # PUTerm, Calculator, PUFiles, PUText -- g_apps[] order
+NUM_PINNED = 5  # PUTerm, Calculator, PUFiles, PUText, Settings -- g_apps[]
+                # order (docs/pude.md's "Settings" section) -- this test
+                # only exercises the original four by index (0-3, unaffected
+                # by Settings being appended last), but the dock/drawer are
+                # centered on the *total* pinned/graphical count, so a
+                # wrong NUM_PINNED here would silently mis-click every icon.
 
 MENU_BTN_X, MENU_BTN_Y, MENU_BTN_W, MENU_BTN_H = 8, 8, 90, 26
 DRAWER_BTN_X = MENU_BTN_X + MENU_BTN_W + 8
@@ -235,7 +243,7 @@ DRAWER_CELL_W = 96
 DRAWER_CELL_H = 96
 DRAWER_COLS = 4
 DRAWER_PAD = 16
-NUM_DRAWER_APPS = 4  # same four, all graphical=true
+NUM_DRAWER_APPS = 5  # same five, all graphical=true
 
 BORDER = 3
 TITLEBAR_PAD = 6

@@ -181,6 +181,49 @@ static inline void pu_icon_puterm(SDL_Surface *s, int x, int y, int w, int h,
     pu_fill_rect(s, gx + clen + cw, by + bh / 2 - curh / 2, curw, curh, prompt);
 }
 
+/* ---- Settings: a gear -- a square hub ringed by eight stubby teeth, plus
+ * a recessed center hole. Every other icon in this file is built the same
+ * way (nested pu_fill_rect() calls, no circle primitive exists in
+ * pude_gfx.h), so a gear reads as "square teeth around a square body"
+ * rather than a true polygon -- legible at dock/drawer sizes without
+ * needing a new drawing primitive just for this one icon. ---- */
+static inline void pu_icon_settings(SDL_Surface *s, int x, int y, int w, int h,
+                                     bool hovered, bool pressed)
+{
+    int sz, ox, oy;
+    pu_icon_tile(s, x, y, w, h, hovered, pressed, &sz, &ox, &oy);
+
+    Uint32 body = SDL_MapRGB(s->format, 175, 180, 190);
+    Uint32 edge = SDL_MapRGB(s->format, 90, 94, 104);
+    Uint32 hole = SDL_MapRGB(s->format, 40, 42, 50);
+
+    int hub = sz * 5 / 10;
+    int hx = ox + (sz - hub) / 2, hy = oy + (sz - hub) / 2;
+
+    int tooth = sz * 16 / 100 > 2 ? sz * 16 / 100 : 2;
+    /* Eight teeth: the four edge-midpoints plus the four corners, each a
+     * small square straddling the hub's own border. */
+    struct { int cx, cy; } teeth[8] = {
+        { hx + hub / 2, hy },                 /* top */
+        { hx + hub / 2, hy + hub },            /* bottom */
+        { hx, hy + hub / 2 },                  /* left */
+        { hx + hub, hy + hub / 2 },             /* right */
+        { hx, hy },                             /* top-left */
+        { hx + hub, hy },                       /* top-right */
+        { hx, hy + hub },                       /* bottom-left */
+        { hx + hub, hy + hub },                 /* bottom-right */
+    };
+    for (int i = 0; i < 8; i++) {
+        pu_fill_rect(s, teeth[i].cx - tooth / 2, teeth[i].cy - tooth / 2, tooth, tooth, body);
+    }
+
+    pu_fill_rect(s, hx, hy, hub, hub, body);
+    pu_draw_rect_outline(s, hx, hy, hub, hub, 1, edge);
+
+    int hole_sz = hub * 4 / 10 > 2 ? hub * 4 / 10 : 2;
+    pu_fill_rect(s, hx + (hub - hole_sz) / 2, hy + (hub - hole_sz) / 2, hole_sz, hole_sz, hole);
+}
+
 /* ---- App-drawer button: a 3x3 grid of dots, distinguishing it from any
  * single app's icon at a glance. ---- */
 static inline void pu_icon_drawer(SDL_Surface *s, int x, int y, int w, int h,

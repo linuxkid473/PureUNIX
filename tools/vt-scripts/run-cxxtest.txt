@@ -1,0 +1,12 @@
+# Runs the real C++ runtime regression suite (user/cxxtest.cpp) from a
+# freshly booted VT1 shell and waits for its final "=== N passed, M failed"
+# summary line — proves global ctors ran before main() (the "ABC" ordering
+# check), new/delete, new[]/delete[], virtual dispatch through a real
+# vtable, std::string/std::vector/std::unique_ptr, std::sort, and a real
+# thrown/caught C++ exception, all against the vendored libstdc++
+# (third_party/libstdcxx) cross-built for i686 PureUnix.
+WAIT #\s*$
+TYPE /bin/cxxtest.elf
+WAIT === \d+ passed
+WAIT \[global destructors\] final g_ctor_log = "ABCcba"
+SLEEP 1
