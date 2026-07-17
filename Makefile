@@ -1139,6 +1139,21 @@ $(BUILD)/user/qpa_pureunix/pureunixplugin.o: user/qpa_pureunix/pureunixplugin.cp
 
 DEPS += $(QT_PUREUNIX_QPA_OBJS:.o=.d)
 
+# QtWidgets (docs/qt-port.md Phase 6's own "Phase 5" sub-step,
+# user/qtwidgetstest.cpp): adds the QtWidgets include path and its own 3
+# compiled-in resource object files (Qt6WidgetsTargets.cmake's real
+# INTERFACE_LINK_LIBRARIES/TARGET_OBJECTS -- same "real CMake object
+# libraries, not part of libQt6Widgets.a itself" situation QT_GUI_RESOURCE_OBJS
+# already documents for Gui) -- no new *third-party* dependency beyond
+# what QT_PUREUNIX_QPA_LIBS already brings in (Qt6Widgets only adds
+# Qt6::Core/Qt6::Gui to its own real link-library list).
+QT_WIDGETS_CFLAGS := $(QT_PUREUNIX_QPA_CFLAGS) -isystem $(QT_DIR)/include/QtWidgets \
+	-isystem $(QT_DIR)/include/QtWidgets/6.5.3 -isystem $(QT_DIR)/include/QtWidgets/6.5.3/QtWidgets
+QT_WIDGETS_RESOURCE_OBJS := $(QT_DIR)/lib/objects-Release/Widgets_resources_1/.rcc/qrc_qstyle.cpp.o \
+	$(QT_DIR)/lib/objects-Release/Widgets_resources_2/.rcc/qrc_qstyle1.cpp.o \
+	$(QT_DIR)/lib/objects-Release/Widgets_resources_3/.rcc/qrc_qmessagebox.cpp.o
+QT_PUREUNIX_QPA_WIDGETS_LIBS := -lQt6Widgets $(QT_PUREUNIX_QPA_LIBS)
+
 QT_PROGRAMS := qtcoretest qtguitest
 QT_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(QT_PROGRAMS)))
 # qtwindowtest.elf (docs/qt-port.md Phase 6, the "pureunix" QPA plugin
@@ -1158,7 +1173,7 @@ QT_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(QT_PROGRAMS)))
 # disk boot path, which reads EXT2 from a real/virtual disk on demand
 # rather than preloading the whole image into RAM, and has no such
 # ceiling at all).
-QT_STANDALONE_ELFS := $(BUILD)/user/qtwindowtest.elf
+QT_STANDALONE_ELFS := $(BUILD)/user/qtwindowtest.elf $(BUILD)/user/qtwidgetstest.elf
 
 # A second, recipe-less rule for the already-defined `all` target, adding
 # QT_STANDALONE_ELFS as a real prerequisite -- `all:`'s own prerequisite
@@ -1219,7 +1234,23 @@ $(BUILD)/user/qtwindowtest.elf: $(BUILD)/user/qtwindowtest.o $(QT_PUREUNIX_QPA_O
 		$(BUILD)/user/qtwindowtest.o $(QT_PUREUNIX_QPA_OBJS) $(QT_GUI_RESOURCE_OBJS) \
 		-Wl,--start-group $(QT_PUREUNIX_QPA_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
 
-DEPS += $(BUILD)/user/qtcoretest.d $(BUILD)/user/qtguitest.d $(BUILD)/user/qtwindowtest.d
+
+# qtwidgetstest.cpp (docs/qt-port.md Phase 6's "Phase 5" sub-step): a real
+# QApplication + QMainWindow/QLabel/QLineEdit/QTextEdit/QPushButton
+# widgets app against the same "pureunix" QPA plugin qtwindowtest.cpp
+# already verified end-to-end -- no Q_OBJECT classes of its own (the
+# button-click lambda needs no moc), same "plain compile" reasoning.
+$(BUILD)/user/qtwidgetstest.o: user/qtwidgetstest.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_WIDGETS_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/qtwidgetstest.elf: $(BUILD)/user/qtwidgetstest.o $(QT_PUREUNIX_QPA_OBJS) $(QT_GUI_RESOURCE_OBJS) $(QT_WIDGETS_RESOURCE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/qtwidgetstest.o $(QT_PUREUNIX_QPA_OBJS) $(QT_GUI_RESOURCE_OBJS) $(QT_WIDGETS_RESOURCE_OBJS) \
+		-Wl,--start-group $(QT_PUREUNIX_QPA_WIDGETS_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
+
+DEPS += $(BUILD)/user/qtcoretest.d $(BUILD)/user/qtguitest.d $(BUILD)/user/qtwindowtest.d $(BUILD)/user/qtwidgetstest.d
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)

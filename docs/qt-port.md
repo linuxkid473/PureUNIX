@@ -37,10 +37,15 @@ heap start address too small for a large static binary's own code segment
 `CR4.OSFXSR`/FXSAVE-FXRSTOR support (any ring-3 SSE instruction was a
 guaranteed kernel panic), and a process-group bug that hung `pude`'s own
 Ctrl+F12 emergency-quit forever whenever a Qt window was open — see the
-Phase 6 section below for all four. **Not yet started: real QtWidgets
-apps (`QLabel`/`QPushButton`/`QLineEdit`/`QTextEdit`/`QMainWindow`,
-layouts) and font deployment (glyphs currently render as tofu boxes, no
-font files are on the disk image yet).** This
+Phase 6 section below for all four. **Phase 5 (real QtWidgets) attempted
+and hit a genuine, unfixed architectural blocker: a widget whose natural
+size hint exceeds the window's initially granted size drives the QPA
+plugin into an infinite repaint loop** (`user/qtwidgetstest.cpp` builds
+and links fine; deliberately NOT wired into `pude`'s live launcher menu
+until this is root-caused — see the Phase 6 section's own writeup for
+the full bisection and next debugging steps). Font deployment is also
+still pending (glyphs currently render as tofu boxes, no font files are
+on the disk image yet). This
 document is the living record of the Qt 6 port (pinned version,
 toolchain, patches, protocol, architecture, limitations) required by the
 port's own acceptance criteria.
@@ -1034,15 +1039,110 @@ the known 343/345 baseline, every other `tools/vt-scripts/*.txt` still
    `SIGKILL`, so a future app that doesn't cleanly exit on SIGHUP for
    some other reason can never hang the whole desktop again either.
 
-Next when resuming: Phase 4 (input) is wired and stable but not yet
-*visually* round-trip-verified (`TestWindow` has nothing interactive to
-confirm a keystroke landed correctly) — that naturally falls out of
-Phase 5. Phase 5 (real QtWidgets — `QLabel`/`QPushButton`/`QLineEdit`/
-`QTextEdit`/`QMainWindow`/layouts) is the next real milestone and hasn't
-been started. Font rendering currently shows tofu boxes instead of glyphs
-(`QFontDatabase: Cannot find font directory`) — deploying a real font
-(e.g. DejaVu, per Qt's own suggestion) onto the disk image is a
-prerequisite for Phase 5 actually being legible, not just architecturally
-present. Keep `kernel/heap.c`'s `HEAP_SIZE` in mind if a future QtWidgets
-test binary approaches ~20 MiB even stripped — it may need raising again (a real,
-independent-of-RAM kernel heap ceiling, not the disk/RAM tension above).
+## Phase 5 attempt: real QtWidgets — genuine architectural blocker found (unfixed)
+
+`user/qtwidgetstest.cpp` (a real, unmodified `QApplication` +
+`QMainWindow` + `QVBoxLayout`/`QHBoxLayout` + `QLabel`/`QLineEdit`/
+`QTextEdit`/`QPushButton`) builds and links cleanly against the same
+"pureunix" QPA plugin, and is wired into the Makefile
+(`QT_WIDGETS_CFLAGS`/`QT_WIDGETS_RESOURCE_OBJS`/
+`QT_PUREUNIX_QPA_WIDGETS_LIBS`, `QT_STANDALONE_ELFS`) exactly like
+`qtwindowtest.elf` — real-symbol `libQt6Widgets.a`, its own 3 compiled-in
+resource objects (`Widgets_resources_1/2/3`), one new libc gap fixed for
+real (`pathconf()`/`fpathconf()`, `user/newlib_syscalls.c` — real answers
+for `_PC_NAME_MAX`/`_PC_PATH_MAX` from this kernel's own actual ext2/path
+limits, needed because `libQt6Widgets.a`'s `QFileDialogPrivate` pulls in
+a `pathconf()` reference even though this test never opens a
+`QFileDialog` itself). `user/pude_qtclient.c` gained a second
+`app_class_t` instance, `qtclient_widgets_app_class`, reusing every
+existing callback (the adapter is already generic — see its own header
+comment) with its own name/default size.
+
+**Real, reproducible, unfixed bug: a widget whose natural size hint is
+wider or taller than the window's initially granted size drives the QPA
+plugin into an infinite repaint loop.** Isolated via bisection
+(`tools/test-qt-widgets-pude.py`, a real end-to-end driver identical in
+spirit to `tools/test-qt-pude.py`):
+
+- Bare `QMainWindow`, no central widget: shows fine.
+- `QMainWindow` + a plain central `QWidget`, no layout: shows fine.
+- `QMainWindow` + central `QWidget` + an *empty* `QVBoxLayout`: shows fine.
+- `QMainWindow` + `QVBoxLayout` + one `QLabel("Hi")` (short — fits inside
+  the requested 420×320 window): shows fine, `[002]` prints promptly.
+- `QMainWindow` + `QVBoxLayout` + one `QLabel("Hello from Qt Widgets on
+  PureUnix")` (naturally wider than 420 px): **`[002]` never prints.**
+  A temporary debug counter in `QPureUnixWindow::setGeometry()` confirmed
+  this is *not* an infinite-setGeometry-call loop (it's called exactly
+  once, with the layout's own enlarged request — `546×320`, confirming
+  Qt really did decide the window needs to grow past what `pude`'s
+  `app_class_t.default_client_w/h` initially granted). Further
+  instrumentation in `QPureUnixBackingStore::flush()`/
+  `QPureUnixIntegration::sendMessage()` showed the real signature: `flush()`
+  is called over and over, forever, each time re-sending the exact same
+  full-window `PU_QPA_C2S_DAMAGE` payload (`698896` bytes, matching
+  `546×320×4 + header`) — a genuine, unbounded repaint loop, not just
+  "slow" (confirmed by waiting 20s+ with no change, several times, fully
+  reproducible). `pude`'s own emergency Ctrl+F12 quit still works (the
+  child gets `SIGKILL`ed via the pgid fix above), so this doesn't hang
+  the *host*, only that one client forever.
+
+**Root cause not yet found** — the working theory (not confirmed): this
+plugin has no real notion of "the window manager granted a *different*
+size than what the layout wanted" — a real WM's `QPlatformWindow` usually
+gets an authoritative resize acknowledgement (or a hard rejection) from
+the compositor before Qt's layout system considers a resize "settled";
+here, `QPureUnixWindow::setGeometry()` just accepts whatever Qt asks for
+and reports it straight back via `handleGeometryChange()` with no actual
+enforcement from `pude`'s own side (which still renders the window at
+its *original* `app_class_t`-granted size, silently dropping any
+`PU_QPA_C2S_DAMAGE` whose rect exceeds `qtclient_state_t.content_w/h` —
+`user/pude_qtclient.c`'s own bounds check). That mismatch between "what
+Qt thinks its window size is" and "what `pude` is actually still
+rendering at" may be what keeps something in Qt's own repaint-scheduling
+machinery from ever considering the frame "done." Not conclusively
+proven — the actual repaint trigger inside Qt's own event/layout code was
+not traced further.
+
+**Decision: `qtclient_widgets_app_class` is deliberately NOT registered
+in `user/pude.c`'s `g_apps[]`** (so it can't be launched from `pude`'s
+real menu and hang the whole desktop with one click) until this is
+understood and fixed. `user/qtwidgetstest.cpp` and the Makefile plumbing
+are kept in place — still built and regression-checked by `make all` via
+`QT_STANDALONE_ELFS` — as the starting point for whoever resumes this.
+`tools/test-qt-widgets-pude.py` is the reproduction driver; re-run it
+after any real fix attempt (it currently reports the hang honestly via a
+bounded 20s `wait_for` + `WARN`, not a hard failure, so it's safe to run
+without blocking indefinitely).
+
+**Likely next debugging steps for whoever resumes this:**
+1. Make `pude`'s own side actually *resize its chrome* to match a
+   client-requested size (right now `app_class_t.default_client_w/h` is
+   fixed at spawn time and never revisited) — this may be the real fix,
+   not just a workaround, since the current mismatch is genuinely a
+   protocol gap (no `C2S` message exists for "I need to be resized," only
+   the WM-driven `S2C_RESIZE` for user drag-resizes).
+2. Instrument Qt's own `QWidgetPrivate`/`QLayout` call sites (or build
+   Qt itself with `QT_LOGGING_RULES=qt.widgets.layout=true` if that
+   category exists in this version) to see exactly what's re-triggering
+   `update()`/`repaint()` after the first flush.
+3. Try constraining the label (`setWordWrap(true)`, `setMaximumWidth()`)
+   to see if avoiding the implicit-grow path avoids the loop entirely —
+   if so, that's strong confirmation of the size-mismatch theory above
+   and narrows the real fix to specifically the resize-acknowledgement
+   path.
+
+Next when resuming, in priority order: (1) the QtWidgets infinite-repaint
+bug above — the real remaining blocker for Phase 5; (2) Phase 4 (input)
+is wired and stable but not yet *visually* round-trip-verified beyond
+raw key/mouse messages not crashing anything (`qtwindowtest.cpp`'s
+`TestWindow` has nothing interactive to confirm a keystroke lands on the
+right control) — naturally falls out once Phase 5's repaint bug is
+fixed and a real interactive widget can be clicked/typed into; (3) font
+rendering currently shows tofu boxes instead of glyphs (`QFontDatabase:
+Cannot find font directory`) — deploying a real font (e.g. DejaVu, per
+Qt's own suggestion) onto the disk image, needed for Phase 5 to actually
+be legible once the repaint bug is fixed. Keep `kernel/heap.c`'s
+`HEAP_SIZE` in mind if a future QtWidgets test binary approaches ~20 MiB
+even stripped (`qtwidgetstest.elf` is already ~19 MiB) — it may need
+raising again (a real, independent-of-RAM kernel heap ceiling, not the
+disk/RAM tension above).

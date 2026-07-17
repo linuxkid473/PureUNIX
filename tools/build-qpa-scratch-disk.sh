@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # tools/build-qpa-scratch-disk.sh — builds a small, standalone ISO
 # (build/qpa-scratch.iso) carrying BusyBox + user/qtwindowtest.elf +
-# user/pude.elf on its EXT2 root, for interactively verifying the
-# "pureunix" QPA plugin (docs/qt-port.md Phase 6, user/qpa_pureunix/) in
-# QEMU. pude.elf is included so the real end-to-end path (PUDE's "Qt
-# Application" menu item fork()+exec()'ing qtwindowtest.elf, per
-# user/pude_qtclient.c) can be exercised, not just the standalone QPA
-# client.
+# user/qtwidgetstest.elf + user/pude.elf on its EXT2 root, for
+# interactively verifying the "pureunix" QPA plugin (docs/qt-port.md
+# Phase 6, user/qpa_pureunix/) in QEMU. pude.elf is included so the real
+# end-to-end path (PUDE's "Qt Application"/"Qt Widgets Test" menu items
+# fork()+exec()'ing the two real Qt binaries, per user/pude_qtclient.c)
+# can be exercised, not just the standalone QPA client.
 #
 # Why this exists instead of just adding qtwindowtest.elf to the normal
 # shared build/ext2.img: that image travels whole into RAM as a GRUB
@@ -32,11 +32,11 @@ command -v i686-elf-grub-mkrescue >/dev/null 2>&1 || {
   exit 1
 }
 
-make -C "${REPO_ROOT}" "${BUILD}/pureunix.elf" "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/pude.elf"
+make -C "${REPO_ROOT}" "${BUILD}/pureunix.elf" "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/qtwidgetstest.elf" "${BUILD}/user/pude.elf"
 
-echo "==> Building scratch EXT2 (BusyBox + qtwindowtest.elf + pude.elf)"
+echo "==> Building scratch EXT2 (BusyBox + qtwindowtest.elf + qtwidgetstest.elf + pude.elf)"
 python3 "${SCRIPT_DIR}/mkext2.py" "${BUILD}/qpa-scratch-root.img" \
-  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/pude.elf"
+  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/qtwidgetstest.elf" "${BUILD}/user/pude.elf"
 
 echo "==> Assembling build/qpa-scratch.iso"
 # Deliberately NO fat.img GRUB module here (unlike the shared LIVE_ISO's

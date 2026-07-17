@@ -105,6 +105,17 @@ static const app_class_t *const g_apps[] = {
     &putext_app_class,
     &settings_app_class,
     &qtclient_app_class,
+    /* qtclient_widgets_app_class (user/pude_qtclient.h) is deliberately
+     * NOT registered here yet: a real QMainWindow whose own layout needs
+     * more width/height than initially granted (any label/text wider
+     * than the window, in practice almost any real QtWidgets app)
+     * currently drives this plugin into an infinite repaint loop (real,
+     * reproducible, root cause not yet found -- see docs/qt-port.md's
+     * Phase 6 "Known limitation" section and user/qtwidgetstest.cpp,
+     * which still builds and is regression-checked by `make all` via
+     * QT_STANDALONE_ELFS for whoever resumes this). Wiring it into the
+     * live launcher menu before that's fixed would let one menu click
+     * hang the whole desktop. */
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 

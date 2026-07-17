@@ -537,3 +537,25 @@ const app_class_t qtclient_app_class = {
     .graphical = true,
     .pinned_default = false,
 };
+
+/* See this struct's own comment in user/pude_qtclient.h. */
+const app_class_t qtclient_widgets_app_class = {
+    .name = "Qt Widgets Test",
+    .default_client_w = 420,
+    .default_client_h = 320,
+    .min_client_w = 200,
+    .min_client_h = 150,
+    .create = qtclient_create,
+    .destroy = qtclient_destroy,
+    .render = qtclient_render,
+    .on_key = qtclient_on_key,
+    .on_mouse_down = qtclient_on_mouse_down,
+    .on_mouse_up = qtclient_on_mouse_up,
+    .on_mouse_move = qtclient_on_mouse_move,
+    .on_resize = qtclient_on_resize,
+    .poll = qtclient_poll,
+    .is_alive = qtclient_is_alive,
+    .icon_draw = NULL,
+    .graphical = true,
+    .pinned_default = false,
+};

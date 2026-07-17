@@ -500,6 +500,40 @@ int getpagesize(void)
     return 4096;
 }
 
+/* pathconf()/fpathconf(): real answers where this kernel actually has a
+ * fixed, known limit, not stubs -- fs/ext2/dir.c's own dirent name_len
+ * field is a single byte and its own real ext2_dir_add_entry() already
+ * rejects any name over 255 bytes, and PATH_MAX (limits.h) is this
+ * kernel's own real fixed path-buffer size everywhere else (matches
+ * include/pureunix/config.h's PUREUNIX_MAX_PATH, which vfs_normalize()
+ * etc. actually use). Needed to link real Qt Widgets code for the first
+ * time (libQt6Widgets.a's QFileDialogPrivate::maxNameLength() calls
+ * pathconf(path, _PC_NAME_MAX) even though this port's own
+ * qtwidgetstest.cpp never opens a QFileDialog itself — once one
+ * translation unit inside a static archive is pulled in for any symbol,
+ * every reference in that same .o must still resolve at link time).
+ * Every other _PC_* case returns -1/EINVAL, same as any real libc does
+ * for a query it doesn't have a real answer for. */
+long pathconf(const char *path, int name)
+{
+    (void)path;
+    switch (name) {
+    case _PC_NAME_MAX:
+        return 255;
+    case _PC_PATH_MAX:
+        return PATH_MAX;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+long fpathconf(int fd, int name)
+{
+    (void)fd;
+    return pathconf(NULL, name);
+}
+
 /* BSD flock() reimplemented on top of the real POSIX fcntl() advisory
  * locking already added for the SQLite port (PU_SYS_FCNTL, kernel/flock.c,
  * docs/sqlite-port.md) — the same "implement the BSD entry point over the

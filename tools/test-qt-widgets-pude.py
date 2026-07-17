@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""tools/test-qt-pude.py — interactive QEMU test driver for docs/qt-port.md
-Phase 6's real end-to-end path: pude's "Qt Application" launcher menu item
-(user/pude_qtclient.c) fork/exec'ing a real Qt Widgets/Gui binary built
-against the "pureunix" QPA plugin (user/qpa_pureunix/), then driving real
-injected keyboard/mouse input into it exactly the way tools/test-pude.py
-and tools/test-pude-dock.py already drive input into every other pude app.
+"""tools/test-qt-widgets-pude.py — interactive QEMU test driver for
+docs/qt-port.md Phase 6's QtWidgets milestone: pude's "Qt Widgets Test"
+launcher menu item (user/pude_qtclient.c's qtclient_widgets_app_class)
+fork/exec'ing a real, unmodified Qt Widgets application
+(user/qtwidgetstest.cpp -- QMainWindow + QLabel/QLineEdit/QTextEdit/
+QPushButton via a real layout) against the "pureunix" QPA plugin.
 
-Boots build/qpa-scratch.iso (tools/build-qpa-scratch-disk.sh's small
-dedicated scratch image carrying BusyBox + pude.elf + qtwindowtest.elf --
-see that script's own comment for why this doesn't use the shared
-build/ext2.img). Launches pude from a real BusyBox ash prompt, opens the
-launcher menu, clicks "Qt Application" (last menu entry, g_apps[]'s
-qtclient_app_class), and screenshots the result.
+Same technique as tools/test-qt-pude.py (see that file's own docstring
+for the QMP/HMP mouse rationale) -- duplicated rather than imported,
+matching tools/test-pude-perf.py's own precedent for these QEMU test
+drivers.
 
 Usage:
-    tools/test-qt-pude.py build/qpa-scratch.iso --screenshot-dir DIR
+    tools/test-qt-widgets-pude.py build/qpa-scratch.iso --screenshot-dir DIR
 """
 import argparse
 import json
@@ -178,16 +176,21 @@ class QemuSession:
 
 
 # ---- pude's menu geometry (user/pude.c) -- kept in sync by hand, same
-# convention tools/test-pude-dock.py's own geometry block uses.
+# convention tools/test-qt-pude.py's own geometry block uses.
 MENU_BTN_X, MENU_BTN_Y, MENU_BTN_W, MENU_BTN_H = 8, 8, 90, 26
 MENU_ITEM_W, MENU_ITEM_H = 170, 28
 # g_apps[] order: PUTerm(0), Calculator(1), PUFiles(2), PUText(3),
-# Settings(4), Qt Application(5, qtclient_app_class) -- user/pude.c.
-# (qtclient_widgets_app_class exists in user/pude_qtclient.c but is
-# deliberately NOT registered in g_apps[] yet -- see that file's own
-# comment on the real infinite-repaint-loop bug this hits.)
-NUM_APPS = 6
-QTCLIENT_INDEX = 5
+# Settings(4), Qt Application(5), Qt Widgets Test
+# (6, qtclient_widgets_app_class) -- user/pude.c.
+NUM_APPS = 7
+QTCLIENT_WIDGETS_INDEX = 6
+
+# user/pude.c's BORDER/TITLEBAR_PAD/FONT_CELL_H constants -- same values
+# tools/test-pude-dock.py's own geometry block hardcodes.
+BORDER = 3
+TITLEBAR_PAD = 6
+FONT_CELL_H = 17
+TITLEBAR_H = FONT_CELL_H + TITLEBAR_PAD * 2
 
 
 def menu_item_center(i):
@@ -206,6 +209,12 @@ def spawn_position(spawn_index):
     return MARGIN + cascade, MARGIN + cascade
 
 
+def client_origin(spawn_index):
+    """Top-left of the window's *client* area (inside chrome)."""
+    wx, wy = spawn_position(spawn_index)
+    return wx + BORDER, wy + BORDER + TITLEBAR_H
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("iso")
@@ -222,63 +231,75 @@ def main():
         print(f"screenshot: {path}")
         return path
 
-    tmp = os.environ.get("PUDE_TEST_KEEP_TMP") or tempfile.mkdtemp(prefix="pureunix-qt-pude-test-")
+    tmp = os.environ.get("PUDE_TEST_KEEP_TMP") or tempfile.mkdtemp(prefix="pureunix-qt-widgets-pude-test-")
     print(f"(tmp dir: {tmp})")
-    if True:
-        serial = os.path.join(tmp, "serial.log")
-        qmp = os.path.join(tmp, "qmp.sock")
+    serial = os.path.join(tmp, "serial.log")
+    qmp = os.path.join(tmp, "qmp.sock")
 
-        qemu = QemuSession(args.iso, serial, qmp)
+    qemu = QemuSession(args.iso, serial, qmp)
+    try:
+        print("=== waiting for shell prompt ===")
+        qemu.wait_for(r"Enter 'help'", 60)
+        time.sleep(1.5)
+
+        print("=== launching pude ===")
+        qemu.type_text("pude\n")
+        time.sleep(2.0)
+        shot("w01-desktop.ppm")
+
+        print("=== opening launcher menu ===")
+        qemu.click_at(*menu_btn_center())
+        shot("w02-menu-open.ppm")
+
+        print("=== clicking 'Qt Widgets Test' menu entry ===")
+        qemu.click_at(*menu_item_center(QTCLIENT_WIDGETS_INDEX))
+        time.sleep(2.0)
+        shot("w03-widgets-window-just-spawned.ppm")
+        print("=== waiting up to 20s for [002] to confirm the window really painted ===")
         try:
-            print("=== waiting for shell prompt ===")
-            qemu.wait_for(r"Enter 'help'", 60)
-            time.sleep(1.5)
+            qemu.wait_for(r"\[002\]", 20)
+            print("[002] observed")
+        except TimeoutError:
+            print("WARN: [002] never printed within 20s")
+        time.sleep(2.0)
+        shot("w04-widgets-window-settled.ppm")
 
-            print("=== launching pude ===")
-            qemu.type_text("pude\n")
-            time.sleep(2.0)
-            shot("q01-desktop.ppm")
+        cx, cy = client_origin(0)
+        print("=== clicking into the QLineEdit and typing ===")
+        qemu.click_at(cx + 100, cy + 35)
+        time.sleep(0.3)
+        qemu.type_text("hello widgets")
+        time.sleep(0.5)
+        shot("w05-lineedit-typed.ppm")
 
-            print("=== opening launcher menu ===")
-            qemu.click_at(*menu_btn_center())
-            shot("q02-menu-open.ppm")
+        print("=== clicking the QPushButton (real signal/slot round trip) ===")
+        # Button row is near the bottom of the 420x320 client area, left
+        # side (QHBoxLayout: button then click-count label).
+        qemu.click_at(cx + 40, cy + 280)
+        time.sleep(0.5)
+        shot("w06-after-button-click-1.ppm")
+        qemu.click_at(cx + 40, cy + 280)
+        time.sleep(0.5)
+        shot("w07-after-button-click-2.ppm")
 
-            print("=== clicking 'Qt Application' menu entry ===")
-            qemu.click_at(*menu_item_center(QTCLIENT_INDEX))
-            time.sleep(2.0)
-            shot("q03-qt-window-just-spawned.ppm")
-            time.sleep(2.0)
-            shot("q04-qt-window-settled.ppm")
+        print("=== emergency whole-desktop quit (Ctrl+F12) back to outer ash ===")
+        qemu.send_key_combo("ctrl+f12")
+        time.sleep(1.0)
+        qemu.type_text("echo qt_widgets_pude_test_wm_exited_ok\n")
+        transcript = qemu.wait_for(r"qt_widgets_pude_test_wm_exited_ok", 20)
+        if transcript.count("qt_widgets_pude_test_wm_exited_ok") < 1:
+            print("FAIL: outer ash shell did not cleanly resume after pude exited")
+            sys.exit(1)
+        print("PASS: outer shell cleanly restored after pude exited")
 
-            wx, wy = spawn_position(0)
-            print("=== clicking inside the Qt window to focus it ===")
-            qemu.click_at(wx + 60, wy + 45)
-            time.sleep(0.5)
-            shot("q05-qt-window-focused.ppm")
+        clicks = transcript.count("QPushButton::clicked signal fired")
+        print(f"QPushButton::clicked fired {clicks} time(s) (expected 2)")
+        if clicks < 2:
+            print("WARN: expected 2 button-click signal firings, see screenshots for the real check")
+    finally:
+        qemu.kill()
 
-            print("=== typing into the Qt window (keyboard plumbing check) ===")
-            qemu.type_text("hello")
-            time.sleep(0.5)
-            shot("q06-qt-window-after-typing.ppm")
-
-            print("=== moving mouse across the Qt window (mouse-move plumbing check) ===")
-            qemu.mouse_to(wx + 20, wy + 20)
-            qemu.mouse_to(wx + 150, wy + 100)
-            shot("q07-qt-window-mouse-moved.ppm")
-
-            print("=== emergency whole-desktop quit (Ctrl+F12) back to outer ash ===")
-            qemu.send_key_combo("ctrl+f12")
-            time.sleep(1.0)
-            qemu.type_text("echo qt_pude_test_wm_exited_ok\n")
-            transcript = qemu.wait_for(r"qt_pude_test_wm_exited_ok", 20)
-            if transcript.count("qt_pude_test_wm_exited_ok") < 1:
-                print("FAIL: outer ash shell did not cleanly resume after pude exited")
-                sys.exit(1)
-            print("PASS: outer shell cleanly restored after pude exited")
-        finally:
-            qemu.kill()
-
-    print("=== test-qt-pude complete (visual verification required from screenshots) ===")
+    print("=== test-qt-widgets-pude complete (visual verification required from screenshots) ===")
     print("Screenshots:", *shots, sep="\n  ")
 
 
