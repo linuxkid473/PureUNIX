@@ -226,6 +226,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 {
     serial_init();
     arch_init();
+    fpu_init();
     pmm_init(magic, mbi_addr);
 
     /* Parse the framebuffer tag and map its physical range before any

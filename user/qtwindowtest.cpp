@@ -32,7 +32,14 @@ protected:
         p.fillRect(r, QColor(40, 40, 120));
         p.setPen(Qt::white);
         p.drawText(r, Qt::AlignCenter, QStringLiteral("Hello from Qt on PureUnix"));
+        if (!m_painted) {
+            m_painted = true;
+            std::printf("[003] paintEvent() ran a real QPainter fillRect+drawText\n      PASS\n");
+        }
     }
+
+private:
+    bool m_painted = false;
 };
 
 int main(int argc, char *argv[])

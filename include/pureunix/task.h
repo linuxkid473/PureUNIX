@@ -378,6 +378,44 @@ typedef struct task {
      * handles — same reasoning as fb_shadow_mapped above. */
     uint32_t heap_used;
     uint32_t heap_mapped;
+    /* Real per-task heap start VA, computed by kernel/elf.c's
+     * elf_load_into() from the actual highest loaded PT_LOAD segment end
+     * (page-aligned), not the fixed include/pureunix/vmm.h HEAP_VA
+     * constant every task used to share. HEAP_VA (4 MiB into the user
+     * window) quietly assumed every program's own code/data/bss stayed
+     * under that -- true for every program on this system until the Qt
+     * QPA port's qtwindowtest.elf, whose real ~10 MiB statically-linked
+     * .text alone blew past it. With a fixed HEAP_VA, that program's own
+     * sbrk()-backed heap allocations (e.g. a QImage's pixel buffer) landed
+     * *inside* its own still-in-use .text region -- since every PT_LOAD
+     * segment here is mapped PAGE_WRITE (no W^X), an ordinary heap write
+     * silently overwrote real code with 0xFF bytes (QImage::fill(Qt::
+     * white) = 0xFFFFFFFF), which the CPU only surfaced later as a
+     * spurious #UD (invalid opcode) crash when execution next reached the
+     * clobbered address -- initially misread as a missing-SSE/FPU-support
+     * problem (see fpu_state's own comment above) until raw memory
+     * inspection through the live page tables showed the "instruction"
+     * byte-for-byte was just a run of 0xFF. FB_SHADOW_VA (SYS_FB_MMAP) is
+     * derived from this same per-task base now too (arch/i386/
+     * syscall.c), not a second fixed constant, for the identical reason.
+     * Copied across task_fork() (kernel/task.c) alongside heap_used/
+     * heap_mapped; reset by elf.c on every real exec() the same way. */
+    uint32_t heap_base;
+    /* FXSAVE/FXRSTOR image (x87/MMX/SSE register file) for this task,
+     * captured/restored by every context_switch() (kernel/task.c's
+     * task_yield(), arch/i386/fpu.c) -- real hardware requires the memory
+     * operand 16-byte aligned or FXSAVE/FXRSTOR both #GP fault, and
+     * task_t itself is only ever kcalloc()'d at 8-byte granularity
+     * (kernel/heap.c's align8()), so this is deliberately oversized by 16
+     * bytes rather than trusted to already land on a 16-byte boundary --
+     * see arch/i386/fpu.c's task_fpu_area() for the alignment-fixup this
+     * buys. Found the hard way: the Qt QPA port's first real on-screen
+     * QPainter paint (raster blend code compiled with SSE2) took a #UD
+     * (invalid opcode) kernel panic, because nothing before this ever
+     * enabled CR4.OSFXSR or saved/restored SSE state across a task
+     * switch -- a previously-flagged, real architectural prerequisite,
+     * not a Qt bug. */
+    uint8_t fpu_state[512 + 16];
 } task_t;
 
 void tasking_init(void);

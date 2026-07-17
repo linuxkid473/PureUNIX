@@ -1990,7 +1990,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EINVAL;
         }
         if (t->fb_shadow_mapped) {
-            return FB_SHADOW_VA;
+            return t->heap_base + HEAP_MAX;
         }
         const fb_info_t *fb = fb_get_info();
         if (!fb->present) {
@@ -1998,6 +1998,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         size_t needed = (size_t)fb->width * fb->height * (fb->bpp / 8);
         uint32_t pages = (uint32_t)((needed + PUREUNIX_PAGE_SIZE - 1) / PUREUNIX_PAGE_SIZE);
+        uint32_t fb_shadow_va = t->heap_base + HEAP_MAX;
         for (uint32_t i = 0; i < pages; ++i) {
             phys_addr_t frame = pmm_alloc_frame();
             if (!frame) {
@@ -2010,11 +2011,11 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                 return (uint32_t)-ENOMEM;
             }
             memset((void *)(uintptr_t)frame, 0, PUREUNIX_PAGE_SIZE);
-            vmm_map_page_in(t->pd_phys, FB_SHADOW_VA + i * PUREUNIX_PAGE_SIZE, frame,
+            vmm_map_page_in(t->pd_phys, fb_shadow_va + i * PUREUNIX_PAGE_SIZE, frame,
                              PAGE_USER | PAGE_WRITE);
         }
         t->fb_shadow_mapped = true;
-        return FB_SHADOW_VA;
+        return fb_shadow_va;
     }
     case SYS_SBRK: {
         task_t *t = task_current();
@@ -2022,7 +2023,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             return (uint32_t)-EINVAL;
         }
         int32_t incr = (int32_t)regs->ebx;
-        uint32_t old_break = HEAP_VA + t->heap_used;
+        uint32_t old_break = t->heap_base + t->heap_used;
         if (incr < 0 && (uint32_t)(-incr) > t->heap_used) {
             return (uint32_t)-EINVAL;
         }
@@ -2037,7 +2038,7 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                 return (uint32_t)-ENOMEM;
             }
             memset((void *)(uintptr_t)frame, 0, PUREUNIX_PAGE_SIZE);
-            vmm_map_page_in(t->pd_phys, HEAP_VA + t->heap_mapped, frame, PAGE_USER | PAGE_WRITE);
+            vmm_map_page_in(t->pd_phys, t->heap_base + t->heap_mapped, frame, PAGE_USER | PAGE_WRITE);
             t->heap_mapped += PUREUNIX_PAGE_SIZE;
         }
         t->heap_used = new_used;

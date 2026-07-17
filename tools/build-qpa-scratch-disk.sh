@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # tools/build-qpa-scratch-disk.sh — builds a small, standalone ISO
-# (build/qpa-scratch.iso) carrying ONLY BusyBox + user/qtwindowtest.elf on
-# its EXT2 root, for interactively verifying the "pureunix" QPA plugin
-# (docs/qt-port.md Phase 6, user/qpa_pureunix/) in QEMU.
+# (build/qpa-scratch.iso) carrying BusyBox + user/qtwindowtest.elf +
+# user/pude.elf on its EXT2 root, for interactively verifying the
+# "pureunix" QPA plugin (docs/qt-port.md Phase 6, user/qpa_pureunix/) in
+# QEMU. pude.elf is included so the real end-to-end path (PUDE's "Qt
+# Application" menu item fork()+exec()'ing qtwindowtest.elf, per
+# user/pude_qtclient.c) can be exercised, not just the standalone QPA
+# client.
 #
 # Why this exists instead of just adding qtwindowtest.elf to the normal
 # shared build/ext2.img: that image travels whole into RAM as a GRUB
@@ -28,22 +32,41 @@ command -v i686-elf-grub-mkrescue >/dev/null 2>&1 || {
   exit 1
 }
 
-make -C "${REPO_ROOT}" "${BUILD}/pureunix.elf" "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf"
+make -C "${REPO_ROOT}" "${BUILD}/pureunix.elf" "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/pude.elf"
 
-echo "==> Building scratch FAT16 (empty-ish, just needed as GRUB module 'fat.img')"
-python3 "${SCRIPT_DIR}/mkfat16.py" "${BUILD}/qpa-scratch-fat.img"
-
-echo "==> Building scratch EXT2 (BusyBox + qtwindowtest.elf only)"
+echo "==> Building scratch EXT2 (BusyBox + qtwindowtest.elf + pude.elf)"
 python3 "${SCRIPT_DIR}/mkext2.py" "${BUILD}/qpa-scratch-root.img" \
-  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf"
+  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/pude.elf"
 
 echo "==> Assembling build/qpa-scratch.iso"
+# Deliberately NO fat.img GRUB module here (unlike the shared LIVE_ISO's
+# boot/grub.cfg) -- kernel/main.c's fat16_vfs_ops() mount is optional
+# ("No FAT16 disk found; /fat will be unavailable." is a normal, non-fatal
+# log line, not a boot failure), and skipping it frees a real 32 MiB of
+# physical RAM this small machine badly needs: every GRUB module is loaded
+# whole into RAM before the kernel starts (see tools/mkext2.py's own
+# NUM_GROUPS comment / this repo's "GRUB module RAM ceiling" gotcha), and
+# qtwindowtest.elf's real exec() was observed failing with ENOMEM at the
+# default 128 MiB machine size specifically because fat.img's now-unused
+# 32 MiB was still eating into the same physical RAM pool a real Qt
+# binary needs to load into.
 rm -rf "${BUILD}/qpa-scratch-iso"
 mkdir -p "${BUILD}/qpa-scratch-iso/boot/grub"
 cp "${BUILD}/pureunix.elf" "${BUILD}/qpa-scratch-iso/boot/pureunix.elf"
-cp "${BUILD}/qpa-scratch-fat.img" "${BUILD}/qpa-scratch-iso/boot/fat.img"
 cp "${BUILD}/qpa-scratch-root.img" "${BUILD}/qpa-scratch-iso/boot/root.img"
-cp "${REPO_ROOT}/boot/grub.cfg" "${BUILD}/qpa-scratch-iso/boot/grub/grub.cfg"
+cat > "${BUILD}/qpa-scratch-iso/boot/grub/grub.cfg" <<'GRUBCFG'
+set timeout=1
+set default=0
+
+serial --unit=0 --speed=115200
+terminal_output console serial
+
+menuentry "PureUnix" {
+    multiboot2 /boot/pureunix.elf
+    module2 /boot/root.img root.img
+    boot
+}
+GRUBCFG
 i686-elf-grub-mkrescue -o "${BUILD}/qpa-scratch.iso" "${BUILD}/qpa-scratch-iso"
 
 echo "==> Done: ${BUILD}/qpa-scratch.iso"

@@ -248,9 +248,13 @@ static int build_argv_stack(phys_addr_t top_frame, uint32_t top_page_va, int arg
  * vmm_free_user_directory()). */
 static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char *const argv[],
                           char *const envp[], uint32_t *out_entry, uint32_t *out_stack,
-                          uint32_t *out_mapped_bytes)
+                          uint32_t *out_mapped_bytes, uint32_t *out_heap_base)
 {
     uint32_t mapped_bytes = 0;
+    /* Highest PT_LOAD segment end seen so far (page-aligned) -- see
+     * task_t.heap_base's own comment (include/pureunix/task.h) for why
+     * this replaces the fixed HEAP_VA constant every task used to share. */
+    uint32_t highest_seg_end = 0;
     /* raw_path may be relative (a real user process's execve("./foo", ...)
      * or a bare/relative name from a fork()+exec() shell — the in-kernel
      * shell's own callers (shell/sh.c) already pass an absolute path, so
@@ -332,10 +336,23 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
             vmm_map_page_in(pd_phys, va, frame, PAGE_USER | PAGE_WRITE);
         }
         mapped_bytes += seg_end - seg_start;
+        if (seg_end > highest_seg_end) {
+            highest_seg_end = seg_end;
+        }
     }
 
     uint32_t entry = eh->e_entry;
     kfree(image);
+
+    /* See task_t.heap_base's own comment -- never *smaller* than the old
+     * fixed HEAP_VA (every existing program's own segments already fit
+     * comfortably under it, so this preserves their exact layout), but
+     * grows for a program whose real code/data/bss extends past it. */
+    uint32_t heap_base = highest_seg_end > HEAP_VA ? highest_seg_end : HEAP_VA;
+    if (heap_base + HEAP_MAX > SIGNAL_TRAMPOLINE_VA) {
+        printf("%s: program too large (no room left for its heap)\n", path);
+        return -ENOMEM;
+    }
 
     uint32_t top_page_va = USER_WINDOW_END - PUREUNIX_PAGE_SIZE;
     phys_addr_t top_frame = 0;
@@ -369,6 +386,7 @@ static int elf_load_into(const char *raw_path, uint32_t pd_phys, int argc, char 
     *out_entry = entry;
     *out_stack = stack_top;
     *out_mapped_bytes = mapped_bytes;
+    *out_heap_base = heap_base;
     return 0;
 }
 
@@ -380,8 +398,8 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
         return -ENOMEM;
     }
 
-    uint32_t entry, stack_top, mapped_bytes;
-    int rc = elf_load_into(path, pd_phys, argc, argv, envp, &entry, &stack_top, &mapped_bytes);
+    uint32_t entry, stack_top, mapped_bytes, heap_base;
+    int rc = elf_load_into(path, pd_phys, argc, argv, envp, &entry, &stack_top, &mapped_bytes, &heap_base);
     if (rc != 0) {
         vmm_free_user_directory(pd_phys);
         return rc;
@@ -396,6 +414,7 @@ int elf_exec_argv(const char *path, int argc, char *const argv[], char *const en
     pack_cmdline(child->cmdline, sizeof(child->cmdline), path, argc, argv);
     pack_comm(child->name, sizeof(child->name), path);
     child->mapped_bytes = mapped_bytes;
+    child->heap_base = heap_base;
 
     /* Starts its own new process group (same session, inherited
      * unchanged) rather than the caller's — elf_exec_argv() is always
@@ -445,8 +464,8 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
         return -ENOMEM;
     }
 
-    uint32_t entry, stack_top, mapped_bytes;
-    int rc = elf_load_into(path, new_pd, argc, argv, envp, &entry, &stack_top, &mapped_bytes);
+    uint32_t entry, stack_top, mapped_bytes, heap_base;
+    int rc = elf_load_into(path, new_pd, argc, argv, envp, &entry, &stack_top, &mapped_bytes, &heap_base);
     if (rc != 0) {
         vmm_free_user_directory(new_pd);
         return rc;
@@ -481,6 +500,7 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
      * pages at all yet) even though no concrete repro surfaced it first. */
     t->heap_used = 0;
     t->heap_mapped = 0;
+    t->heap_base = heap_base;
     t->fb_shadow_mapped = false;
     /* Same stale-address-space bug class as heap_used/heap_mapped/
      * fb_shadow_mapped just above: a fresh exec()'d image has no TLS block

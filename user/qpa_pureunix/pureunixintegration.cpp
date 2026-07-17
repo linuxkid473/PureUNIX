@@ -123,8 +123,21 @@ bool QPureUnixIntegration::hasCapability(QPlatformIntegration::Capability cap) c
     switch (cap) {
     case QPlatformIntegration::NonFullScreenWindows:
     case QPlatformIntegration::WindowManagement:
-    case QPlatformIntegration::PaintEvents:
+    case QPlatformIntegration::MultipleWindows:
+    case QPlatformIntegration::ThreadedPixmaps:
         return true;
+    // Deliberately NOT claiming PaintEvents: that capability tells
+    // QGuiApplicationPrivate::processExposeEvent() that *this plugin*
+    // will emit real QWindowSystemInterfacePrivate::Paint events itself,
+    // which this plugin never does -- only handleExposeEvent()
+    // (QPureUnixWindow::setVisible()/handleProtocolMessage()'s
+    // PU_QPA_S2C_RESIZE case). Leaving this false is what makes Qt
+    // synthesize QPaintEvent automatically from those expose events
+    // (see qguiapplication.cpp's shouldSynthesizePaintEvents), which is
+    // the only reason QRasterWindow::paintEvent() ever fires here --
+    // real bug found the hard way: claiming PaintEvents=true left every
+    // window a real native chrome shell with a permanently-black client
+    // area, since paintEvent() was simply never called.
     default:
         return QPlatformIntegration::hasCapability(cap);
     }

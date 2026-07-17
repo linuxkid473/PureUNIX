@@ -27,6 +27,7 @@
 #include "pude_files.h"
 #include "pude_gfx.h"
 #include "pude_icon.h"
+#include "pude_qtclient.h"
 #include "pude_settings.h"
 #include "pude_spawn.h"
 #include "pude_term.h"
@@ -103,6 +104,7 @@ static const app_class_t *const g_apps[] = {
     &pufiles_app_class,
     &putext_app_class,
     &settings_app_class,
+    &qtclient_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 
@@ -721,6 +723,18 @@ int main(int argc, char *argv[])
                     if (point_in(mx, my, MENU_BTN_X, py, MENU_ITEM_W, ph)) {
                         int idx = (my - (py + 4)) / MENU_ITEM_H;
                         if (idx >= 0 && idx < NUM_APPS) {
+                            /* qtclient_app_class (docs/qt-port.md Phase 6)
+                             * is the one app_class_t whose create() needs
+                             * to know *which* program to fork/exec --
+                             * every other app here is a single, fixed
+                             * program, so this is the smallest way to
+                             * supply that without widening app_class_t's
+                             * own interface for everyone else (same
+                             * one-shot-mailbox pattern PUFiles already
+                             * uses to preload PUTerm's startup command). */
+                            if (g_apps[idx] == &qtclient_app_class) {
+                                pude_qtclient_set_exec_path("/bin/qtwindowtest.elf");
+                            }
                             spawn_window(g_apps[idx], screen_w, screen_h);
                         }
                     }

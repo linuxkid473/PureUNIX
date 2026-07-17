@@ -68,6 +68,42 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs);
 
 void context_switch(uint32_t **old_sp, uint32_t *new_sp);
 
+/* Enables real hardware x87/SSE support (CR0.EM=0/MP=1, CR4.OSFXSR=1,
+ * CR4.OSXMMEXCPT=1) and captures a valid "freshly reset FPU" FXSAVE
+ * image for fpu_init_task_state() to seed every new task with -- see
+ * arch/i386/fpu.c and task_t.fpu_state's own comment
+ * (include/pureunix/task.h) for why this exists at all. Must run once,
+ * before tasking_init() creates any task. */
+void fpu_init(void);
+
+/* Copies fpu_init()'s captured default state into `dst` (task_t.fpu_state,
+ * which callers align first via fpu_state_area()) -- called once per task
+ * by task_alloc() (kernel/task.c) so a task that has never yet been
+ * context-switched away from still has a legal image ready for the very
+ * first FXRSTOR when it's about to run as `next`. */
+void fpu_init_task_state(uint8_t *dst);
+
+/* Rounds a task_t.fpu_state[512+16] buffer up to the 16-byte boundary
+ * FXSAVE/FXRSTOR's memory operand requires -- shared by kernel/task.c
+ * (task_alloc()/task_yield()) and arch/i386/fpu.c itself. */
+static inline uint8_t *fpu_state_area(uint8_t *raw)
+{
+    return (uint8_t *)(((uintptr_t)raw + 15) & ~(uintptr_t)15);
+}
+
+/* Real FXSAVE/FXRSTOR — `area` must already be 16-byte aligned (see
+ * fpu_state_area() above). The one place these actually run is
+ * kernel/task.c's task_yield(), around every context_switch(). */
+static inline void fpu_save(uint8_t *area)
+{
+    __asm__ volatile("fxsave (%0)" : : "r"(area) : "memory");
+}
+
+static inline void fpu_restore(uint8_t *area)
+{
+    __asm__ volatile("fxrstor (%0)" : : "r"(area) : "memory");
+}
+
 static inline void arch_halt(void)
 {
     __asm__ volatile("hlt");

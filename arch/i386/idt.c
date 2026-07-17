@@ -222,6 +222,27 @@ void isr_dispatch(interrupt_regs_t *regs)
                   regs->int_no, exception_names[regs->int_no], regs->err_code,
                   (void *)regs->eip, (void *)cr2);
         }
+        if (regs->int_no == 6) {
+            /* Invalid opcode: same reasoning as vector 14's CR2 dump just
+             * above -- the bytes actually at eip (not what any on-disk ELF
+             * copy says should be there) are the one diagnostic that can
+             * distinguish "jumped to garbage" from "the CPU genuinely
+             * can't decode legitimate code here", and this kernel has no
+             * per-process fault isolation to fall back on either way.
+             * Real precedent: this exact dump is what found a genuine
+             * memory-layout bug during the Qt QPA port (task_t.heap_base's
+             * own comment, include/pureunix/task.h) -- a fixed HEAP_VA
+             * offset too small for a large program's own .text let an
+             * ordinary heap write (QImage::fill()) land inside still-live
+             * code, which only surfaced later as this exact exception when
+             * execution reached the clobbered bytes. */
+            const uint8_t *p = (const uint8_t *)regs->eip;
+            printf("bytes at eip:");
+            for (int i = 0; i < 16; i++) {
+                printf(" %02x", p[i]);
+            }
+            printf("\n");
+        }
         panic("CPU exception %u (%s), err=%x eip=%p",
               regs->int_no, exception_names[regs->int_no], regs->err_code, (void *)regs->eip);
     } else {

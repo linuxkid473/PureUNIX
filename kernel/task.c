@@ -233,6 +233,13 @@ static task_t *task_alloc(const char *name)
     strncpy(task->cmdline, task->name, sizeof(task->cmdline) - 1);
     task->pd_phys = current ? current->pd_phys : vmm_kernel_directory_phys();
 
+    /* See task_t.fpu_state's own comment (include/pureunix/task.h) --
+     * this task's own FXSAVE image must already hold a legal "freshly
+     * reset FPU" state before it can ever be FXRSTOR'd as `next` in
+     * task_yield() below, which is the very first time this buffer would
+     * otherwise be touched. */
+    fpu_init_task_state(task->fpu_state);
+
     uint32_t *sp = (uint32_t *)(task->stack_base + TASK_STACK_SIZE);
     *--sp = (uint32_t)task_bootstrap;
     *--sp = 0x202;
@@ -357,6 +364,7 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
      * right offset instead of re-mapping over the parent's copied pages. */
     child->heap_used = current->heap_used;
     child->heap_mapped = current->heap_mapped;
+    child->heap_base = current->heap_base;
     child->is_fork_child = true;
     child->fork_regs = *parent_regs;
     child->fork_regs.eax = 0; /* fork() returns 0 in the child */
@@ -485,6 +493,15 @@ void task_yield(void)
      * about to actually run, every switch — same reasoning as
      * tss_set_kernel_stack()/vmm_switch_directory() just above. */
     gdt_set_tls_base(next->tls_base);
+    /* Real x87/SSE register file save/restore -- see task_t.fpu_state's
+     * own comment (include/pureunix/task.h). Must happen before
+     * context_switch()'s stack-pointer swap: the CPU's actual FPU/SSE
+     * registers are global machine state, entirely untouched by that
+     * swap (it only pushes/pops GP registers + eflags), so `next` must
+     * already have its own state loaded by the time execution actually
+     * resumes at whatever eip its stack holds. */
+    fpu_save(fpu_state_area(prev->fpu_state));
+    fpu_restore(fpu_state_area(next->fpu_state));
     context_switch(&prev->stack_ptr, next->stack_ptr);
 }
 

@@ -672,18 +672,28 @@ $(BUILD)/user/pude_settings.o: user/pude_settings.c user/pude_settings.h user/pu
 
 DEPS += $(BUILD)/user/pude_settings.d
 
-$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_settings.h user/pude_spawn.h user/pude_text.h user/pude_wallpaper.h
+$(BUILD)/user/pude.o: user/pude.c user/pude_app.h user/pude_gfx.h user/pude_icon.h user/pude_term.h user/pude_calc.h user/pude_files.h user/pude_settings.h user/pude_spawn.h user/pude_text.h user/pude_wallpaper.h user/pude_qtclient.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -ffunction-sections -fdata-sections -MMD -MP -c $< -o $@
 
 DEPS += $(BUILD)/user/pude.d
 
+# pude_qtclient: pude's app_class_t adapter for an external Qt GUI client
+# process (docs/qt-port.md Phase 6) -- forks/execs a Qt binary built
+# against the pureunix QPA plugin, then bridges pureunix_qpa_protocol.h
+# framed messages between that process's pipes and pude's real WM/input.
+$(BUILD)/user/pude_qtclient.o: user/pude_qtclient.c user/pude_qtclient.h user/pude_app.h user/pude_gfx.h user/pude_widgets.h user/pureunix_qpa_protocol.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -I$(SDL_SRC)/include -Iuser -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/pude_qtclient.d
+
 PUDE_ELF := $(BUILD)/user/pude.elf
 
-$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+$(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(BUILD)/user/pude_qtclient.o $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
-		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o \
+		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o $(BUILD)/user/pude_qtclient.o \
 		-Wl,--start-group $(SDL_LIB) $(LIBPNG_LIB) $(ZLIB_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
 
 # Chocolate Doom 3.1.1 (vendored upstream source under

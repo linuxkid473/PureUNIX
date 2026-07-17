@@ -24,9 +24,23 @@ i386 TLS support, and a real `poll()` that can actually check pipe
 readiness); Phase 5 needed one more (the kernel's fixed heap size, a hard
 ceiling on how large a single file can even be `open()`ed) — see "Phase 4
 results" and "Phase 5 results" below. **Phase 6 (the real "pureunix" QPA
-platform plugin) is in progress** — see its own section below for the
-current sub-phase breakdown; Phases 7-8 (the external PUDE GUI client
-protocol's PUDE side, QtWidgets, the final demo) not started. This
+platform plugin): sub-phases 1-3 (integration/screen/window/backing-store)
+and 4 (input plumbing) are done and QEMU-verified end-to-end — a real,
+unmodified `QRasterWindow` app now creates a native chrome-decorated
+window inside `pude`, and real `QPainter` output (`fillRect`/`drawText`)
+renders correctly on screen**, confirmed via QEMU screendumps
+(`tools/test-qt-pude.py`). Getting here needed four more real, general
+kernel/WM fixes beyond Phase 4/5's own list: a QPA plugin capability-flag
+bug that silently skipped every `paintEvent()`, a fixed-offset per-task
+heap start address too small for a large static binary's own code segment
+(letting an ordinary heap write corrupt still-executing code), missing
+`CR4.OSFXSR`/FXSAVE-FXRSTOR support (any ring-3 SSE instruction was a
+guaranteed kernel panic), and a process-group bug that hung `pude`'s own
+Ctrl+F12 emergency-quit forever whenever a Qt window was open — see the
+Phase 6 section below for all four. **Not yet started: real QtWidgets
+apps (`QLabel`/`QPushButton`/`QLineEdit`/`QTextEdit`/`QMainWindow`,
+layouts) and font deployment (glyphs currently render as tofu boxes, no
+font files are on the disk image yet).** This
 document is the living record of the Qt 6 port (pinned version,
 toolchain, patches, protocol, architecture, limitations) required by the
 port's own acceptance criteria.
@@ -812,7 +826,7 @@ compile straight from source, same as any ordinary C++ program in this
 repo). `tools/vt-scripts/run-qtguitest.txt` follows the same convention as
 every other `make run-test` script.
 
-## Phase 6 (in progress): the real "pureunix" QPA platform plugin
+## Phase 6 (Phases 1-4 done, QEMU-verified end-to-end): the real "pureunix" QPA platform plugin
 
 Goal: replace `qtguitest.cpp`'s upstream offscreen QPA plugin with a real
 PureUnix-specific one (`user/qpa_pureunix/`) that talks to `pude` over a
@@ -832,41 +846,62 @@ Widgets application can create, display, and interact with a real
    `qtcoretest.cpp`/`qtguitest.cpp`) constructs `QGuiApplication` with
    `-platform pureunix` and shows a real `QRasterWindow` successfully, with
    zero undefined symbols at link time and a clean run in QEMU (checks
-   [001]/[002] both PASS) — verified via a small, dedicated scratch disk
-   (`tools/build-qpa-scratch-disk.sh`, see below for why) rather than the
-   main shared regression disk.
-2. **Done alongside item 1** (not a separate step in practice):
+   [001]/[002]/[003] all PASS).
+2. **Done, QEMU-verified end-to-end inside a real `pude` window.**
    `QPlatformWindow` (`pureunixwindow.{h,cpp}`) sends a real
    `PU_QPA_C2S_WINDOW_CREATE` message with the window's initial size and
-   title over the wire protocol on construction, and
-   `PU_QPA_C2S_CLOSE` on destruction; `setWindowTitle()`/
-   `requestActivateWindow()` are wired for real. Not yet verified *inside*
-   a real `pude` window (needs item 2's PUDE-side counterpart below) —
-   only that the client-side code path runs without crashing when
-   nothing is on the other end of the pipe (`sendMessage()`'s documented
-   safe no-op when `!connected()`).
-3. **Done alongside item 1.** `QPlatformBackingStore`
+   title over the wire protocol on construction, and `PU_QPA_C2S_CLOSE`
+   on destruction; `setWindowTitle()`/`requestActivateWindow()` are wired
+   for real. `user/pude_qtclient.c` (see item 5) is the PUDE-side
+   counterpart that actually makes the window appear: a real chrome-
+   decorated `pude` window titled "PureUnix Qt Window Test" opens from
+   the launcher menu's new "Qt Application" entry and closes cleanly via
+   its own titlebar close button or `pude`'s window-close path.
+3. **Done, QEMU-verified end-to-end.** `QPlatformBackingStore`
    (`pureunixbackingstore.{h,cpp}`) provides a real `QImage` paint
    device Qt's raster paint engine draws into, and `flush()` sends a real
    `PU_QPA_C2S_DAMAGE` message (bounding rect + raw ARGB32 pixel bytes)
    — matching `pude`'s own existing "full-frame redraw, no finer damage-
    rect concept" sophistication level (docs section 5), not a
    regression against something more precise that already existed.
-   Same "runs without crashing standalone" verification level as item 2;
-   pixel-correctness inside a real `pude` window is next.
-4. Not started: keyboard/mouse/wheel/focus event plumbing
-   (`PU_QPA_S2C_KEY`/`MOUSE_MOVE`/`MOUSE_BUTTON`/`MOUSE_WHEEL`/`FOCUS`,
-   already fully defined in `user/pureunix_qpa_protocol.h` and handled by
-   `QPureUnixWindow::handleProtocolMessage()` — the PUDE side that would
-   actually *send* them, `user/pude_qtclient.c`'s `on_key`/`on_mouse_*`
-   callbacks, doesn't exist yet).
-5. Not started: `user/pude_qtclient.c` — the PUDE-side `app_class_t`
-   adapter (fork/exec the client with `PUREUNIX_QPA_FD_READ`/`_WRITE`
-   dup2'd into place, parse incoming `PU_QPA_C2S_*` messages, blit
-   `PU_QPA_C2S_DAMAGE` payloads into the window's on-screen surface,
-   forward real keyboard/mouse events back). This is the one piece that
-   actually makes a Qt window appear *inside* `pude` — everything above
-   only proves the client-side plugin runs correctly in isolation.
+   `QPainter::fillRect()`/`drawText()` output is now visually confirmed
+   on real `pude` screendumps: a solid `QColor(40,40,120)` fill renders
+   correctly at the right position and size inside the native window.
+   Glyphs currently render as empty boxes (tofu) — Qt's `QFontDatabase`
+   warns `Cannot find font directory .../lib/fonts` at startup, since no
+   font files are bundled onto the disk image; a real but separate
+   deployment gap (see "Known gaps" below), not a rendering-pipeline bug.
+4. **Protocol/plumbing done and exercised without incident** (real
+   keydown/keyup and mouse-move/click messages were sent to a live Qt
+   window via `pude_qtclient.c`'s `on_key`/`on_mouse_*` callbacks and
+   `QPureUnixWindow::handleProtocolMessage()` on the client side, with no
+   crashes); `TestWindow` itself doesn't yet have any interactive widget
+   to visually confirm keystrokes *land* on the right control (that's
+   Phase 5's job below), so this counts as "wired and stable", not yet
+   "visually round-trip-verified" the way rendering is.
+5. **Done, QEMU-verified.** `user/pude_qtclient.c` — the PUDE-side
+   `app_class_t` adapter: forks/execs the client with
+   `PUREUNIX_QPA_FD_READ`/`_WRITE` dup2'd into place, parses incoming
+   `PU_QPA_C2S_*` messages with a real incremental/resumable parser
+   (`drain_messages()`, mirroring the client's own `ReadBuffer`), blits
+   `PU_QPA_C2S_DAMAGE` payloads into the window's on-screen `SDL_Surface`,
+   and forwards real keyboard/mouse/resize events back over
+   `PU_QPA_S2C_*`. Registered in `user/pude.c`'s `g_apps[]` as
+   `qtclient_app_class` ("Qt Application", last launcher-menu entry);
+   `pude_qtclient_set_exec_path()` is the one-shot mailbox that tells it
+   which real Qt binary to launch (`/bin/qtwindowtest.elf` today).
+
+**End-to-end verification (`tools/test-qt-pude.py`, `tools/build-qpa-scratch-disk.sh`):**
+boots a small dedicated scratch ISO carrying BusyBox + `pude.elf` +
+`qtwindowtest.elf`, launches `pude` from a real shell prompt, opens the
+launcher menu, clicks "Qt Application", and drives real QMP keyboard/mouse
+input into the resulting window. Confirmed via screendump: a real chrome-
+decorated `pude` window appears, `QPainter` output renders at the correct
+position/color, and `pude`'s own Ctrl+F12 "emergency whole-desktop quit"
+correctly tears the whole thing down and returns to the outer shell. This
+is the Phase 2/3 milestone the original plan called for — "verify a blank
+native Qt window appears inside PUDE" and "confirm QPainter output appears
+correctly onscreen" are both real, not simulated.
 
 **Two real findings while getting here, beyond the plugin code itself:**
 
@@ -902,18 +937,112 @@ Widgets application can create, display, and interact with a real
   `make all`, just never added to `mkfat16.py`/`mkext2.py`'s file lists)
   and gets its own small, dedicated scratch disk
   (`tools/build-qpa-scratch-disk.sh`) for interactive verification
-  instead. Revisit properly once Phase 6 stabilizes — likely by moving
-  Qt QPA testing to the persistent-disk boot path
-  (`tools/test-persistent-boot.py`'s style), which reads EXT2 from a
-  real/virtual disk on demand rather than preloading the whole image
-  into RAM, and has no such ceiling at all.
+  instead — the script also strips the scratch ISO's `fat.img` GRUB
+  module entirely (unlike the shared `$(LIVE_ISO)`'s `boot/grub.cfg`):
+  `kernel/main.c`'s FAT16 mount is optional, and skipping it frees a real
+  32 MiB of physical RAM this small machine badly needs, which is what
+  actually let `qtwindowtest.elf`'s real `exec()` succeed at all (`ram_
+  free` went from ~17 MiB to ~50 MiB just from that one change). Revisit
+  properly once Phase 6 stabilizes — likely by moving Qt QPA testing to
+  the persistent-disk boot path (`tools/test-persistent-boot.py`'s
+  style), which reads EXT2 from a real/virtual disk on demand rather than
+  preloading the whole image into RAM, and has no such ceiling at all.
 
-Next when resuming: item 5 above (`user/pude_qtclient.c`, the PUDE-side
-adapter) is the critical path — nothing above can be verified *inside* a
-real `pude` window without it. Then item 4 (input plumbing) becomes
-straightforward (the protocol and client-side handling already exist).
-QtWidgets (Phase 8 in the original plan) and the final demo follow once
-input/painting round-trips through a real `pude`-hosted window. Keep
-`kernel/heap.c`'s `HEAP_SIZE` in mind if a future QtWidgets test binary
-approaches ~20 MiB even stripped — it may need raising again (a real,
+**Three real kernel/WM bugs found and fixed getting a Qt window to actually
+render and quit cleanly inside `pude` (all QEMU-verified fixed, all with
+the existing regression suites re-run clean — `run-systest.txt` still at
+the known 343/345 baseline, every other `tools/vt-scripts/*.txt` still
+`OK`, `test-pude-dock.py` still passes):**
+
+1. **QPA plugin claimed a capability it never actually implemented.**
+   `QPureUnixIntegration::hasCapability()` returned `true` for
+   `QPlatformIntegration::PaintEvents`, which tells Qt "this platform will
+   emit real paint events itself" — this plugin never does, so
+   `QGuiApplicationPrivate::processExposeEvent()`'s `shouldSynthesizePaintEvents`
+   check came out `false` and **`QRasterWindow::paintEvent()` was simply
+   never called**, ever, for any window. A blank native chrome-decorated
+   `pude` window appeared (Phase 2's own milestone), but every client
+   area stayed permanently black — this looked at first like Phase 2 was
+   done and Phase 3 (real painting) just hadn't been wired up yet, but
+   was actually a one-line capability-flag bug. Fixed by not claiming
+   `PaintEvents` (matching the real upstream `offscreen`/`minimal`
+   plugins' own `hasCapability()`, neither of which claim it either).
+2. **A fixed per-task heap start address assumed every program's own
+   code/data/bss stayed under 4 MiB — untrue for Qt.** `include/pureunix/
+   vmm.h`'s `HEAP_VA` was `USER_WINDOW_BASE + 4 MiB`, a compile-time
+   constant every process shared. `qtwindowtest.elf`'s real, statically-
+   linked `.text` alone is ~10 MiB, so its own `sbrk()`-backed heap
+   allocations (e.g. `QImage`'s pixel buffer, `QImage::fill(Qt::white) ==
+   0xFFFFFFFF`) landed *inside* its own still-executing code — and since
+   every `PT_LOAD` segment here is mapped `PAGE_WRITE` (no W^X), the
+   write succeeded silently. The corruption only surfaced later as a
+   spurious `#UD` (invalid opcode) kernel panic when execution reached
+   the clobbered bytes, which every naive read (kernel panic's own
+   `eip`, `objdump` on the on-disk ELF) misleadingly showed as a
+   perfectly valid instruction — only reading the *live* bytes through
+   the fault handler itself (`arch/i386/idt.c`'s new eip byte-dump, kept
+   as a permanent diagnostic alongside the existing page-fault `cr2`
+   dump) revealed a run of real `0xFF` bytes where the disk image had
+   real code. Fixed with a new per-task `task_t.heap_base`
+   (`include/pureunix/task.h`), computed by `kernel/elf.c`'s
+   `elf_load_into()` from the actual highest loaded `PT_LOAD` segment end
+   (never *smaller* than the old fixed `HEAP_VA`, so every existing
+   program's layout is unchanged) — `arch/i386/syscall.c`'s `SYS_SBRK`/
+   `SYS_FB_MMAP` now use `t->heap_base` instead of the shared constant,
+   and `task_fork()` copies it like `heap_used`/`heap_mapped` already
+   were. This is what a *previous* Phase 6 attempt at raising total RAM
+   (see the paragraph above) had actually stumbled into and misdiagnosed
+   as "an unexplained page fault at `HEAP_VA` during multi-VT boot" —
+   same real bug, different trigger, correctly root-caused this time.
+3. **No CR4.OSFXSR: any ring-3 SSE instruction was a guaranteed #UD.**
+   Once (1) and (2) were both fixed, real `QPainter` painting finally ran
+   — and immediately hit a *second*, genuine `#UD` at `QPainter`'s own
+   construction, this time a real one: `libQt6Gui.a`'s SSE2-optimized
+   raster blend routines, exercised for the first time in this whole
+   port. Nothing in this kernel had ever enabled `CR4.OSFXSR`/
+   `CR4.OSXMMEXCPT` or set up `FXSAVE`/`FXRSTOR` register-file save/
+   restore across a context switch — a real prerequisite already flagged
+   (unfixed) during an earlier phase (`qfloat16`/`-msse2`), now hit for
+   real. Fixed with a new `arch/i386/fpu.c` (`fpu_init()`, called once at
+   boot right after `arch_init()`) enabling the CR0/CR4 bits and
+   capturing a legal "freshly reset FPU" `FXSAVE` template every new
+   task's own `task_t.fpu_state` is seeded from
+   (`fpu_init_task_state()`); `kernel/task.c`'s `task_yield()` now does a
+   real `fxsave(prev)`/`fxrstor(next)` around every `context_switch()`.
+   `task_t.fpu_state` is deliberately oversized by 16 bytes and aligned
+   at the point of use (`fpu_state_area()`) since `kmalloc()`/`kcalloc()`
+   only guarantee 8-byte alignment but `FXSAVE`/`FXRSTOR` require 16.
+4. **`pude`'s own Ctrl+F12 "emergency whole-desktop quit" hung forever
+   with a live Qt child window open.** `user/pude_qtclient.c`'s
+   `qtclient_destroy()` copied PUTerm's own `kill(-st->child, SIGHUP);
+   waitpid(st->child, &status, 0);` pattern verbatim — but that pattern
+   only works for PUTerm because the *shell* it forks (BusyBox ash with
+   job control) calls `setpgid(0,0)` on itself at startup, making
+   `-st->child` a valid target. An ordinary Qt binary has no reason to
+   know that convention and never calls `setpgid()`, so it silently kept
+   *pude's own* inherited process group — `kill(-st->child, ...)` then
+   targeted a process group nothing was actually in, a real no-op, and
+   the blocking `waitpid()` right after it hung forever (confirmed via a
+   temporary debug print: the Ctrl+F12 keydown *was* correctly detected
+   and `quit=true` *was* set — `pude` was stuck inside its own window-
+   teardown loop, not failing to notice the hotkey at all). Fixed two
+   ways: `spawn_client()` now calls `setpgid(0,0)`/`setpgid(pid,pid)`
+   from both the child and parent side (the standard fork/exec race
+   guard) so the Qt child gets its own real process group; and
+   `qtclient_destroy()` now bounds the post-SIGHUP wait to a real ~500 ms
+   of non-blocking `waitpid(..., WNOHANG)` polling before escalating to
+   `SIGKILL`, so a future app that doesn't cleanly exit on SIGHUP for
+   some other reason can never hang the whole desktop again either.
+
+Next when resuming: Phase 4 (input) is wired and stable but not yet
+*visually* round-trip-verified (`TestWindow` has nothing interactive to
+confirm a keystroke landed correctly) — that naturally falls out of
+Phase 5. Phase 5 (real QtWidgets — `QLabel`/`QPushButton`/`QLineEdit`/
+`QTextEdit`/`QMainWindow`/layouts) is the next real milestone and hasn't
+been started. Font rendering currently shows tofu boxes instead of glyphs
+(`QFontDatabase: Cannot find font directory`) — deploying a real font
+(e.g. DejaVu, per Qt's own suggestion) onto the disk image is a
+prerequisite for Phase 5 actually being legible, not just architecturally
+present. Keep `kernel/heap.c`'s `HEAP_SIZE` in mind if a future QtWidgets
+test binary approaches ~20 MiB even stripped — it may need raising again (a real,
 independent-of-RAM kernel heap ceiling, not the disk/RAM tension above).
