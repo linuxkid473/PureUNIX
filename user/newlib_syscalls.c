@@ -41,6 +41,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -124,7 +125,34 @@ enum {
     PU_SYS_FB_MMAP = 61,
     PU_SYS_SBRK = 62,
     PU_SYS_PTY_CREATE = 63,
+    PU_SYS_FUTIME = 64,
+    PU_SYS_STATFS = 65,
+    PU_SYS_SET_TLS = 66,
+    PU_SYS_POLL = 67,
 };
+
+/* Mirrors arch/i386/syscall.c's SYS_POLL wire struct exactly (int32_t fd +
+ * two int16_t fields, already 8 bytes/naturally aligned, no padding) —
+ * same "explicit wire struct instead of relying on two differently-
+ * declared structs happening to line up" reasoning as struct pu_raw_stat/
+ * pu_raw_flock/pu_raw_statfs above. */
+struct pu_raw_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+/* SYS_SET_TLS (include/pureunix/syscall.h) — tells the kernel about a TLS
+ * block user/newlib_crt0.c's tls_init() already built, so
+ * arch/i386/gdt.c's gdt_set_tls_base() can replay it on every future
+ * context switch back to this task. This file is the one place that owns
+ * the raw syscall ABI/PU_SYS_* numbering (see raw_syscall() above); crt0
+ * stays kernel-ABI-agnostic and just calls this instead of duplicating
+ * PU_SYS_SET_TLS or the int $0x80 gate itself. */
+void __pureunix_set_tls_base(void *tp)
+{
+    raw_syscall(PU_SYS_SET_TLS, (int)tp, 0, 0);
+}
 
 /* open() flags — must match include/pureunix/fcntl.h. Distinct bit layout
  * from newlib's own O_* (sys/_default_fcntl.h), so open() below translates
@@ -170,6 +198,20 @@ struct pu_raw_flock {
     int32_t l_start;
     int32_t l_len;
     int32_t l_pid;
+};
+
+/* Mirrors include/pureunix/vfs.h's struct vfs_statfs exactly (same field
+ * order/widths) — SYS_STATFS (arch/i386/syscall.c) writes directly into
+ * this layout, same "explicit wire struct" convention as struct pu_raw_stat/
+ * pu_raw_flock above. */
+struct pu_raw_statfs {
+    uint32_t f_bsize;
+    uint32_t f_blocks;
+    uint32_t f_bfree;
+    uint32_t f_bavail;
+    uint32_t f_files;
+    uint32_t f_ffree;
+    uint32_t f_namemax;
 };
 
 /* Mirrors include/pureunix/termios.h's struct termios (NCCS == 8, its own
@@ -365,6 +407,23 @@ int ftruncate(int fd, off_t length)
     return r < 0 ? fail(r) : 0;
 }
 
+/* Path-based truncate(): no separate SYS_TRUNCATE exists (or is needed) —
+ * open()+ftruncate()+close() is exactly what a path-based truncate does
+ * everywhere, real syscall or not. Real Qt Core caller: qfsfileengine_unix.cpp's
+ * QFSFileEngine::setSize(), a general POSIX function, not Qt-specific. */
+int truncate(const char *path, off_t length)
+{
+    int fd = open(path, O_WRONLY, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int r = ftruncate(fd, length);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return r;
+}
+
 /* Every write() already lands directly in the VFS's in-memory copy of the
  * file (see open_file_t in include/pureunix/task.h) with nothing buffered
  * behind it to flush — a real no-op, not a stub standing in for a missing
@@ -373,6 +432,107 @@ int fsync(int fd)
 {
     (void)fd;
     return 0;
+}
+
+/* Real statvfs(), backed by SYS_STATFS (arch/i386/syscall.c -> fs/vfs.c's
+ * vfs_statfs() -> the mounted filesystem's own ops->statfs, real on EXT2 —
+ * see fs/ext2/mount.c's ext2_statfs()). Real Qt Core caller:
+ * qstorageinfo_unix.cpp's QStorageInfoPrivate::retrieveVolumeInfo()
+ * (QStorageInfo) — a general POSIX function, not Qt-specific (also used by
+ * BusyBox's df applet). f_fsid/f_flag aren't populated (no volume-id or
+ * mount-flags concept tracked anywhere yet) and stay 0, matching this
+ * file's usual "honest zero, not a fabricated value" convention. */
+int statvfs(const char *path, struct statvfs *buf)
+{
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
+    struct pu_raw_statfs raw;
+    int r = raw_syscall(PU_SYS_STATFS, (int)path, (int)&raw, 0);
+    if (r < 0) {
+        return fail(r);
+    }
+    buf->f_bsize = raw.f_bsize;
+    buf->f_frsize = raw.f_bsize;
+    buf->f_blocks = raw.f_blocks;
+    buf->f_bfree = raw.f_bfree;
+    buf->f_bavail = raw.f_bavail;
+    buf->f_files = raw.f_files;
+    buf->f_ffree = raw.f_ffree;
+    buf->f_favail = raw.f_ffree;
+    buf->f_fsid = 0;
+    buf->f_flag = 0;
+    buf->f_namemax = raw.f_namemax;
+    return 0;
+}
+
+/* No fd-to-path resolution syscall exists for statfs specifically (unlike
+ * fchmod/fchown/futimens above, which SYS_FCHMOD/SYS_FCHOWN/SYS_FUTIME
+ * already do via the fd's own open_file_t.path) — not reachable by this
+ * port's actual Qt Core scope (QStorageInfo always goes through the
+ * path-based statvfs64() below), so left as a real, honest ENOSYS rather
+ * than a fabricated kernel syscall for a currently-unreached code path
+ * (same "declare it, implement for real only once something actually
+ * calls it" precedent as docs/qt-port.md's Phase 3 statvfs64 finding). */
+int fstatvfs(int fd, struct statvfs *buf)
+{
+    (void)fd;
+    (void)buf;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* struct statvfs64 (user/newlib_compat/sys/statvfs.h) is byte-for-byte
+ * identical to struct statvfs above — PureUnix has no real 32-vs-64-bit
+ * file-offset distinction to make — so this is genuinely just the
+ * cast-through the header comment describes, not a shortcut. */
+int statvfs64(const char *path, struct statvfs64 *buf)
+{
+    return statvfs(path, (struct statvfs *)buf);
+}
+
+/* Real answer, not a stub: every page this kernel's VMM maps (kernel/vmm.c,
+ * arch/i386/*) is a fixed 4096-byte x86 page — there's no larger-page/huge-
+ * page support anywhere to make this configurable. */
+int getpagesize(void)
+{
+    return 4096;
+}
+
+/* BSD flock() reimplemented on top of the real POSIX fcntl() advisory
+ * locking already added for the SQLite port (PU_SYS_FCNTL, kernel/flock.c,
+ * docs/sqlite-port.md) — the same "implement the BSD entry point over the
+ * POSIX one" approach glibc/most libcs use, not a PureUNIX-specific
+ * shortcut. flock()'s lock domain is technically distinct from fcntl()'s
+ * (whole-open-file vs whole-process-per-inode), but with no real
+ * multi-process concurrent access to the same file ever exercised on this
+ * target (single fcntl()-based lock table, see kernel/flock.c), a
+ * whole-file F_SETLK/F_SETLKW covering the entire file (l_whence=SEEK_SET,
+ * l_start=0, l_len=0) gives correct-enough behavior for every real caller.
+ * Real Qt Core callers: qlockfile_unix.cpp's QLockFilePrivate::tryLock_sys()/
+ * removeStaleLock() (QLockFile, used internally by QSettings et al). */
+int flock(int fd, int operation)
+{
+    struct flock lck;
+    lck.l_whence = SEEK_SET;
+    lck.l_start = 0;
+    lck.l_len = 0;
+    lck.l_pid = 0;
+
+    int op = operation & ~LOCK_NB;
+    if (op == LOCK_UN) {
+        lck.l_type = F_UNLCK;
+    } else if (op == LOCK_SH) {
+        lck.l_type = F_RDLCK;
+    } else if (op == LOCK_EX) {
+        lck.l_type = F_WRLCK;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return fcntl(fd, (operation & LOCK_NB) ? F_SETLK : F_SETLKW, &lck);
 }
 
 /* sys/config.h picks _READ_WRITE_RETURN_TYPE == int for this target (no
@@ -897,6 +1057,124 @@ time_t time(time_t *out)
     return tv.tv_sec;
 }
 
+/* clock_gettime()/clock_getres() — newlib's own <time.h> only declares
+ * these behind an `#ifdef __rtems__` guard (see third_party/newlib's
+ * sys/features.h - it has no case for an unknown/generic target), so
+ * user/newlib_compat/time.h declares them unconditionally instead. Real
+ * implementations, not stubs: CLOCK_MONOTONIC is backed by SYS_GET_TICKS_MS
+ * (syscall 59, PIT-derived, 10ms resolution, already general-purpose —
+ * this is the exact clock Qt's QElapsedTimer needs, see docs/qt-port.md
+ * section 4), CLOCK_REALTIME reuses gettimeofday() above (SYS_GETTIMEOFDAY,
+ * second resolution). Any other clockid_t is rejected with EINVAL, matching
+ * real clock_gettime()'s behavior for an unsupported clock. */
+int clock_gettime(clockid_t clock_id, struct timespec *tp)
+{
+    if (!tp) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (clock_id == CLOCK_MONOTONIC) {
+        unsigned int ms = (unsigned int)raw_syscall(PU_SYS_GET_TICKS_MS, 0, 0, 0);
+        tp->tv_sec = (time_t)(ms / 1000);
+        tp->tv_nsec = (long)((ms % 1000) * 1000000L);
+        return 0;
+    }
+    if (clock_id == CLOCK_REALTIME) {
+        struct timeval tv;
+        if (gettimeofday(&tv, 0) != 0) {
+            return -1;
+        }
+        tp->tv_sec = tv.tv_sec;
+        tp->tv_nsec = 0;
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+int clock_getres(clockid_t clock_id, struct timespec *res)
+{
+    if (!res) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (clock_id == CLOCK_MONOTONIC) {
+        res->tv_sec = 0;
+        res->tv_nsec = 10000000L; /* 10ms, matching SYS_GET_TICKS_MS's real PIT resolution */
+        return 0;
+    }
+    if (clock_id == CLOCK_REALTIME) {
+        res->tv_sec = 1; /* SYS_GETTIMEOFDAY has second resolution only */
+        res->tv_nsec = 0;
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+/* getentropy() — cpuid/rdrand are plain, unprivileged x86 instructions (no
+ * ring-0 support needed, unlike almost everything else this file wraps),
+ * same "just execute it" reasoning kernel/vmm.c's own cpuid-based PAT probe
+ * already relies on. Real hardware entropy (RDRAND, CPUID.1:ECX.30) is used
+ * whenever the CPU has it; on a CPU/QEMU CPU model without it, this falls
+ * back to a simple xorshift PRNG reseeded from SYS_GET_TICKS_MS each call —
+ * good enough for QRandomGenerator's non-cryptographic seeding use (Qt
+ * Core's real caller: qrandom.cpp's QRandomGenerator::SystemGenerator, used
+ * to seed QHash's per-process seed and QUuid — not a security-sensitive CSPRNG
+ * deployment on this target), not a claim of real cryptographic quality
+ * without RDRAND. */
+static int rdrand_supported(void)
+{
+    static int checked = 0, supported = 0;
+    if (!checked) {
+        unsigned int a = 1, c = 0, d = 0, b = 0;
+        __asm__ volatile("cpuid" : "+a"(a), "=c"(c), "=d"(d), "=b"(b));
+        supported = (c & (1U << 30)) != 0;
+        checked = 1;
+    }
+    return supported;
+}
+
+static unsigned int rdrand32(void)
+{
+    unsigned int val;
+    unsigned char ok;
+    int attempts = 10;
+    do {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+    } while (!ok && --attempts > 0);
+    return val;
+}
+
+static unsigned int fallback_prng32(void)
+{
+    static unsigned int state;
+    unsigned int ms = (unsigned int)raw_syscall(PU_SYS_GET_TICKS_MS, 0, 0, 0);
+    state ^= ms + 0x9e3779b9u + (state << 6) + (state >> 2);
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+int getentropy(void *buf, size_t buflen)
+{
+    if (buflen > 256) {
+        errno = EIO;
+        return -1;
+    }
+    unsigned char *p = buf;
+    int use_rdrand = rdrand_supported();
+    while (buflen > 0) {
+        unsigned int r = use_rdrand ? rdrand32() : fallback_prng32();
+        size_t n = buflen < sizeof(r) ? buflen : sizeof(r);
+        memcpy(p, &r, n);
+        p += n;
+        buflen -= n;
+    }
+    return 0;
+}
+
 /* Translates POSIX's three time-setting flavors down to SYS_UTIME's plain
  * {path, atime, mtime} — dirfd is always treated as AT_FDCWD-relative
  * (every PureUNIX path syscall already resolves relative to this task's
@@ -934,6 +1212,31 @@ int utimes(const char *path, const struct timeval times[2])
         mtime = (uint32_t)times[1].tv_sec;
     }
     int r = raw_syscall(PU_SYS_UTIME, (int)path, (int)atime, (int)mtime);
+    return r < 0 ? fail(r) : 0;
+}
+
+/* fd-based utimensat() — same NOW/OMIT/explicit-seconds translation as
+ * utimensat() above, backed by SYS_FUTIME (arch/i386/syscall.c) which
+ * resolves the fd to its open_file_t.path and calls the same vfs_utime()
+ * the path-based syscalls use, mirroring how fchmod()/fchown() above
+ * already resolve an fd the same way. Real Qt Core caller:
+ * qfilesystemengine_unix.cpp's QFileSystemEngine::setFileTime()
+ * (QFile::setFileTime()/QFileDevice), a general POSIX primitive, not
+ * Qt-specific. */
+int futimens(int fd, const struct timespec times[2])
+{
+    uint32_t atime = 0xFFFFFFFFu, mtime = 0xFFFFFFFFu;
+    if (!times) {
+        atime = mtime = (uint32_t)time(0);
+    } else {
+        atime = times[0].tv_nsec == UTIME_NOW ? (uint32_t)time(0)
+                : times[0].tv_nsec == UTIME_OMIT ? 0xFFFFFFFFu
+                : (uint32_t)times[0].tv_sec;
+        mtime = times[1].tv_nsec == UTIME_NOW ? (uint32_t)time(0)
+                : times[1].tv_nsec == UTIME_OMIT ? 0xFFFFFFFFu
+                : (uint32_t)times[1].tv_sec;
+    }
+    int r = raw_syscall(PU_SYS_FUTIME, fd, (int)atime, (int)mtime);
     return r < 0 ? fail(r) : 0;
 }
 
@@ -1818,54 +2121,131 @@ clock_t times(struct tms *buf)
     return (clock_t)((long)tv.tv_sec * 100 + tv.tv_usec / 10000);
 }
 
-/* No select()/poll()-equivalent readiness multiplexing exists in this
- * kernel — every requested fd is reported ready for whatever it asked
- * about immediately. This is enough for the only reachable callers in the
- * currently enabled applet set (ash's `read -t`/`read -s` builtin,
- * libbb's safe_poll() retry wrapper): the real read()/write() call that
- * follows is what actually blocks or returns data, same as it always
- * would — `read -t TIMEOUT` just won't genuinely time out yet. */
+/* Real poll(), backed by SYS_POLL (arch/i386/syscall.c -> fs/vfs.c's
+ * pipe_buf_t.count for FD_KIND_PIPE fds, the one fd kind this kernel can
+ * genuinely check readiness for without lying — see that syscall's own
+ * comment). Originally reachable only via ash's `read -t`/`read -s`
+ * builtin and libbb's safe_poll() retry wrapper, both of which only ever
+ * needed the real read()/write() that follows to be the thing that
+ * actually blocks; Qt's event dispatcher (qeventdispatcher_unix.cpp,
+ * docs/qt-port.md section 4) is a real multiplexing caller — its own
+ * same-process wakeup pipe is exactly the FD_KIND_PIPE case SYS_POLL
+ * handles for real. nfds==0 (Qt's "just sleep until the next due
+ * QTimer" idiom) is special-cased to skip marshalling an empty array. */
 int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
-    (void)timeout;
-    int ready = 0;
-    for (nfds_t i = 0; i < nfds; i++) {
-        fds[i].revents = fds[i].events & (POLLIN | POLLOUT);
-        if (fds[i].revents) {
-            ready++;
+    if (nfds == 0) {
+        if (timeout != 0) {
+            struct timespec req;
+            if (timeout < 0) {
+                req.tv_sec = 0;
+                req.tv_nsec = 50000000L; /* no fds at all to ever become "ready" -- approximate an unbounded wait as bounded 50ms steps, same as before */
+            } else {
+                req.tv_sec = timeout / 1000;
+                req.tv_nsec = (long)(timeout % 1000) * 1000000L;
+            }
+            nanosleep(&req, 0);
         }
+        return 0;
     }
-    return ready;
+
+    struct pu_raw_pollfd *raw = malloc(nfds * sizeof(struct pu_raw_pollfd));
+    if (!raw) {
+        errno = ENOMEM;
+        return -1;
+    }
+    for (nfds_t i = 0; i < nfds; i++) {
+        raw[i].fd = fds[i].fd;
+        raw[i].events = fds[i].events;
+        raw[i].revents = 0;
+    }
+    int r = raw_syscall(PU_SYS_POLL, (int)raw, (int)nfds, timeout);
+    for (nfds_t i = 0; i < nfds; i++) {
+        fds[i].revents = raw[i].revents;
+    }
+    free(raw);
+    return r < 0 ? fail(r) : r;
 }
 
-/* Same real gap and same honest answer as poll() just above (no readiness
- * multiplexing exists in this kernel) — every fd named in readfds/
- * writefds is reported ready immediately rather than lying about a real
- * wait; exceptfds is always empty (no urgent/OOB data model exists
- * either). Added for htop's TraceScreen (third_party/htop/) — its own
- * F-key strace/truss integration fails at the execlp() step anyway
- * (neither binary exists on PureUNIX), so this mainly just needs to link
- * and not misbehave, not genuinely multiplex. */
+/* Real select(), built on the same SYS_POLL as poll() just above (marshals
+ * every fd named in readfds/writefds into a compact pollfd list, then
+ * unpacks revents back into fresh fd_sets) — same real FD_KIND_PIPE
+ * readiness, same honest-optimistic fallback for every other fd kind.
+ * exceptfds is always empty (no urgent/OOB data model exists anywhere).
+ * Originally added for htop's TraceScreen (its own F-key strace/truss
+ * integration fails at the execlp() step anyway, neither binary exists on
+ * PureUNIX, so it only ever needed to link here); Qt's event dispatcher
+ * (docs/qt-port.md section 4) is what makes real readiness matter now. */
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
 {
-    (void)timeout;
-    int ready = 0;
-    for (int fd = 0; fd < nfds; fd++) {
-        bool set = false;
-        if (readfds && FD_ISSET(fd, readfds)) {
-            set = true;
-        }
-        if (writefds && FD_ISSET(fd, writefds)) {
-            set = true;
-        }
-        if (set) {
-            ready++;
-        }
-    }
     if (exceptfds) {
         FD_ZERO(exceptfds);
     }
-    return ready;
+
+    int count = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        if ((readfds && FD_ISSET(fd, readfds)) || (writefds && FD_ISSET(fd, writefds))) {
+            count++;
+        }
+    }
+    if (count == 0) {
+        if (readfds) {
+            FD_ZERO(readfds);
+        }
+        if (writefds) {
+            FD_ZERO(writefds);
+        }
+        if (timeout) {
+            struct timespec req;
+            req.tv_sec = timeout->tv_sec;
+            req.tv_nsec = (long)timeout->tv_usec * 1000L;
+            nanosleep(&req, 0);
+        }
+        return 0;
+    }
+
+    struct pu_raw_pollfd *raw = malloc((size_t)count * sizeof(struct pu_raw_pollfd));
+    if (!raw) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int idx = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        bool r = readfds && FD_ISSET(fd, readfds);
+        bool w = writefds && FD_ISSET(fd, writefds);
+        if (!r && !w) {
+            continue;
+        }
+        raw[idx].fd = fd;
+        raw[idx].events = (int16_t)((r ? POLLIN : 0) | (w ? POLLOUT : 0));
+        raw[idx].revents = 0;
+        idx++;
+    }
+
+    int timeout_ms = timeout ? (int)(timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
+    int r = raw_syscall(PU_SYS_POLL, (int)raw, count, timeout_ms);
+
+    if (readfds) {
+        FD_ZERO(readfds);
+    }
+    if (writefds) {
+        FD_ZERO(writefds);
+    }
+    int ready = 0;
+    if (r >= 0) {
+        for (int i = 0; i < count; i++) {
+            if (readfds && (raw[i].revents & POLLIN)) {
+                FD_SET(raw[i].fd, readfds);
+                ready++;
+            }
+            if (writefds && (raw[i].revents & POLLOUT)) {
+                FD_SET(raw[i].fd, writefds);
+                ready++;
+            }
+        }
+    }
+    free(raw);
+    return r < 0 ? fail(r) : ready;
 }
 
 long sysconf(int name)

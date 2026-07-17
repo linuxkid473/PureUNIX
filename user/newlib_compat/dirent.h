@@ -19,6 +19,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_DIRENT_H
 #define PUREUNIX_NEWLIB_COMPAT_DIRENT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Standard values (matching Linux/glibc) so code that compares d_type
  * against these constants works unmodified. PureUNIX's own SYS_READDIR
  * only distinguishes file/directory/symlink (include/pureunix/dirent.h),
@@ -48,4 +52,8 @@ int closedir(DIR *dirp);
  * why a real fd-backed dirfd() isn't meaningful on this kernel. */
 int dirfd(DIR *dirp);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

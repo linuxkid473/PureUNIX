@@ -482,6 +482,14 @@ int elf_exec_current(interrupt_regs_t *regs, const char *path, int argc, char *c
     t->heap_used = 0;
     t->heap_mapped = 0;
     t->fb_shadow_mapped = false;
+    /* Same stale-address-space bug class as heap_used/heap_mapped/
+     * fb_shadow_mapped just above: a fresh exec()'d image has no TLS block
+     * of its own yet (crt0 sets one up via SYS_SET_TLS, see
+     * arch/i386/gdt.c's gdt_set_tls_base()) — carrying over the old
+     * image's tls_base would point the GDT's TLS descriptor at memory that
+     * either doesn't exist in the new address space or means something
+     * completely different there. */
+    t->tls_base = 0;
 
     /* POSIX close-on-exec: any fd fcntl(F_DUPFD_CLOEXEC)'d (e.g. BusyBox
      * ash's setjobctl() — see fd_entry_t.cloexec's own comment) must not

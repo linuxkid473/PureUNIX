@@ -7,4 +7,12 @@
  * stub is enough to satisfy the #include. */
 #ifndef PUREUNIX_NEWLIB_COMPAT_FEATURES_H
 #define PUREUNIX_NEWLIB_COMPAT_FEATURES_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 #endif

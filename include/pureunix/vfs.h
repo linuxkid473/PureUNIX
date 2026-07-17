@@ -42,6 +42,21 @@ typedef struct vfs_dirent {
 
 typedef int (*vfs_readdir_cb_t)(const vfs_dirent_t *entry, void *ctx);
 
+/* Whole-filesystem space/inode usage (statvfs(2)/statfs(2), e.g. BusyBox's
+ * df applet, Qt Core's QStorageInfo). Real on EXT2 (fs/ext2/mount.c's
+ * ext2_statfs(), read straight from the mounted superblock's own free/total
+ * counters); NULL on FAT16 (no free-space bookkeeping this driver tracks
+ * today) and PROCFS (not a real block device). */
+typedef struct vfs_statfs {
+    uint32_t f_bsize;    /* block size */
+    uint32_t f_blocks;   /* total blocks */
+    uint32_t f_bfree;    /* free blocks */
+    uint32_t f_bavail;   /* free blocks available to unprivileged users */
+    uint32_t f_files;    /* total inodes */
+    uint32_t f_ffree;    /* free inodes */
+    uint32_t f_namemax;  /* max filename length */
+} vfs_statfs_t;
+
 /* Filesystem type tag — used only for identification/display (e.g. mount,
  * df); routing never switches on it. Add an entry here when a new driver
  * gains a vfs_mount() registration. */
@@ -80,6 +95,8 @@ typedef struct vfs_ops {
     int (*readlink)(const char *path, char *buf, size_t bufsize);
     int (*link)(const char *old_path, const char *new_path);
     int (*symlink)(const char *target, const char *path);
+    /* See vfs_statfs_t's own comment above. */
+    int (*statfs)(vfs_statfs_t *out);
 } vfs_ops_t;
 
 typedef struct vfs_mount {
@@ -114,6 +131,7 @@ int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_rename(const char *old_path, const char *new_path);
 int vfs_readdir(const char *path, vfs_readdir_cb_t cb, void *ctx);
+int vfs_statfs(const char *path, vfs_statfs_t *out);
 const char *vfs_last_error(void);
 void vfs_normalize(char *out, const char *cwd, const char *path);
 

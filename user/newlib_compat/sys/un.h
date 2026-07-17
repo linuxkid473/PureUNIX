@@ -6,6 +6,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_UN_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_UN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/socket.h>
 
 struct sockaddr_un {
@@ -13,4 +17,8 @@ struct sockaddr_un {
     char        sun_path[108];
 };
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

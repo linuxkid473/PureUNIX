@@ -14,6 +14,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SIGNAL_H
 #define PUREUNIX_NEWLIB_COMPAT_SIGNAL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <signal.h>
 
 #ifndef SA_RESTART
@@ -29,4 +33,8 @@
 #define SA_NOMASK SA_NODEFER
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

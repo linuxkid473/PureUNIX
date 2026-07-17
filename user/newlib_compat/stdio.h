@@ -20,10 +20,18 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_STDIO_H
 #define PUREUNIX_NEWLIB_COMPAT_STDIO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <stdio.h>
 
 #ifndef __cplusplus
 #define getline __getline
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

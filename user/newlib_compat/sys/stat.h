@@ -16,6 +16,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_STAT_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_STAT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <sys/stat.h>
 
 int lstat(const char *__restrict path, struct stat *__restrict buf);
@@ -28,4 +32,8 @@ int mknod(const char *path, mode_t mode, dev_t dev);
 #define UTIME_OMIT -1L
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

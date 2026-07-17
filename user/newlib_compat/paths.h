@@ -13,10 +13,18 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_PATHS_H
 #define PUREUNIX_NEWLIB_COMPAT_PATHS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <paths.h>
 
 #ifndef _PATH_TTY
 #define _PATH_TTY "/dev/tty"
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

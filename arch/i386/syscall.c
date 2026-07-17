@@ -1394,6 +1394,17 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         }
         return (uint32_t)vfs_chown(t->fds[fd].file->path, uid, gid);
     }
+    case SYS_FUTIME: {
+        int fd = (int)regs->ebx;
+        uint32_t atime = regs->ecx;
+        uint32_t mtime = regs->edx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_FILE) {
+            return (uint32_t)-EBADF;
+        }
+        return (uint32_t)vfs_utime(t->fds[fd].file->path, atime, mtime);
+    }
     case SYS_READDIR: {
         const char *raw_path = (const char *)regs->ebx;
         struct pureunix_dirent *out = (struct pureunix_dirent *)regs->ecx;
@@ -1784,6 +1795,108 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         char path_buf[PUREUNIX_MAX_PATH];
         resolve_path(path_buf, raw_path);
         return (uint32_t)vfs_utime(path_buf, atime, mtime);
+    }
+    case SYS_STATFS: {
+        const char *raw_path = (const char *)regs->ebx;
+        vfs_statfs_t *out = (vfs_statfs_t *)regs->ecx;
+        if (!raw_path || !out) {
+            return (uint32_t)-EINVAL;
+        }
+        if (!vfs_mounted()) {
+            return (uint32_t)-ENOENT;
+        }
+        char path_buf[PUREUNIX_MAX_PATH];
+        resolve_path(path_buf, raw_path);
+        return (uint32_t)vfs_statfs(path_buf, out);
+    }
+    case SYS_SET_TLS: {
+        uint32_t tp = regs->ebx;
+        task_t *t = task_current();
+        t->tls_base = tp;
+        /* Takes effect immediately (not just on the next context switch) —
+         * the calling task is about to load %gs itself and start using it
+         * right after this syscall returns. */
+        gdt_set_tls_base(tp);
+        return 0;
+    }
+    case SYS_POLL: {
+        /* Wire layout — must match user/newlib_syscalls.c's
+         * struct pu_raw_pollfd exactly (int32_t/int16_t/int16_t, no
+         * padding since it's already naturally 8-byte-sized/4-byte
+         * aligned). Bit values must match user/newlib_compat/poll.h's
+         * POLLIN/POLLOUT/POLLERR/POLLNVAL exactly (the kernel has no
+         * <poll.h> of its own to pull these from). */
+        enum { POLLIN = 0x1, POLLOUT = 0x4, POLLERR = 0x8, POLLNVAL = 0x20 };
+        struct raw_pollfd { int32_t fd; int16_t events; int16_t revents; };
+        struct raw_pollfd *ufds = (struct raw_pollfd *)regs->ebx;
+        int nfds = (int)regs->ecx;
+        int timeout_ms = (int)regs->edx;
+        if (!ufds && nfds > 0) {
+            return (uint32_t)-EINVAL;
+        }
+        task_t *t = task_current();
+        int elapsed_ms = 0;
+        for (;;) {
+            int ready = 0;
+            for (int i = 0; i < nfds; i++) {
+                int fd = ufds[i].fd;
+                int16_t events = ufds[i].events;
+                int16_t revents = 0;
+                if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file) {
+                    revents = POLLNVAL;
+                } else {
+                    open_file_t *f = t->fds[fd].file;
+                    if (f->kind == FD_KIND_PIPE) {
+                        pipe_buf_t *pb = f->pipe_buf;
+                        if (!f->pipe_is_write_end && (events & POLLIN) &&
+                            (pb->count > 0 || pb->write_ends == 0)) {
+                            revents |= POLLIN;
+                        }
+                        if (f->pipe_is_write_end && (events & POLLOUT) &&
+                            (pb->count < PUREUNIX_PIPE_SIZE || pb->read_ends == 0)) {
+                            revents |= POLLOUT;
+                        }
+                        if (f->pipe_is_write_end && pb->read_ends == 0) {
+                            revents |= POLLERR;
+                        }
+                    } else {
+                        /* No real readiness tracking exists yet for any
+                         * other fd kind (regular file/tty/pty/procfs) —
+                         * same honest-for-what-it-is optimistic fallback
+                         * poll()/select() always gave every fd before real
+                         * pipe support existed (see user/newlib_syscalls.c's
+                         * poll() comment). */
+                        revents = events & (POLLIN | POLLOUT);
+                    }
+                }
+                ufds[i].revents = revents;
+                if (revents) {
+                    ready++;
+                }
+            }
+            if (ready > 0 || timeout_ms == 0) {
+                return (uint32_t)ready;
+            }
+            if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
+                return 0;
+            }
+            /* int $0x80 enters with interrupts masked — pit_sleep() needs
+             * the PIT tick interrupt to ever fire, same fix SYS_PING's
+             * icmp_ping() and drivers/tty.c's tty_read() already apply
+             * before their own blocking waits (see those comments / the
+             * interrupt-gate-blocking gotcha in project memory). Short
+             * 10ms steps rather than one real wait_queue_sleep(): pipe
+             * readiness can depend on activity happening in a *different*
+             * task, which would need waking this one from that task's own
+             * write()/close() — real, but a larger change than this port
+             * currently needs (its one real caller, Qt's own event
+             * dispatcher wakeup pipe, is polled by the very same
+             * single-threaded process that would also have to write it —
+             * see docs/qt-port.md). */
+            arch_enable_interrupts();
+            pit_sleep(10);
+            elapsed_ms += 10;
+        }
     }
     case SYS_GETTIMEOFDAY: {
         uint32_t *out = (uint32_t *)regs->ebx;

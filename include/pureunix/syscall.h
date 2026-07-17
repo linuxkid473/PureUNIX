@@ -251,6 +251,59 @@ enum {
      * (fewer than two free fd slots) / -ENOSPC (kernel/pty.c's fixed pty
      * pool, MAX_PTYS, is full). */
     SYS_PTY_CREATE = 63,
+
+    /* fd-based analog of SYS_UTIME, mirroring how SYS_FCHMOD/SYS_FCHOWN
+     * already resolve an fd to its open file's path and defer to the same
+     * vfs_chmod()/vfs_chown() a path-based syscall uses -- this does the
+     * same for vfs_utime(). Added for futimens()/futimes() (Qt Core's
+     * qfilesystemengine_unix.cpp calls futimens() for
+     * QFile::setFileTime()), a general POSIX primitive, not Qt-specific.
+     * EBX: fd. ECX: atime (seconds). EDX: mtime (seconds). */
+    SYS_FUTIME = 64,
+
+    /* Whole-filesystem space/inode usage (vfs_statfs_t, fs/vfs.c's
+     * vfs_statfs()) — backs statvfs()/statfs() (user/newlib_syscalls.c),
+     * needed for real by Qt Core's QStorageInfo (src/corelib/io/
+     * qstorageinfo_unix.cpp) as well as BusyBox's df applet. A general
+     * POSIX primitive, not Qt-specific.
+     * EBX: path. ECX: vfs_statfs_t * (out). */
+    SYS_STATFS = 65,
+
+    /* Installs a real i386 Variant-II TLS (thread-local storage) block for
+     * the calling task — see task_t.tls_base's own comment
+     * (include/pureunix/task.h) and arch/i386/gdt.c's gdt_set_tls_base()
+     * for the full picture. Needed for real by any real C11/C++11
+     * `thread_local` storage duration (Qt6's QBindingStorage, used
+     * pervasively by QObject construction, is the first PureUnix userspace
+     * code that actually needs one — see docs/qt-port.md) — a general
+     * userspace-runtime primitive, not Qt-specific.
+     * EBX: tp (the self-pointing TCB word address user/newlib_crt0.c's
+     * tls_init() already built — this syscall just tells the kernel about
+     * it so gdt_set_tls_base() can be replayed on every future context
+     * switch back to this task, not just right now). */
+    SYS_SET_TLS = 66,
+
+    /* Real poll(2) — the "smallest correct general primitive" docs/
+     * qt-port.md section 4 already anticipated needing. Genuinely checks
+     * FD_KIND_PIPE readiness against the pipe's own real pipe_buf_t.count
+     * (fs/ext2 files/tty/pty/procfs fds still report optimistic "whatever
+     * was asked for" readiness, same honest-for-what-it-is fallback as
+     * before — no readiness tracking exists for those yet); blocks for
+     * real (short repeated pit_sleep() polling, arch/i386/syscall.c) up to
+     * the requested timeout when nothing is ready yet, rather than lying
+     * about instant readiness. The real, first-necessary caller is Qt
+     * Core's own event dispatcher's internal same-process wakeup pipe
+     * (QCoreApplication::exec() hung waiting on it before this existed —
+     * see docs/qt-port.md) — a general POSIX primitive, not Qt-specific;
+     * user/newlib_syscalls.c's poll()/select() are now real wrappers
+     * around this instead of the old always-ready userspace stub.
+     * EBX: struct pu_raw_pollfd[nfds] (fd/events/revents, marshalled by
+     * poll()/select() below — see their own comments for the wire
+     * struct's exact layout). ECX: nfds. EDX: timeout_ms (-1 = wait
+     * indefinitely for at least one fd to become ready, matching POSIX
+     * poll()'s own timeout==-1 convention). Returns the number of fds
+     * with a nonzero revents (0 on a real timeout), or -EINVAL. */
+    SYS_POLL = 67,
 };
 
 #endif

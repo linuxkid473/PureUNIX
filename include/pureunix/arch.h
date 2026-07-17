@@ -30,6 +30,11 @@ void isr_dispatch(interrupt_regs_t *regs);
  * kernel stack instead of whatever the previous running task left there. */
 void tss_set_kernel_stack(uint32_t esp0);
 
+/* Repoints the shared ring-3 TLS descriptor (selector 0x33) at `base` —
+ * see arch/i386/gdt.c's own comment and task_t.tls_base
+ * (include/pureunix/task.h) for the full picture. */
+void gdt_set_tls_base(uint32_t base);
+
 /* Drops to CPL3 and starts executing at `entry` on `user_stack` (which
  * must already be present + PAGE_USER mapped). Never returns. */
 void enter_usermode(uint32_t entry, uint32_t user_stack) __attribute__((noreturn));

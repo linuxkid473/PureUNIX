@@ -686,15 +686,6 @@ $(PUDE_ELF): $(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_c
 		$(BUILD)/user/pude.o $(BUILD)/user/pude_term.o $(BUILD)/user/pude_calc.o $(BUILD)/user/pude_files.o $(BUILD)/user/pude_text.o $(BUILD)/user/pude_settings.o $(BUILD)/user/pude_wallpaper.o $(BUILD)/user/pude_launch.o $(BUILD)/user/pude_spawn.o $(BUILD)/user/pude_clipboard.o $(BUILD)/user/pude_font.o \
 		-Wl,--start-group $(SDL_LIB) $(LIBPNG_LIB) $(ZLIB_LIB) -lc -lm -Wl,--end-group -lgcc -o $@
 
-# $(LIBPNG_LIB)/$(ZLIB_LIB) aren't defined until further down this file
-# (see the zlib/libpng port section) -- this second, recipe-less rule for
-# the same target only adds them as *prerequisites* (so `make` rebuilds
-# pude.elf if either static lib changes); the actual link recipe above
-# already references both by name, which is safe regardless of where in
-# this file they're defined (recipes expand at build time, once the whole
-# Makefile has been read, unlike a prerequisite list).
-$(PUDE_ELF): $(LIBPNG_LIB) $(ZLIB_LIB)
-
 # Chocolate Doom 3.1.1 (vendored upstream source under
 # third_party/chocolate-doom/ -- see that directory's README.md and
 # docs/chocolate-doom-port.md). Same "vendor upstream source, compile it
@@ -866,6 +857,19 @@ $(LIBPNG_LIB): $(LIBPNG_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIBPNG_OBJS)
 
+# $(PUDE_ELF)'s link recipe (defined earlier in this file, before
+# $(LIBPNG_LIB)/$(ZLIB_LIB) exist yet) already references both by name in
+# its recipe text, which is fine -- recipes expand lazily at build time.
+# But a *prerequisite* list is expanded immediately as the makefile is
+# parsed, not lazily, so adding $(LIBPNG_LIB)/$(ZLIB_LIB) as prerequisites
+# back at that earlier point would silently expand to nothing (both
+# variables are still unset there) and pude.elf would have no real
+# dependency on them -- exactly the bug this second, recipe-less rule once
+# had, letting `make -j` link pude.elf before libpng16.a/libz.a existed.
+# Declaring the prerequisite here, after both are assigned above, is what
+# actually makes `make` wait for them.
+$(PUDE_ELF): $(LIBPNG_LIB) $(ZLIB_LIB)
+
 # pude_wallpaper: `pude`'s desktop wallpaper (user/pude_wallpaper.c/.h,
 # docs/pude.md's "Settings" section) -- decodes a user-chosen PNG with the
 # same real upstream libpng/zlib ports above (not a copy: same $(LIBPNG_LIB)/
@@ -934,7 +938,7 @@ $(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_as
 
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -1008,6 +1012,56 @@ $(NEWLIB_CXX_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_
 
 DEPS += $(NEWLIB_CXX_PROG_OBJS:.o=.d)
 
+# Qt 6 (vendored build output, third_party/qt/i686-elf/ — see
+# third_party/qt/README.md and docs/qt-port.md for the full port). QT_DIR
+# is the vendored headers/static libs; QT_HOST_TOOLS is the native-host moc
+# binary tools/build-qt.sh persists to build/qt-host-tools (NOT committed —
+# architecture/OS-specific, same reasoning as every other host-only tool
+# this repo builds; re-run tools/build-qt.sh if it's missing).
+QT_DIR := third_party/qt/i686-elf
+QT_HOST_TOOLS := build/qt-host-tools
+MOC := $(QT_HOST_TOOLS)/libexec/moc
+# Every real consumer of Qt's own public headers needs the same three
+# defines tools/pureunix-qt-toolchain.cmake used to build libQt6Core.a
+# itself (mirrored here since this repo hand-lists sources instead of
+# using qmake — see third_party/qt/mkspecs/pureunix-g++/qmake.conf's own
+# comment for the qmake-based-application-build equivalent of this same
+# requirement): -D__PUREUNIX__ so qsystemdetection.h's real patched
+# Q_OS_PUREUNIX branch actually triggers (see third_party/qt/patches/),
+# -U__FLT16_MAX__ so qfloat16.h picks its portable non-SSE2 fallback (this
+# kernel's context switch never saves/restores SSE state — see
+# docs/qt-port.md), and -D_GNU_SOURCE for the same newlib declaration-
+# visibility reasons user/newlib_syscalls.c itself needs it.
+QT_CONSUMER_FLAGS := -D__PUREUNIX__ -U__FLT16_MAX__ -D_GNU_SOURCE
+QT_CORE_CFLAGS := $(QT_CONSUMER_FLAGS) -isystem $(QT_DIR)/include -isystem $(QT_DIR)/include/QtCore
+# Qt6Core's own real transitive dependencies (Qt6CoreTargets.cmake
+# INTERFACE_LINK_LIBRARIES): bundled PCRE2 (QRegularExpression) and bundled
+# zlib (qCompress/qUncompress, QResource) — both already vendored as their
+# own static libs by tools/build-qt.sh alongside libQt6Core.a itself.
+QT_CORE_LIBS := -lQt6Core -lQt6BundledPcre2 -lQt6BundledZLIB
+
+QT_PROGRAMS := qtcoretest
+QT_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(QT_PROGRAMS)))
+
+# Real Qt moc (Meta-Object Compiler) run against each Qt program's own
+# source — user/qtcoretest.cpp declares Q_OBJECT classes and #includes its
+# own generated "qtcoretest.moc" directly (a real, normal Qt convention for
+# a single-file program with Q_OBJECT types, not a PureUnix workaround).
+$(BUILD)/user/%.moc: user/%.cpp $(MOC)
+	@mkdir -p $(dir $@)
+	$(MOC) -I$(QT_DIR)/include -I$(QT_DIR)/include/QtCore $< -o $@
+
+$(BUILD)/user/qtcoretest.o: user/qtcoretest.cpp $(BUILD)/user/qtcoretest.moc
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_CORE_CFLAGS) -I$(BUILD)/user -MMD -MP -c $< -o $@
+
+$(QT_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $< \
+		-Wl,--start-group $(QT_CORE_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -o $@
+
+DEPS += $(BUILD)/user/qtcoretest.d
+
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -MMD -MP -c $< -o $@
@@ -1033,11 +1087,11 @@ EXTRA_FILES_DIR := extra-files
 EXTRA_FILES_HOST := $(shell find $(EXTRA_FILES_DIR) -type f -not -name '.*' 2>/dev/null | sort)
 EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubst $(EXTRA_FILES_DIR)/%,%,$(f)))
 
-$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
-	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
+$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) tools/mkfat16.py $(DOCS_MD)
+	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 disk: $(DISK) $(DISK2)
@@ -1049,8 +1103,8 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-

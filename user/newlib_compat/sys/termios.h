@@ -15,6 +15,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_TERMIOS_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_TERMIOS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef unsigned int tcflag_t;
 typedef unsigned char cc_t;
 typedef unsigned int speed_t;
@@ -170,4 +174,8 @@ int tcdrain(int fd);
 int tcflow(int fd, int action);
 int tcsendbreak(int fd, int duration);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

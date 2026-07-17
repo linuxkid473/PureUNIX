@@ -185,6 +185,36 @@ int ext2_utime(const char *path, uint32_t atime, uint32_t mtime)
 }
 
 /* -------------------------------------------------------------------------
+ * statfs — whole-filesystem space/inode usage (vfs_statfs_t, e.g. BusyBox's
+ * df applet, Qt Core's QStorageInfo). free_blocks/free_inodes have no
+ * single cached total anywhere (fs->bgdt[] per-group counters are the live,
+ * write-path-maintained source of truth — see the write registration
+ * comment above), so this sums them across every block group, same as a
+ * real ext2 df implementation would.
+ * ---------------------------------------------------------------------- */
+
+int ext2_statfs(vfs_statfs_t *out)
+{
+    ext2_fs_t *fs = ext2_get_fs();
+    if (!fs->mounted || !out) return -1;
+
+    uint32_t free_blocks = 0, free_inodes = 0;
+    for (uint32_t i = 0; i < fs->num_groups; i++) {
+        free_blocks += fs->bgdt[i].bg_free_blocks_count;
+        free_inodes += fs->bgdt[i].bg_free_inodes_count;
+    }
+
+    out->f_bsize = fs->block_size;
+    out->f_blocks = fs->total_blocks;
+    out->f_bfree = free_blocks;
+    out->f_bavail = free_blocks; /* no reserved-for-root block reservation on this fs */
+    out->f_files = fs->total_inodes;
+    out->f_ffree = free_inodes;
+    out->f_namemax = 255; /* ext2_dirent_t.name_len is a uint8_t (max 255) */
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * VFS mount-table registration (Stage 4: EXT2 is now writable — see
  * fs/ext2/write.c for create/unlink/rename/link/symlink/readlink/
  * write_file). chmod/chown/utime are real now too — see above.
@@ -204,6 +234,7 @@ static const vfs_ops_t ext2_vfs_ops_table = {
     .readlink = ext2_readlink,
     .link = ext2_link,
     .symlink = ext2_symlink,
+    .statfs = ext2_statfs,
 };
 
 const vfs_ops_t *ext2_vfs_ops(void)

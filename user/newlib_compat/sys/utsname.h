@@ -8,6 +8,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_UTSNAME_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_UTSNAME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define _UTSNAME_LENGTH 65
 
 struct utsname {
@@ -20,4 +24,8 @@ struct utsname {
 
 int uname(struct utsname *buf);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

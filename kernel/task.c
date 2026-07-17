@@ -336,6 +336,11 @@ task_t *task_fork(const interrupt_regs_t *parent_regs)
     child->pd_phys = child_pd;
     child->user_entry = current->user_entry;
     child->user_stack = current->user_stack;
+    /* vmm_fork_address_space() deep-copies the whole address space, TLS
+     * block included, so the same virtual address is still valid (and
+     * still holds an independent copy) in the child — see task_t.tls_base's
+     * own comment (include/pureunix/task.h). */
+    child->tls_base = current->tls_base;
     /* vmm_fork_address_space() just copied the parent's whole address
      * space, so the child's real mapped size starts out identical —
      * see include/pureunix/task.h's mapped_bytes comment. */
@@ -474,6 +479,12 @@ void task_yield(void)
     if (next->pd_phys != prev->pd_phys) {
         vmm_switch_directory(next->pd_phys);
     }
+    /* See task_t.tls_base's own comment (include/pureunix/task.h): the
+     * CPU has no per-task notion of %gs's base address on its own, so the
+     * shared TLS descriptor has to be repointed at whichever task is
+     * about to actually run, every switch — same reasoning as
+     * tss_set_kernel_stack()/vmm_switch_directory() just above. */
+    gdt_set_tls_base(next->tls_base);
     context_switch(&prev->stack_ptr, next->stack_ptr);
 }
 

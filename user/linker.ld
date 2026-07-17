@@ -62,4 +62,35 @@ SECTIONS
         __dtors_end = .;
     }
     .bss ALIGN(4K) : { *(COMMON) *(.bss*) }
+    /* Real C11/C++11 `thread_local` storage duration (i386 Variant II TLS
+     * ABI, R_386_TLS_LE "local exec" relocations — the only TLS model that
+     * makes sense for a statically-linked, no-dynamic-loader executable
+     * like every PureUnix program, see docs/qt-port.md section 2). The
+     * kernel ELF loader has no PT_TLS handling at all (only ever walks
+     * PT_LOAD segments, same fact that already made .init_array/.ctors
+     * pure userspace work above) — .tdata/.tbss end up inside this
+     * PT_LOAD-covered image exactly like any other data, and it's entirely
+     * up to user/newlib_crt0.c's tls_init() to actually allocate a real
+     * per-task TLS block, copy this template into it, and tell the kernel
+     * about it (SYS_SET_TLS). What has to be exact here is the *layout*:
+     * .tdata immediately followed by .tbss, no gap, standard ld TLS
+     * alignment — R_386_TLS_LE offsets embedded in the compiled code
+     * (e.g. Qt6's QBindingStorage doing `%gs:-0x18`) are computed by ld
+     * purely from this template's own internal layout, independent of
+     * where in the final binary it physically lives; __tdata_start/
+     * __tbss_end just have to bracket that exact same template so
+     * tls_init() can reproduce it faithfully at runtime. ALIGN(16) is
+     * deliberately generous (i386's own natural max alignment need is 8,
+     * for double/int64_t) — cheap insurance, not a precisely-reasoned
+     * minimum. */
+    .tdata ALIGN(16) : {
+        __tdata_start = .;
+        *(.tdata .tdata.*)
+        __tdata_end = .;
+    }
+    .tbss ALIGN(16) : {
+        __tbss_start = .;
+        *(.tbss .tbss.*)
+        __tbss_end = .;
+    }
 }

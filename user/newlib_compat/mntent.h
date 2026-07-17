@@ -11,6 +11,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_MNTENT_H
 #define PUREUNIX_NEWLIB_COMPAT_MNTENT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdio.h>
 
 #define MOUNTED "/etc/mtab"
@@ -31,4 +35,8 @@ int addmntent(FILE *stream, const struct mntent *mnt);
 int endmntent(FILE *stream);
 char *hasmntopt(const struct mntent *mnt, const char *opt);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

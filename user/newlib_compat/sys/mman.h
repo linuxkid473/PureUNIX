@@ -12,6 +12,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_MMAN_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_MMAN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 #define PROT_NONE  0x0
@@ -31,4 +35,8 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t length, int prot);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

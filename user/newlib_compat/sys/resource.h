@@ -11,6 +11,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_RESOURCE_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_RESOURCE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/time.h>
 #include <sys/types.h>
 
@@ -73,4 +77,8 @@ struct rusage {
 
 int getrusage(int who, struct rusage *usage);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

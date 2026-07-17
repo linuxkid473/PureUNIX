@@ -8,6 +8,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_SOCKET_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_SOCKET_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 #define AF_UNSPEC 0
@@ -58,4 +62,8 @@ int shutdown(int fd, int how);
 int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

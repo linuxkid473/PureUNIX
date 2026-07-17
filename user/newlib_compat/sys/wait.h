@@ -12,10 +12,18 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_WAIT_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_WAIT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <sys/wait.h>
 
 #ifndef WCOREDUMP
 #define WCOREDUMP(w) 0
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

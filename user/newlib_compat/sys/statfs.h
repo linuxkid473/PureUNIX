@@ -6,6 +6,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_STATFS_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_STATFS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 struct statfs {
@@ -24,4 +28,8 @@ struct statfs {
 int statfs(const char *path, struct statfs *buf);
 int fstatfs(int fd, struct statfs *buf);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

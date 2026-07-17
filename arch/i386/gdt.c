@@ -31,7 +31,7 @@ typedef struct tss_entry {
     uint16_t iomap_base;
 } __attribute__((packed)) tss_entry_t;
 
-static gdt_entry_t gdt[6];
+static gdt_entry_t gdt[7];
 static gdt_ptr_t gp;
 static tss_entry_t tss;
 
@@ -61,6 +61,19 @@ void gdt_init(void)
     gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);
     gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
     gdt_set_gate(5, (uint32_t)&tss, sizeof(tss) - 1, 0x89, 0x00);
+    /* Ring-3 TLS (thread-local storage) data segment — same access/
+     * granularity byte as gate 4 (the flat ring-3 data segment), just a
+     * separate selector (0x33 = index 6, RPL 3) so %gs can point somewhere
+     * different from %ds/%es/%ss: a small per-task block holding .tdata/
+     * .tbss for real C11/C++11 thread_local support (see
+     * gdt_set_tls_base()/task_t.tls_base's own comments — this is what
+     * Qt6's QBindingStorage, and any future thread_local-using PureUnix
+     * userspace code, needs). Base starts at 0 (no task has set one up
+     * yet); updated per-task by gdt_set_tls_base() on every context
+     * switch. This kernel is single-CPU/cooperatively-scheduled, so one
+     * shared descriptor updated at switch time (rather than a real
+     * per-CPU GDT) is race-free. */
+    gdt_set_gate(6, 0, 0xFFFFFFFF, 0xF2, 0xCF);
 
     tss.ss0 = 0x10;
     tss.esp0 = 0;
@@ -73,4 +86,19 @@ void gdt_init(void)
 void tss_set_kernel_stack(uint32_t esp0)
 {
     tss.esp0 = esp0;
+}
+
+/* Repoints the shared ring-3 TLS descriptor (GDT index 6, selector 0x33)
+ * at `base` — called by task_yield()'s context switch (kernel/task.c) for
+ * whichever task is about to run, and by SYS_SET_TLS (arch/i386/
+ * syscall.c) the first time a task's own crt0 sets its TLS block up. No
+ * GDT reload needed afterwards: gdt_flush() (which reloads every segment
+ * register, including a fresh %gs) only has to run once at boot — the
+ * CPU re-reads a segment *descriptor* from the GDT on every memory access
+ * through that segment, it only latches the *selector* into the register,
+ * so mutating gdt[6]'s base here takes effect immediately for whichever
+ * selector (kernel or user code) is already loaded into %gs. */
+void gdt_set_tls_base(uint32_t base)
+{
+    gdt_set_gate(6, base, 0xFFFFFFFF, 0xF2, 0xCF);
 }

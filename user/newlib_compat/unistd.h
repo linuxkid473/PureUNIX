@@ -13,9 +13,17 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_UNISTD_H
 #define PUREUNIX_NEWLIB_COMPAT_UNISTD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <unistd.h>
 
 char *ttyname(int fd);
 int ttyname_r(int fd, char *buf, size_t buflen);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -1,0 +1,11 @@
+--- qtbase-pristine/qtbase-everywhere-src-6.5.3/src/corelib/global/qsystemdetection.h	2023-09-22 05:24:26
++++ qtbase-6.5.3/src/corelib/global/qsystemdetection.h	2026-07-16 18:04:06
+@@ -131,6 +131,8 @@
+ #  define Q_OS_INTEGRITY
+ #elif defined(__rtems__)
+ #  define Q_OS_RTEMS
++#elif defined(__PUREUNIX__) /* PureUnix - a from-scratch, newlib-based OS with no predefined compiler macro of its own (see docs/qt-port.md in the PureUnix source tree this Qt build came from); __PUREUNIX__ is defined by mkspecs/pureunix-g++/qmake.conf, the same way Q_OS_VXWORKS below is set from the mkspec rather than detected. */
++#  define Q_OS_PUREUNIX
+ #elif defined(VXWORKS) /* there is no "real" VxWorks define - this has to be set in the mkspec! */
+ #  define Q_OS_VXWORKS
+ #elif defined(__HAIKU__)

@@ -19,6 +19,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_STDLIB_H
 #define PUREUNIX_NEWLIB_COMPAT_STDLIB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define itoa __newlib_itoa
 #define utoa __newlib_utoa
 #include_next <stdlib.h>
@@ -29,4 +33,8 @@
  * anywhere (implemented for real in user/newlib_syscalls.c). */
 int clearenv(void);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

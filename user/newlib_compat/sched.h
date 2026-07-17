@@ -16,8 +16,16 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SCHED_H
 #define PUREUNIX_NEWLIB_COMPAT_SCHED_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <sched.h>
 
 int sched_yield(void);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

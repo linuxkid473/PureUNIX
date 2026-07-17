@@ -8,6 +8,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_BYTESWAP_H
 #define PUREUNIX_NEWLIB_COMPAT_BYTESWAP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define bswap_16(x) \
     ((unsigned short)(((x) << 8) | ((x) >> 8)))
 
@@ -21,4 +25,8 @@
     ((((unsigned long long)bswap_32((unsigned int)(x))) << 32) | \
      (unsigned int)bswap_32((unsigned int)((x) >> 32)))
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

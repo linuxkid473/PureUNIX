@@ -10,6 +10,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_IOCTL_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_IOCTL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define TIOCGWINSZ 1
 #define TIOCSFONT  2
 /* VT_GETACTIVE/VT_ACTIVATE (include/pureunix/ioctl.h's request codes 3/4)
@@ -40,4 +44,8 @@ struct winsize {
 
 int ioctl(int fd, int request, ...);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

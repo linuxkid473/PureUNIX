@@ -14,6 +14,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_NETDB_H
 #define PUREUNIX_NEWLIB_COMPAT_NETDB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/socket.h>
 
 struct hostent {
@@ -82,4 +86,8 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen, char *host, sock
 extern int h_errno;
 const char *hstrerror(int err);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

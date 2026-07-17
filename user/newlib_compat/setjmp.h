@@ -21,6 +21,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SETJMP_H
 #define PUREUNIX_NEWLIB_COMPAT_SETJMP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include_next <setjmp.h>
 
 #ifndef _setjmp
@@ -30,4 +34,8 @@
 #define _longjmp(env, val) longjmp(env, val)
 #endif
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

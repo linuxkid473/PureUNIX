@@ -59,10 +59,33 @@ EXT2_MAGIC        = 0xEF53
 INODE_SIZE        = 128
 INODES_PER_GROUP  = 1024
 BLOCKS_PER_GROUP  = 8192          # max for 1 KB blocks (1 bitmap block = 8192 bits)
-NUM_GROUPS        = 3             # see the module docstring's "Why 3 block
-                                   # groups" -- 24 MB total, comfortably
-                                   # fitting the SDL2 port's sdltest.elf
-                                   # alongside everything else installed.
+NUM_GROUPS        = 6              # see the module docstring's "Why 3 block
+                                   # groups" (purely additive extra
+                                   # capacity, same reasoning applies to
+                                   # every group added since) -- 48 MB
+                                   # total. Raised from 3 (24 MB) for the
+                                   # Qt 6 port (docs/qt-port.md): a real
+                                   # statically-linked Qt Core program
+                                   # (user/qtcoretest.cpp, ~6-7 MB
+                                   # unstripped) no longer fit alongside
+                                   # everything else already installed.
+                                   # NOTE: this same image also travels as
+                                   # a whole-file GRUB module for
+                                   # tools/vt-inject-test.py's LIVE_ISO
+                                   # boot path, which only gives QEMU
+                                   # 128 MB total RAM (see that script's
+                                   # "-m 128M") shared with fat.img (32 MB)
+                                   # + the kernel itself -- a first attempt
+                                   # at 96 MB (NUM_GROUPS=12) silently blew
+                                   # through that ceiling ("error: out of
+                                   # memory" from GRUB itself, before the
+                                   # kernel even started, no crash/error
+                                   # surfaced anywhere else), which made
+                                   # every VT's root filesystem missing
+                                   # entirely (not a real regression in the
+                                   # OS, but a real regression in *this*
+                                   # image-size choice) -- keep well under
+                                   # that combined ~96 MB ceiling.
 FIRST_DATA_BLOCK  = 1             # for 1 KB blocks the SB lives in block 1
 
 # Block layout for group 0 -- unchanged from every previous single-group

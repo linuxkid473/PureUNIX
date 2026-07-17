@@ -194,6 +194,21 @@ typedef struct task {
      * vmm_kernel_directory_phys(); tasks created via task_create_user()/
      * task_fork() get their own private one. */
     uint32_t pd_phys;
+    /* Virtual address of this task's TLS (thread-local storage) block —
+     * i386 Variant II layout (.tdata/.tbss copied below a small
+     * self-pointing TCB word, see user/newlib_crt0.c's tls_init()), or 0
+     * if this task has never set one up (SYS_SET_TLS, see
+     * arch/i386/syscall.c) — every task starts this way until its own
+     * crt0 runs. task_yield()'s context switch installs this into the
+     * shared GDT TLS descriptor (arch/i386/gdt.c's gdt_set_tls_base())
+     * for whichever task is about to run, since %gs:0 (what compiled TLS
+     * accesses like Qt6's QBindingStorage read) resolves through that one
+     * descriptor's base address, not per-task state the CPU tracks on its
+     * own. Inherited as-is across fork() (the whole address space, TLS
+     * block included, is already deep-copied by vmm_fork_address_space());
+     * reset to 0 across exec() (kernel/elf.c) since a fresh image has no
+     * TLS block of its own yet. */
+    uint32_t tls_base;
     /* Creator's pid, used by task_waitpid()/task_exit() to find a caller's
      * own children — a scalar id rather than a `struct task *`, because a
      * raw pointer would dangle the instant the parent itself exits and gets

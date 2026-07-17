@@ -8,6 +8,10 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_MOUNT_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_MOUNT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MS_RDONLY      1
 #define MS_NOSUID      2
 #define MS_NODEV       4
@@ -27,4 +31,8 @@ int mount(const char *source, const char *target, const char *filesystemtype,
 int umount(const char *target);
 int umount2(const char *target, int flags);
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif

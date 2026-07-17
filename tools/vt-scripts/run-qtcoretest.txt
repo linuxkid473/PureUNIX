@@ -1,0 +1,12 @@
+# Runs the real Qt 6 Core regression suite (user/qtcoretest.cpp) from a
+# freshly booted VT1 shell and waits for its final "=== N passed" summary
+# line -- proves real, upstream Qt Core (QString/QByteArray/QList/QFile,
+# a genuine moc-generated signal/slot connection, and a real running
+# QCoreApplication::exec() event loop driven by three staggered QTimers)
+# works natively on PureUnix, on top of the vendored libQt6Core.a
+# (third_party/qt/i686-elf, docs/qt-port.md Phase 3) cross-built for i686.
+WAIT #\s*$
+TYPE /bin/qtcoretest.elf
+WAIT event loop: three staggered QTimers fired in order
+WAIT === \d+ passed
+SLEEP 1

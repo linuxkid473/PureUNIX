@@ -696,6 +696,20 @@ int vfs_utime(const char *path, uint32_t atime, uint32_t mtime)
     return m->ops->utime(sub, atime, mtime);
 }
 
+/* Whole-filesystem space/inode usage — see vfs_statfs_t's own comment
+ * (include/pureunix/vfs.h). No permission check: reading aggregate
+ * free-space counters isn't sensitive the way reading/writing a specific
+ * file's contents is (same as real statvfs(2), world-readable everywhere). */
+int vfs_statfs(const char *path, vfs_statfs_t *out)
+{
+    char sub[PUREUNIX_MAX_PATH];
+    const vfs_mount_t *m = vfs_dispatch(path, sub, sizeof(sub));
+    if (!m) return -ENOENT;
+    if (!m->ops->statfs) return -ENOSYS;
+
+    return m->ops->statfs(out);
+}
+
 /* ---- Path normalisation (unchanged) ---- */
 
 static void append_component(char *out, const char *component)

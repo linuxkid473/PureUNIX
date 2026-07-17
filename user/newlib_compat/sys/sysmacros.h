@@ -9,8 +9,16 @@
 #ifndef PUREUNIX_NEWLIB_COMPAT_SYS_SYSMACROS_H
 #define PUREUNIX_NEWLIB_COMPAT_SYS_SYSMACROS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define major(dev) (((unsigned int)(dev) >> 8) & 0xfff)
 #define minor(dev) ((unsigned int)(dev) & 0xff)
 #define makedev(maj, min) ((((unsigned int)(maj) & 0xfff) << 8) | ((unsigned int)(min) & 0xff))
 
+
+#ifdef __cplusplus
+}
+#endif
 #endif
