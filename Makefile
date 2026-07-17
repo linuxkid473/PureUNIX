@@ -1040,7 +1040,28 @@ QT_CORE_CFLAGS := $(QT_CONSUMER_FLAGS) -isystem $(QT_DIR)/include -isystem $(QT_
 # own static libs by tools/build-qt.sh alongside libQt6Core.a itself.
 QT_CORE_LIBS := -lQt6Core -lQt6BundledPcre2 -lQt6BundledZLIB
 
-QT_PROGRAMS := qtcoretest
+# QtGui adds real image-format/font/text-shaping dependencies
+# (Qt6GuiTargets.cmake INTERFACE_LINK_LIBRARIES: bundled FreeType,
+# HarfBuzz, libpng — zlib/pcre2 already covered by QT_CORE_LIBS above,
+# shared with Core), plus two compiled-in Qt *resource* object files
+# (qrc_qpdf.cpp.o/qrc_gui_shaders.cpp.o — real embedded data Gui_resources_1/2
+# supply as plain TARGET_OBJECTS in the real CMake target, not part of
+# libQt6Gui.a itself) that any real executable link needs listed directly.
+QT_GUI_CFLAGS := $(QT_CONSUMER_FLAGS) -isystem $(QT_DIR)/include \
+	-isystem $(QT_DIR)/include/QtCore -isystem $(QT_DIR)/include/QtGui
+QT_GUI_RESOURCE_OBJS := $(QT_DIR)/lib/objects-Release/Gui_resources_1/.rcc/qrc_qpdf.cpp.o \
+	$(QT_DIR)/lib/objects-Release/Gui_resources_2/.rcc/qrc_gui_shaders.cpp.o
+# No real PureUnix QPA platform plugin exists yet (Phase 6/7,
+# docs/qt-port.md) — every Gui program links Qt's own real, upstream
+# "offscreen" plugin (renders into an in-memory QImage, no display/window
+# system needed) instead, imported via Q_IMPORT_PLUGIN(
+# QOffscreenIntegrationPlugin) in source (no dynamic plugin loading exists
+# on PureUnix, so this static-link-time registration is the only kind
+# there is here).
+QT_GUI_LIBS := -L$(QT_DIR)/plugins/platforms -lqoffscreen -lQt6Gui \
+	-lQt6BundledFreetype -lQt6BundledHarfbuzz -lQt6BundledLibpng $(QT_CORE_LIBS)
+
+QT_PROGRAMS := qtcoretest qtguitest
 QT_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(QT_PROGRAMS)))
 
 # Real Qt moc (Meta-Object Compiler) run against each Qt program's own
@@ -1055,12 +1076,30 @@ $(BUILD)/user/qtcoretest.o: user/qtcoretest.cpp $(BUILD)/user/qtcoretest.moc
 	@mkdir -p $(dir $@)
 	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_CORE_CFLAGS) -I$(BUILD)/user -MMD -MP -c $< -o $@
 
-$(QT_ELFS): $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+#  -Wl,-s (strip): these are statically-linked Qt test binaries; debug
+# info roughly doubles their size for no benefit at runtime (never
+# debugged on-target), and the smaller ext2.img/kernel-heap footprint
+# (fs/ext2/file.c kcalloc()s a whole file into one contiguous kernel-heap
+# allocation at open()/exec() time — see kernel/heap.c's HEAP_SIZE
+# comment) matters for real here.
+$(BUILD)/user/qtcoretest.elf: $(BUILD)/user/qtcoretest.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
-	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $< \
-		-Wl,--start-group $(QT_CORE_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -o $@
+	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $(BUILD)/user/qtcoretest.o \
+		-Wl,--start-group $(QT_CORE_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
 
-DEPS += $(BUILD)/user/qtcoretest.d
+# qtguitest.cpp has no Q_OBJECT classes (no moc step needed) — plain
+# compile straight from source, same as any ordinary NEWLIB_CXX_PROGRAMS
+# entry, just with QT_GUI_CFLAGS instead.
+$(BUILD)/user/qtguitest.o: user/qtguitest.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_GUI_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/qtguitest.elf: $(BUILD)/user/qtguitest.o $(QT_GUI_RESOURCE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $(BUILD)/user/qtguitest.o $(QT_GUI_RESOURCE_OBJS) \
+		-Wl,--start-group $(QT_GUI_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
+
+DEPS += $(BUILD)/user/qtcoretest.d $(BUILD)/user/qtguitest.d
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)

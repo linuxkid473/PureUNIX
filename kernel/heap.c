@@ -3,7 +3,23 @@
 #include <pureunix/stdio.h>
 #include <pureunix/string.h>
 
-#define HEAP_SIZE (8U * 1024U * 1024U)
+/* Raised from 8 MiB for the Qt 6 port (docs/qt-port.md, Phase 5):
+ * fs/ext2/file.c's ext2_read_file() kcalloc()s a real statically-linked
+ * program's *entire* file content into one contiguous kernel-heap
+ * allocation before exec() ever runs it (this kernel's "whole file in
+ * memory" read model, see include/pureunix/task.h's open_file_t comment)
+ * — a real Qt Gui test program (user/qtguitest.cpp, ~13-16 MB, most of it
+ * real bundled FreeType/HarfBuzz/libpng code) is bigger than the whole
+ * previous heap, so `kcalloc failed for N bytes` at open()/exec() time
+ * was a real, hard ceiling, not something an ext2 image resize (unlike
+ * the earlier docs/qt-port.md Phase 4 mkext2.py finding) could ever fix
+ * — this is kernel physical memory, unrelated to disk image capacity.
+ * 24 MiB leaves real headroom for QtWidgets test binaries later in this
+ * same port while still comfortably fitting a 128 MiB QEMU boot (~33 MiB
+ * was free at the post-boot checkpoint with the old 8 MiB heap already
+ * reserved — see that same doc section for the exact numbers this was
+ * sized against). */
+#define HEAP_SIZE (24U * 1024U * 1024U)
 #define HEAP_MAGIC 0xC0FFEE42U
 
 typedef struct heap_block {

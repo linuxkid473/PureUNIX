@@ -1,23 +1,31 @@
 # Qt 6 port — blocker map, C++ runtime, and real Qt 6.5.3 cross-build
 
 Status: Phase 1 (audit), Phase 2 (real C++ userspace foundation), Phase 3
-(cross-compiling real Qt 6.5.3 qtbase — Core+Gui+Widgets) and **Phase 4
-(native Qt Core test on PureUnix, in QEMU) are all done.**
+(cross-compiling real Qt 6.5.3 qtbase — Core+Gui+Widgets), **Phase 4
+(native Qt Core test) and Phase 5 (native Qt Gui test) are all done.**
 `third_party/qt/i686-elf/lib/libQt6{Core,Gui,Widgets}.a` are real,
 verified i686 ELF static libraries containing genuine Qt6 symbols (not a
 compile-only partial result — the full qtbase build completed and linked
-cleanly), and `user/qtcoretest.cpp` — real `QCoreApplication`, `QString`,
+cleanly). `user/qtcoretest.cpp` — real `QCoreApplication`, `QString`,
 `QByteArray`, `QList`, `QFile`, `QElapsedTimer`, a real moc-generated
 signal/slot connection, and a real running `QCoreApplication::exec()`
 event loop driven by three staggered `QTimer::singleShot()` callbacks —
-**passes all 20/20 checks running natively on real PureUnix in QEMU**
-(`tools/vt-scripts/run-qtcoretest.txt`, part of `make run-test`'s
-regression suite). **Milestone reached: QtCore runs natively on
-PureUnix.** Phase 4 needed two real, general kernel additions beyond what
-Phase 1's audit anticipated (real i386 TLS support, and a real `poll()`
-that can actually check pipe readiness) — see "Phase 4 results" below.
-Phases 5-8 (QtGui, the PUDE external-client protocol, QtWidgets, the final
-demo) not started. This document is the living record of the Qt 6 port
+**passes all 20/20 checks**, and `user/qtguitest.cpp` — real
+`QGuiApplication` (via Qt's own real upstream "offscreen" QPA plugin),
+`QImage`, the real `QPainter` raster paint engine (pixel-verified
+`drawRect()`/`drawLine()` output), `QColor` (named-color lookup + HSV
+round-trip), and `QFont`/`QFontMetrics` (the real bundled FreeType/
+HarfBuzz text-shaping stack) — **passes all 12/12 checks**, both running
+natively on real PureUnix in QEMU (`tools/vt-scripts/run-qt{core,gui}test.txt`,
+part of `make run-test`'s regression suite). **Milestones reached: QtCore
+and QtGui both run natively on PureUnix.** Phase 4 needed two real,
+general kernel additions beyond what Phase 1's audit anticipated (real
+i386 TLS support, and a real `poll()` that can actually check pipe
+readiness); Phase 5 needed one more (the kernel's fixed heap size, a hard
+ceiling on how large a single file can even be `open()`ed) — see "Phase 4
+results" and "Phase 5 results" below. Phases 6-8 (the PureUnix QPA
+platform plugin, the external PUDE GUI client protocol, QtWidgets, the
+final demo) not started. This document is the living record of the Qt 6 port
 (pinned version, toolchain, patches, protocol, architecture, limitations)
 required by the port's own acceptance criteria.
 
@@ -726,10 +734,88 @@ prerequisite. `tools/vt-scripts/run-qtcoretest.txt` follows
 `run-cxxtest.txt`'s exact convention, and is now part of `make run-test`'s
 regression suite alongside every other real boot test in this repo.
 
-Next when resuming: Phase 5 (QtGui — the platform-independent parts:
-`QImage`, `QPainter`'s raster backend, `QColor`, font metrics without a
-real windowing backend yet) is the natural next increment per the port's
-own "build incrementally, verifying each stage" mandate, followed by the
-PureUnix QPA platform plugin and the external PUDE GUI client protocol
-(section 5 above) once there's an actual framebuffer surface for QtGui to
-draw into.
+## Phase 5 results: Qt Gui running natively on PureUnix (done, QEMU-verified)
+
+`user/qtguitest.cpp` — real, unmodified upstream Qt 6 Gui API only:
+`QGuiApplication`, `QImage`, `QPainter` (real raster `drawRect()`/
+`drawLine()`, pixel-verified afterwards via `QImage::pixelColor()`, not
+just "did it crash"), `QColor` (a named-color string lookup and an HSV
+round-trip through `toRgb()`), and `QFont`/`QFontMetrics` (exercises the
+real bundled FreeType/HarfBuzz text-shaping stack end to end, not stubbed)
+— **passes all 12/12 checks** booted from a real PureUnix disk image in
+QEMU (`tools/vt-scripts/run-qtguitest.txt`), with zero regressions across
+the rest of `make run-test`'s suite (`systest` unchanged at 343/345,
+`qtcoretest` still 20/20, everything else unchanged).
+
+No real PureUnix QPA (Qt Platform Abstraction) backend exists yet — that's
+Phase 6/7's job, once there's an actual PUDE-hosted window surface for it
+to draw into. Per this phase's own scope ("platform-independent parts...
+no real windowing backend needed yet"), `qtguitest.elf` links Qt's own
+real, unmodified upstream **`QOffscreenIntegrationPlugin`** instead — a
+genuine QPA backend (not a PureUnix stand-in) that renders entirely into
+an in-memory `QImage`, exactly matching what a real headless/CI Qt Gui
+test would do on any platform. Registered via
+`Q_IMPORT_PLUGIN(QOffscreenIntegrationPlugin)` in source, since PureUnix
+has no dynamic plugin loading at all (every Qt plugin, platform or
+otherwise, has to be a real static link-time choice here — see section 2).
+
+Two real things were found and fixed getting from "`libQt6Gui.a` links"
+(already true since Phase 3) to "a Qt Gui program actually runs":
+
+1. **Qt6Gui's own real CMake dependency graph needed reproducing by
+   hand** (`Qt6GuiTargets.cmake`'s `INTERFACE_LINK_LIBRARIES`) — the
+   Makefile's new `QT_GUI_LIBS` adds the bundled FreeType/HarfBuzz/libpng
+   static archives (zlib/pcre2 already covered by `QT_CORE_LIBS`, shared
+   with Core) alongside `-lqoffscreen`. Less obvious: Qt6Gui also has two
+   real *compiled-in resource* object files
+   (`objects-Release/Gui_resources_{1,2}/.rcc/qrc_{qpdf,gui_shaders}.cpp.o`)
+   that the real CMake target pulls in as plain `TARGET_OBJECTS` rather
+   than archive members of `libQt6Gui.a` itself — omitting them is a
+   real, silent "undefined reference to `qInitResources_qpdf()`"-style
+   link failure waiting to happen the moment anything actually calls the
+   code paths that need them; added directly to the link line
+   (`QT_GUI_RESOURCE_OBJS`) alongside every other Qt program's object
+   file, the same way CMake's own generated link command would.
+2. **The kernel's fixed 8 MiB heap (`kernel/heap.c`'s `HEAP_SIZE`) turned
+   out to be a hard ceiling on how large a file can even be `open()`ed at
+   all**, unrelated to disk image capacity (the Phase 4 `NUM_GROUPS`
+   finding was about *disk* space; this is kernel *physical memory*).
+   `fs/ext2/file.c`'s `ext2_read_file()` `kcalloc()`s a real file's
+   *entire* content into one contiguous kernel-heap allocation before
+   `exec()` ever runs it (this kernel's "whole file in memory" read
+   model — see `include/pureunix/task.h`'s `open_file_t` comment); a real
+   Qt Gui test program — most of its ~13-16 MB is real bundled FreeType/
+   HarfBuzz/libpng code, not test code — is bigger than the entire
+   previous heap, so the very first `/bin/qtguitest.elf` attempt failed
+   with a real, honest `[ext2] file: kcalloc failed for 15766012 bytes`
+   at the shell prompt (not a crash — this kernel's `kcalloc`/`kmalloc`
+   already return `NULL` cleanly on exhaustion, and every caller checks).
+   No `ext2.img` resize could ever have fixed this (a different resource
+   entirely); fixed by actually raising `HEAP_SIZE` from 8 MiB to 24 MiB
+   — real headroom for this test program plus the larger QtWidgets test
+   binaries later phases will need, while still comfortably fitting
+   inside the same 128 MiB QEMU boot every other test in this repo
+   already assumes (verified: `make run-test`'s full suite, including
+   every non-Qt test, still passes unchanged after this change). Also
+   added `-Wl,-s` (strip) to both Qt test binaries' link recipes —
+   halves `qtguitest.elf`'s size (15.7 MB unstripped → 13.3 MB stripped),
+   real, cheap insurance against the same ceiling for whatever comes next
+   in this port, not load-bearing for this phase specifically (12 MiB
+   headroom under the new 24 MiB heap either way).
+
+`Makefile`'s new `QT_GUI_CFLAGS`/`QT_GUI_RESOURCE_OBJS`/`QT_GUI_LIBS` wire
+`user/qtguitest.cpp` into the real build; unlike `qtcoretest.cpp` it has
+no `Q_OBJECT` classes, so it skips the `moc` step entirely (a plain
+compile straight from source, same as any ordinary C++ program in this
+repo). `tools/vt-scripts/run-qtguitest.txt` follows the same convention as
+every other `make run-test` script.
+
+Next when resuming: Phase 6 (the PureUnix QPA platform plugin — a real
+backend targeting an actual PUDE-hosted window surface, replacing the
+offscreen plugin this phase used) and Phase 7 (the external PUDE GUI
+client protocol over two pipes, section 5 above) are the natural next
+increment, once there's a real window surface for QtGui to draw into;
+QtWidgets (Phase 8) and the final demo can follow once input/painting
+round-trips through a real PUDE-hosted window. Keep `HEAP_SIZE`
+(`kernel/heap.c`) in mind if a future QtWidgets test binary approaches
+~20 MiB even stripped — it may need raising again.

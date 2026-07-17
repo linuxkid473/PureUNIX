@@ -1,0 +1,13 @@
+# Runs the real Qt 6 Gui regression suite (user/qtguitest.cpp) from a
+# freshly booted VT1 shell and waits for its final "=== N passed" summary
+# line -- proves real, upstream Qt Gui (QImage, the real QPainter raster
+# paint engine, QColor, QFont/QFontMetrics via the bundled FreeType/
+# HarfBuzz stack) works natively on PureUnix, rendering through Qt's own
+# real "offscreen" QPA platform plugin (no real PureUnix QPA backend
+# exists yet -- see docs/qt-port.md Phase 5) on top of the vendored
+# libQt6Gui.a (third_party/qt/i686-elf, docs/qt-port.md Phase 3) cross-
+# built for i686.
+WAIT #\s*$
+TYPE /bin/qtguitest.elf
+WAIT === \d+ passed
+SLEEP 1
