@@ -1061,8 +1061,104 @@ QT_GUI_RESOURCE_OBJS := $(QT_DIR)/lib/objects-Release/Gui_resources_1/.rcc/qrc_q
 QT_GUI_LIBS := -L$(QT_DIR)/plugins/platforms -lqoffscreen -lQt6Gui \
 	-lQt6BundledFreetype -lQt6BundledHarfbuzz -lQt6BundledLibpng $(QT_CORE_LIBS)
 
+# The real "pureunix" QPA platform plugin (docs/qt-port.md Phase 6,
+# user/qpa_pureunix/) -- unlike qtcoretest/qtguitest's qminimal/qoffscreen
+# (real upstream Qt plugins, already prebuilt into third_party/qt/i686-elf's
+# archives), this one is PureUnix-specific source compiled fresh by this
+# Makefile like any other program here. Its headers reach into QtGui's
+# private/qpa tree (real, sanctioned for writing platform plugins, just
+# versioned/private, hence the extra -isystem paths) and the vendored
+# mkspec (third_party/qt/mkspecs/pureunix-g++/qplatformdefs.h, itself
+# needing two small real upstream mkspecs/common/{posix,c89}/qplatformdefs.h
+# files vendored alongside it — the same files any qtbase source tree
+# ships, just not otherwise needed until a *consumer* of QtGui's private
+# Unix headers came along).
+QT_PUREUNIX_QPA_CFLAGS := $(QT_GUI_CFLAGS) \
+	-isystem $(QT_DIR)/include/QtCore/6.5.3 -isystem $(QT_DIR)/include/QtCore/6.5.3/QtCore \
+	-isystem $(QT_DIR)/include/QtGui/6.5.3 -isystem $(QT_DIR)/include/QtGui/6.5.3/QtGui \
+	-isystem third_party/qt/mkspecs/pureunix-g++ \
+	-Iuser/qpa_pureunix
+# Same include set, but plain -I (moc doesn't understand -isystem, only
+# gcc/g++ do) -- used only for the $(MOC) invocation below.
+QT_PUREUNIX_QPA_MOC_INCLUDES := -I$(QT_DIR)/include -I$(QT_DIR)/include/QtCore -I$(QT_DIR)/include/QtGui \
+	-I$(QT_DIR)/include/QtCore/6.5.3 -I$(QT_DIR)/include/QtCore/6.5.3/QtCore \
+	-I$(QT_DIR)/include/QtGui/6.5.3 -I$(QT_DIR)/include/QtGui/6.5.3/QtGui \
+	-Ithird_party/qt/mkspecs/pureunix-g++ -Iuser/qpa_pureunix
+QT_PUREUNIX_QPA_OBJS := $(BUILD)/user/qpa_pureunix/pureunixintegration.o \
+	$(BUILD)/user/qpa_pureunix/pureunixwindow.o \
+	$(BUILD)/user/qpa_pureunix/pureunixbackingstore.o \
+	$(BUILD)/user/qpa_pureunix/pureunixplugin.o
+# Same QtGui dependency chain as QT_GUI_LIBS, minus the offscreen plugin
+# it doesn't need (this one imports QPureUnixIntegrationPlugin instead).
+QT_PUREUNIX_QPA_LIBS := -lQt6Gui -lQt6BundledFreetype -lQt6BundledHarfbuzz -lQt6BundledLibpng $(QT_CORE_LIBS)
+
+$(BUILD)/user/qpa_pureunix/pureunixintegration.o: user/qpa_pureunix/pureunixintegration.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_PUREUNIX_QPA_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/qpa_pureunix/pureunixwindow.o: user/qpa_pureunix/pureunixwindow.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_PUREUNIX_QPA_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/qpa_pureunix/pureunixbackingstore.o: user/qpa_pureunix/pureunixbackingstore.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_PUREUNIX_QPA_CFLAGS) -MMD -MP -c $< -o $@
+
+# moc needs to see QPlatformIntegrationPlugin's own QPA include path to
+# resolve QPlatformIntegrationFactoryInterface_iid (the Q_PLUGIN_METADATA
+# IID argument) — same extended include set as the plain compile above,
+# just fed to $(MOC) instead of $(CXX). Invoked from the repo root (not
+# cd'd into user/qpa_pureunix/) so the generated file's own #include of
+# pureunixplugin.h comes out as a correct relative path either way; the
+# FILE "pureunix.json" reference in Q_PLUGIN_METADATA resolves relative to
+# pureunixplugin.h's own directory regardless of moc's cwd.
+$(BUILD)/user/qpa_pureunix/moc_pureunixplugin.cpp: user/qpa_pureunix/pureunixplugin.h user/qpa_pureunix/pureunix.json $(MOC)
+	@mkdir -p $(dir $@)
+	$(MOC) $(QT_PUREUNIX_QPA_MOC_INCLUDES) user/qpa_pureunix/pureunixplugin.h -o $@
+
+# -DQT_STATICPLUGIN: makes the moc-generated QT_MOC_EXPORT_PLUGIN_V2 macro
+# (in the #include'd moc_pureunixplugin.cpp) actually emit
+# qt_static_plugin_QPureUnixIntegrationPlugin() — the real, exported-only-
+# when-building-a-static-plugin symbol Q_IMPORT_PLUGIN() in a consumer
+# program calls to force this plugin to be linked in and registered
+# (Qt's own real static-plugin convention; every prebuilt vendored plugin
+# archive, e.g. libqoffscreen.a, was already built this same way).
+$(BUILD)/user/qpa_pureunix/pureunixplugin.o: user/qpa_pureunix/pureunixplugin.cpp $(BUILD)/user/qpa_pureunix/moc_pureunixplugin.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_PUREUNIX_QPA_CFLAGS) -DQT_STATICPLUGIN -I$(BUILD)/user/qpa_pureunix -MMD -MP -c $< -o $@
+
+DEPS += $(QT_PUREUNIX_QPA_OBJS:.o=.d)
+
 QT_PROGRAMS := qtcoretest qtguitest
 QT_ELFS := $(addprefix $(BUILD)/user/,$(addsuffix .elf,$(QT_PROGRAMS)))
+# qtwindowtest.elf (docs/qt-port.md Phase 6, the "pureunix" QPA plugin
+# test) is deliberately NOT in QT_ELFS (so it's never passed to
+# mkfat16.py/mkext2.py, unlike qtcoretest/qtguitest above) — real,
+# current constraint: the shared regression disk's EXT2 image is loaded
+# whole into RAM as a GRUB module for tools/vt-inject-test.py's LIVE_ISO
+# boot path (tools/mkext2.py's own NUM_GROUPS comment); growing that
+# image to fit one more real Qt binary directly shrinks the physical RAM
+# left over to actually *execute* one, and qtwindowtest.elf (~13 MB even
+# stripped) already sits right at that ceiling. Still built by `make all`
+# (so a real compile/link regression is always caught), and separately
+# vendored onto its own small scratch EXT2 image
+# (tools/build-qpa-scratch-disk.sh) for interactive QEMU verification
+# until Phase 6 is further along and this can be revisited with a clearer
+# capacity-planning pass (e.g. moving Qt QPA testing to the persistent-
+# disk boot path, which reads EXT2 from a real/virtual disk on demand
+# rather than preloading the whole image into RAM, and has no such
+# ceiling at all).
+QT_STANDALONE_ELFS := $(BUILD)/user/qtwindowtest.elf
+
+# A second, recipe-less rule for the already-defined `all` target, adding
+# QT_STANDALONE_ELFS as a real prerequisite -- `all:`'s own prerequisite
+# list (near the top of this file, before QT_STANDALONE_ELFS exists yet)
+# would otherwise expand it to nothing (a prerequisite list is expanded
+# immediately as the makefile is parsed, not lazily — same real gotcha
+# already documented at $(PUDE_ELF)'s own second rule, elsewhere in this
+# file), silently never building/regression-checking qtwindowtest.elf at
+# all via a plain `make all`.
+all: $(QT_STANDALONE_ELFS)
 
 # Real Qt moc (Meta-Object Compiler) run against each Qt program's own
 # source — user/qtcoretest.cpp declares Q_OBJECT classes and #includes its
@@ -1099,7 +1195,21 @@ $(BUILD)/user/qtguitest.elf: $(BUILD)/user/qtguitest.o $(QT_GUI_RESOURCE_OBJS) $
 	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o $(BUILD)/user/qtguitest.o $(QT_GUI_RESOURCE_OBJS) \
 		-Wl,--start-group $(QT_GUI_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
 
-DEPS += $(BUILD)/user/qtcoretest.d $(BUILD)/user/qtguitest.d
+# qtwindowtest.cpp (docs/qt-port.md Phase 6): real Qt QGuiApplication +
+# QRasterWindow against the "pureunix" QPA plugin (user/qpa_pureunix/)
+# instead of qtguitest's offscreen one -- no Q_OBJECT classes of its own,
+# same "plain compile, no moc" reasoning as qtguitest.cpp.
+$(BUILD)/user/qtwindowtest.o: user/qtwindowtest.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(USER_CXXFLAGS) $(LIBSTDCXX_CFLAGS) $(QT_GUI_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/user/qtwindowtest.elf: $(BUILD)/user/qtwindowtest.o $(QT_PUREUNIX_QPA_OBJS) $(QT_GUI_RESOURCE_OBJS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(CXX) $(LIBSTDCXX_LDFLAGS) -L$(QT_DIR)/lib $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/qtwindowtest.o $(QT_PUREUNIX_QPA_OBJS) $(QT_GUI_RESOURCE_OBJS) \
+		-Wl,--start-group $(QT_PUREUNIX_QPA_LIBS) -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc -Wl,-s -o $@
+
+DEPS += $(BUILD)/user/qtcoretest.d $(BUILD)/user/qtguitest.d $(BUILD)/user/qtwindowtest.d
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -1126,8 +1236,16 @@ EXTRA_FILES_DIR := extra-files
 EXTRA_FILES_HOST := $(shell find $(EXTRA_FILES_DIR) -type f -not -name '.*' 2>/dev/null | sort)
 EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubst $(EXTRA_FILES_DIR)/%,%,$(f)))
 
-$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) tools/mkfat16.py $(DOCS_MD)
-	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS)
+# QT_ELFS deliberately excluded here (unlike $(DISK2)/$(DISK_PERSISTENT)
+# below): $(DISK) is a small, fixed 32 MiB FAT16 image, mounted at the
+# secondary /fat (not /) by every boot -- every real Qt test
+# (tools/vt-scripts/run-qt*.txt) runs its ELF from EXT2's / instead
+# (BusyBox ash's own root), so FAT16 never actually needed them, and
+# growing binaries here would only ever fight this image's small fixed
+# size for no real benefit (see docs/qt-port.md's Phase 6 section on
+# QT_ELFS's own growing footprint).
+$(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
+	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
 
 $(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
 	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) \

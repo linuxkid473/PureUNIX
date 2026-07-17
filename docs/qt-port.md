@@ -23,11 +23,13 @@ general kernel additions beyond what Phase 1's audit anticipated (real
 i386 TLS support, and a real `poll()` that can actually check pipe
 readiness); Phase 5 needed one more (the kernel's fixed heap size, a hard
 ceiling on how large a single file can even be `open()`ed) — see "Phase 4
-results" and "Phase 5 results" below. Phases 6-8 (the PureUnix QPA
-platform plugin, the external PUDE GUI client protocol, QtWidgets, the
-final demo) not started. This document is the living record of the Qt 6 port
-(pinned version, toolchain, patches, protocol, architecture, limitations)
-required by the port's own acceptance criteria.
+results" and "Phase 5 results" below. **Phase 6 (the real "pureunix" QPA
+platform plugin) is in progress** — see its own section below for the
+current sub-phase breakdown; Phases 7-8 (the external PUDE GUI client
+protocol's PUDE side, QtWidgets, the final demo) not started. This
+document is the living record of the Qt 6 port (pinned version,
+toolchain, patches, protocol, architecture, limitations) required by the
+port's own acceptance criteria.
 
 Pinned target: **Qt 6.5.3** (last Qt 6 LTS-track minor with a plain qtbase
 tarball release and no hard CMake-version creep beyond what's reasonably
@@ -810,12 +812,108 @@ compile straight from source, same as any ordinary C++ program in this
 repo). `tools/vt-scripts/run-qtguitest.txt` follows the same convention as
 every other `make run-test` script.
 
-Next when resuming: Phase 6 (the PureUnix QPA platform plugin — a real
-backend targeting an actual PUDE-hosted window surface, replacing the
-offscreen plugin this phase used) and Phase 7 (the external PUDE GUI
-client protocol over two pipes, section 5 above) are the natural next
-increment, once there's a real window surface for QtGui to draw into;
-QtWidgets (Phase 8) and the final demo can follow once input/painting
-round-trips through a real PUDE-hosted window. Keep `HEAP_SIZE`
-(`kernel/heap.c`) in mind if a future QtWidgets test binary approaches
-~20 MiB even stripped — it may need raising again.
+## Phase 6 (in progress): the real "pureunix" QPA platform plugin
+
+Goal: replace `qtguitest.cpp`'s upstream offscreen QPA plugin with a real
+PureUnix-specific one (`user/qpa_pureunix/`) that talks to `pude` over a
+new wire protocol (`user/pureunix_qpa_protocol.h`), so an unmodified Qt
+Widgets application can create, display, and interact with a real
+`pude`-managed window — see this port's own task-tracking sub-phases:
+
+1. **Done, QEMU-verified.** `QPlatformIntegration`
+   (`pureunixintegration.{h,cpp}`), `QPlatformScreen`
+   (`pureunixscreen.h`), and the plugin registration itself
+   (`pureunixplugin.{h,cpp}`, `pureunix.json`, imported via
+   `Q_IMPORT_PLUGIN(QPureUnixIntegrationPlugin)` exactly like the
+   vendored qminimal/qoffscreen plugins already are — no dynamic plugin
+   loading exists on PureUnix at all, see section 2, so this static-link-
+   time registration is the only kind there is here). `user/qtwindowtest.cpp`
+   (a new, growing regression file — Phase 6's counterpart to
+   `qtcoretest.cpp`/`qtguitest.cpp`) constructs `QGuiApplication` with
+   `-platform pureunix` and shows a real `QRasterWindow` successfully, with
+   zero undefined symbols at link time and a clean run in QEMU (checks
+   [001]/[002] both PASS) — verified via a small, dedicated scratch disk
+   (`tools/build-qpa-scratch-disk.sh`, see below for why) rather than the
+   main shared regression disk.
+2. **Done alongside item 1** (not a separate step in practice):
+   `QPlatformWindow` (`pureunixwindow.{h,cpp}`) sends a real
+   `PU_QPA_C2S_WINDOW_CREATE` message with the window's initial size and
+   title over the wire protocol on construction, and
+   `PU_QPA_C2S_CLOSE` on destruction; `setWindowTitle()`/
+   `requestActivateWindow()` are wired for real. Not yet verified *inside*
+   a real `pude` window (needs item 2's PUDE-side counterpart below) —
+   only that the client-side code path runs without crashing when
+   nothing is on the other end of the pipe (`sendMessage()`'s documented
+   safe no-op when `!connected()`).
+3. **Done alongside item 1.** `QPlatformBackingStore`
+   (`pureunixbackingstore.{h,cpp}`) provides a real `QImage` paint
+   device Qt's raster paint engine draws into, and `flush()` sends a real
+   `PU_QPA_C2S_DAMAGE` message (bounding rect + raw ARGB32 pixel bytes)
+   — matching `pude`'s own existing "full-frame redraw, no finer damage-
+   rect concept" sophistication level (docs section 5), not a
+   regression against something more precise that already existed.
+   Same "runs without crashing standalone" verification level as item 2;
+   pixel-correctness inside a real `pude` window is next.
+4. Not started: keyboard/mouse/wheel/focus event plumbing
+   (`PU_QPA_S2C_KEY`/`MOUSE_MOVE`/`MOUSE_BUTTON`/`MOUSE_WHEEL`/`FOCUS`,
+   already fully defined in `user/pureunix_qpa_protocol.h` and handled by
+   `QPureUnixWindow::handleProtocolMessage()` — the PUDE side that would
+   actually *send* them, `user/pude_qtclient.c`'s `on_key`/`on_mouse_*`
+   callbacks, doesn't exist yet).
+5. Not started: `user/pude_qtclient.c` — the PUDE-side `app_class_t`
+   adapter (fork/exec the client with `PUREUNIX_QPA_FD_READ`/`_WRITE`
+   dup2'd into place, parse incoming `PU_QPA_C2S_*` messages, blit
+   `PU_QPA_C2S_DAMAGE` payloads into the window's on-screen surface,
+   forward real keyboard/mouse events back). This is the one piece that
+   actually makes a Qt window appear *inside* `pude` — everything above
+   only proves the client-side plugin runs correctly in isolation.
+
+**Two real findings while getting here, beyond the plugin code itself:**
+
+- **Environment reset mid-port:** this session's `build/` directory
+  (gitignored — `build/qt-host-tools`'s persisted native `moc`/`rcc`
+  included) was wiped between turns. Recovered by re-running just
+  `tools/build-qt.sh`'s host-tools stage (not the full cross-compile —
+  `third_party/qt/i686-elf/` itself is committed and was untouched) via a
+  one-off script; `third_party/qt/mkspecs/common/{posix,c89}/qplatformdefs.h`
+  (two small, real, unmodified upstream qtbase files `mkspecs/pureunix-g++/
+  qplatformdefs.h` `#include`s) had to be vendored for the first time —
+  needed by any real *consumer* of `QtGui`'s private Unix headers
+  (`qunixeventdispatcher_qpa_p.h` etc.), not by Phase 3's build of Qt
+  itself, which never hit this path.
+- **Growing the shared regression disk to fit each new, larger Qt test
+  binary has a real ceiling, independent of the disk-image-loading GRUB-
+  module ceiling docs/qt-port.md's Phase 4 section already found.**
+  `user/qtwindowtest.cpp` (~13 MB even stripped) hit a genuine
+  `/bin/qtwindowtest.elf: out of memory` at the ash prompt on the shared
+  disk at a combined (fat+ext2) size well *under* that earlier ceiling —
+  a different resource: every byte of `fat.img`/`root.img` is physical
+  RAM this kernel's PMM can never hand a running process, on top of the
+  kernel's own fixed `HEAP_SIZE` reservation, so growing the disk image
+  to fit more *files* directly shrinks the RAM available to *execute*
+  them. Raising `kernel/pmm.c`'s `MAX_MEMORY_BYTES`/`kernel/vmm.c`'s
+  `identity_tables` to 256 MiB (paired with a QEMU `-m 256M` bump)
+  worked around the disk-capacity math but introduced a real, new,
+  unexplained page fault during multi-VT boot (`cr2` landing exactly at
+  `HEAP_VA`, a process's own heap start) — reverted rather than shipped
+  half-debugged. Fixed pragmatically instead: `user/qtwindowtest.cpp`
+  stays off the shared disk entirely (`Makefile`'s `QT_STANDALONE_ELFS`,
+  still built — and thus compile/link-regression-checked — by
+  `make all`, just never added to `mkfat16.py`/`mkext2.py`'s file lists)
+  and gets its own small, dedicated scratch disk
+  (`tools/build-qpa-scratch-disk.sh`) for interactive verification
+  instead. Revisit properly once Phase 6 stabilizes — likely by moving
+  Qt QPA testing to the persistent-disk boot path
+  (`tools/test-persistent-boot.py`'s style), which reads EXT2 from a
+  real/virtual disk on demand rather than preloading the whole image
+  into RAM, and has no such ceiling at all.
+
+Next when resuming: item 5 above (`user/pude_qtclient.c`, the PUDE-side
+adapter) is the critical path — nothing above can be verified *inside* a
+real `pude` window without it. Then item 4 (input plumbing) becomes
+straightforward (the protocol and client-side handling already exist).
+QtWidgets (Phase 8 in the original plan) and the final demo follow once
+input/painting round-trips through a real `pude`-hosted window. Keep
+`kernel/heap.c`'s `HEAP_SIZE` in mind if a future QtWidgets test binary
+approaches ~20 MiB even stripped — it may need raising again (a real,
+independent-of-RAM kernel heap ceiling, not the disk/RAM tension above).
