@@ -1,0 +1,11 @@
+# Runs the real PCRE2 regression test (user/pcre2test_pu.c) from a
+# freshly booted VT1 shell and waits for its final summary line — proves
+# the vendored PCRE2 cross-build (third_party/pcre2/i686-elf,
+# tools/build-pcre2.sh, docs/pcmanfm-port.md phase 5) actually works at
+# runtime, not just links: pcre2_compile()/pcre2_match() genuinely
+# compile and match real regular expressions, including capture groups
+# and a real "no match" case.
+WAIT #\s*$
+TYPE /bin/pcre2test_pu.elf
+WAIT pcre2test_pu: 9/9 passed
+SLEEP 1

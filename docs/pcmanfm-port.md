@@ -154,15 +154,31 @@ assumed):
    implementations if a future build genuinely needs one, same
    "fix real errors as they occur" methodology as everything else in
    this port.
-5. **`pcre2`** — GLib's `GRegex` needs it. Qt's own build
-   (`third_party/qt/`) already vendors a real cross-built PCRE2 as
+5. **DONE (2026-07-18).** `pcre2` — GLib's `GRegex` needs it. Qt's own
+   build (`third_party/qt/`) already vendors a real cross-built PCRE2 as
    `Qt6BundledPcre2`, but that's built as an internal Qt static library,
-   not necessarily exposed as a standalone reusable `libpcre2-8.a` with
-   its own public headers in a form GLib's Meson build can just find via
-   `pkg-config`. Simplest, most isolated path: vendor a second, small,
-   standalone PCRE2 build for GLib specifically (same source version is
-   fine, doesn't need to be a shared artifact) rather than trying to
-   reach into Qt's internal build product.
+   not exposed as a standalone reusable `libpcre2-8.a`, so a second,
+   independent PCRE2 10.47 build was vendored specifically for GLib
+   (`third_party/pcre2/i686-elf/`, `tools/build-pcre2.sh`). JIT
+   deliberately left off (upstream's own default — never needed
+   `--enable-jit` at all, matching Qt's own `-DPCRE2_DISABLE_JIT`
+   reasoning: JIT needs real pthreads for its executable-code-buffer
+   pool, and is a pure performance optimization PCRE2 works correctly
+   without). One real, already-known gap hit: this newlib target's
+   `int32_t` is `long`, not plain `int` (the same fact documented in
+   `docs/qt-port.md`'s Phase 3 section) — PCRE2's own code assumes
+   `int32_t`/`int` are interchangeable in a few places, a strict-type-
+   matching diagnostic here, not a real ABI mismatch on this 32-bit
+   target; fixed with `-Wno-incompatible-pointer-types`, not a source
+   patch. Hit the same libtool-final-archive limitation as libffi (see
+   `gotcha_libffi_cross_build_linker_ld_libtool` in memory) — this
+   time, the build script verifies the *specific* known failure
+   (grepping for real compile errors distinct from the expected libtool
+   message) before treating it as tolerable, rather than blanket-
+   ignoring `make`'s exit code. Proven at runtime via 9 checks in
+   `user/pcre2test_pu.c` (real `pcre2_compile()`/`pcre2_match()`,
+   capture groups, a real "no match" case, a real compile-error
+   rejection) — `make run-test` still at the known 343/345 baseline.
 6. **GIO's actual feature scope** — the plan is *local files only*: no
    D-Bus (GVfs remote mounts, `GDBusConnection`), no `inotify`-based file
    monitoring (Linux-specific syscall that doesn't exist here — GIO has
@@ -251,7 +267,7 @@ assumed):
     documentation (upstream versions pinned, every patch listed,
     disabled features listed, build procedure, known limitations).
 
-## Status: phases 1-2-4 (libffi, iconv, pthread shim) done, phase 5 (pcre2) next
+## Status: phases 1-2-4-5 (libffi, iconv, pthread shim, pcre2) done, phase 3/6 (GLib/GIO itself) next
 
 This is a genuinely large undertaking — realistically comparable in
 scope to the entire Qt6 port (`docs/qt-port.md`), possibly larger, since
