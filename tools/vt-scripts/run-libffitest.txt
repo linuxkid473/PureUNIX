@@ -1,0 +1,11 @@
+# Runs the real libffi regression test (user/libffitest.c) from a freshly
+# booted VT1 shell and waits for its final summary line — proves the
+# vendored libffi cross-build (third_party/libffi/i686-elf,
+# tools/build-libffi.sh, docs/pcmanfm-port.md phase 1) actually works at
+# runtime, not just links: ffi_prep_cif()/ffi_call() genuinely drive a call
+# through libffi's own x86 assembly trampolines (src/x86/sysv.S) to real C
+# functions and check the real results.
+WAIT #\s*$
+TYPE /bin/libffitest.elf
+WAIT libffitest: 4/4 passed
+SLEEP 1
