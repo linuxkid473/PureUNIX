@@ -10,14 +10,15 @@ extern "C" {
 #include <QtGui/private/qgenericunixfontdatabase_p.h>
 #include <QtGui/private/qunixeventdispatcher_qpa_p.h>
 #include <QtGui/qpa/qwindowsysteminterface.h>
-#include <QtCore/QSocketNotifier>
 #include <QtCore/QByteArray>
 #include <QtCore/QDebug>
+#include <QtCore/QSocketNotifier>
 
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 
 // Incremental, resumable parser for the pude -> client pipe
 // (PUREUNIX_QPA_FD_READ) -- messages can legitimately arrive split across
@@ -101,15 +102,17 @@ void QPureUnixIntegration::initialize()
     QWindowSystemInterface::handleScreenAdded(new QPureUnixScreen(QSize(screenW, screenH)));
 
     if (m_connected) {
-        auto *notifier = new QSocketNotifier(m_readFd, QSocketNotifier::Read);
-        QObject::connect(notifier, &QSocketNotifier::activated, [this](QSocketDescriptor, QSocketNotifier::Type) {
+        auto *readNotifier = new QSocketNotifier(m_readFd, QSocketNotifier::Read);
+        QObject::connect(readNotifier, &QSocketNotifier::activated, [this](QSocketDescriptor, QSocketNotifier::Type) {
             char chunk[4096];
-            for (;;) {
+            struct pollfd pfd = { m_readFd, POLLIN, 0 };
+            while (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
                 int n = (int)::read(m_readFd, chunk, sizeof(chunk));
                 if (n <= 0) {
                     break;
                 }
                 m_readBuffer->append(chunk, n);
+                pfd.revents = 0;
             }
             m_readBuffer->drain([this](uint32_t type, const QByteArray &payload) {
                 handleIncomingMessage(type, payload);
@@ -174,12 +177,28 @@ void QPureUnixIntegration::sendMessage(uint32_t type, const void *payload, uint3
     pu_qpa_msg_header_t hdr;
     hdr.type = type;
     hdr.len = len;
-    // Small, real blocking writes (docs/qt-port.md Phase 6's own
-    // reasoning: input/control messages here are tiny relative to the
-    // real 4096-byte pipe buffer, so this can't meaningfully stall
-    // `pude` in practice -- the one deliberately-accepted simplification
-    // this phase makes, same spirit as the rest of this port's "smallest
-    // production-quality version, not overengineered" primitives).
+    // Real blocking writes -- deliberately NOT a queued/non-blocking send:
+    // an earlier version of this function used QSocketNotifier::Write to
+    // retry non-blocking writes incrementally, reasoning (wrongly) that
+    // this side needed the same fix user/pude_qtclient.c's own
+    // send_message() needed. It doesn't, and the non-blocking version
+    // measurably hurt throughput: a large PU_QPA_C2S_DAMAGE payload (a
+    // whole window's raw pixels, easily hundreds of KB) took many real
+    // seconds to trickle out, because progress only happened when Qt's
+    // OWN event loop happened to re-poll this fd's writability -- far
+    // slower than the kernel's real wait_queue_wake_all() waking a
+    // blocked writer the instant `pude` frees pipe space.
+    //
+    // The actual deadlock this was chasing (see user/pude_qtclient.c's
+    // own send_message() comment) only required ONE side to become
+    // non-blocking to break the cycle: `pude`'s single-threaded WM loop
+    // must never block writing input to a client, since that write
+    // sharing pude's only thread with its own qtclient_poll() drain loop
+    // is what could freeze the whole desktop. That side is fixed. This
+    // side blocking is harmless: `pude`'s own read of this pipe
+    // (qtclient_poll()) is always non-blocking/poll-gated and runs every
+    // WM frame regardless of what this client process is doing, so this
+    // write always eventually gets drained and woken, never forever.
     ::write(m_writeFd, &hdr, sizeof(hdr));
     if (len > 0) {
         ::write(m_writeFd, payload, len);

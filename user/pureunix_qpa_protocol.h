@@ -61,6 +61,24 @@ enum {
      * this right before the process exits on its own (distinct from
      * PU_QPA_S2C_CLOSE below, which is the WM-initiated direction). */
     PU_QPA_C2S_CLOSE = 4,
+    /* payload: pu_qpa_size_t (the new client-area size Qt itself decided
+     * it needs, e.g. a layout growing past the window's initial size).
+     * Sent by QPureUnixWindow::setGeometry() any time Qt calls it after
+     * the window already exists. Real WMs get an authoritative resize
+     * acknowledgement from the compositor before Qt's layout considers a
+     * resize "settled" -- this plugin had none at all until this message
+     * was added (found via docs/qt-port.md's Phase 5 "genuine
+     * architectural blocker": with no way to tell PUDE a resize actually
+     * happened, PUDE kept rendering at the *old* size and silently
+     * dropped every oversized PU_QPA_C2S_DAMAGE rect as "stale", which is
+     * what an infinite Qt-side repaint loop turned out to be reacting
+     * to). PUDE's own user/pude_qtclient.c applies this by adjusting the
+     * window's whole-window size by the same delta (client_w/h is the
+     * only thing that changed; chrome thickness is constant), exactly
+     * the same pude_window_t fields a user's own drag-resize already
+     * mutates -- no new WM concept, just a second way to drive the
+     * existing one. */
+    PU_QPA_C2S_RESIZE_REQUEST = 5,
 };
 
 /* ---- PUDE -> client (PUREUNIX_QPA_FD_READ) ---- */

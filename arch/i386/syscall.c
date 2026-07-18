@@ -245,6 +245,19 @@ static int pipe_read(open_file_t *f, char *buf, size_t len)
         if (p->write_ends == 0) {
             return 0; /* EOF: no writers left, nothing buffered */
         }
+        /* Real O_NONBLOCK support, same as pipe_write()'s own (see that
+         * function's comment for the original bidirectional-pipe deadlock
+         * this was added for). Found genuinely necessary here too, not
+         * just for symmetry: Qt's own internal QThreadPipe self-pipe
+         * (qcore_unix_p.h's qt_safe_pipe(..., O_NONBLOCK)) drains itself
+         * in a loop that reads until EAGAIN -- with no O_NONBLOCK support
+         * here, that second, empty-pipe read blocked the caller forever,
+         * even though fcntl(fd, F_SETFL, O_NONBLOCK) had already
+         * genuinely succeeded (confirmed by tracing f->flags) — this
+         * function just never looked at it. */
+        if (f->flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
         /* See include/pureunix/wait.h's invariant — int $0x80 enters with
          * interrupts masked, and nothing could ever wake this sleeper
          * otherwise. */
@@ -266,6 +279,7 @@ static int pipe_read(open_file_t *f, char *buf, size_t len)
     return (int)to_copy;
 }
 
+
 static int pipe_write(open_file_t *f, const char *buf, size_t len)
 {
     if (!f->pipe_is_write_end) {
@@ -278,9 +292,27 @@ static int pipe_write(open_file_t *f, const char *buf, size_t len)
     if (p->read_ends == 0) {
         return -EPIPE;
     }
+    /* Real O_NONBLOCK support (fcntl(fd, F_SETFL, O_NONBLOCK), already
+     * stored into f->flags by SYS_FCNTL's own F_SETFL case above) --
+     * found genuinely necessary, not just a nice-to-have, by a real
+     * bidirectional-pipe deadlock during the Qt QPA port
+     * (docs/qt-port.md): `pude`'s own single-threaded WM loop calls this
+     * (via user/pude_qtclient.c's send_message(), forwarding keyboard/
+     * mouse input to a Qt client) while that same client can itself be
+     * blocked mid-write() sending pude a large PU_QPA_C2S_DAMAGE repaint
+     * over the *other* pipe -- if pude's own write() here also blocks
+     * (the client isn't currently reading its input pipe, busy with its
+     * own write), pude's entire WM loop freezes and can never get back
+     * around to draining the client's pending damage either, a genuine
+     * two-process deadlock, not merely a slow round-trip. A caller that
+     * sets O_NONBLOCK accepts a real short/failed write instead. */
+    bool nonblock = (f->flags & O_NONBLOCK) != 0;
     size_t written = 0;
     while (written < len) {
         if (p->count == PUREUNIX_PIPE_SIZE) {
+            if (nonblock) {
+                return written ? (int)written : -EAGAIN;
+            }
             arch_enable_interrupts();
             pipe_wait_ctx_t ctx = { .p = p };
             wait_queue_sleep(&p->write_wq, pipe_writable, &ctx);

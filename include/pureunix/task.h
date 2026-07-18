@@ -38,7 +38,17 @@ struct pty;
  * reference is gone. read_ends/write_ends count *distinct open_file_t's*
  * holding that end open, not fd-table slots aliasing one of them (dup()/
  * dup2()/fork() bump an open_file_t's own refcount instead — see below). */
-#define PUREUNIX_PIPE_SIZE 4096
+/* Was 4096 (one x86 page) until the Qt QPA port (docs/qt-port.md): a
+ * single PU_QPA_C2S_DAMAGE message (a whole window's raw ARGB32 pixels)
+ * is easily hundreds of KB to a few MB, and every extra round trip here
+ * costs a real context switch between `pude` and the Qt client process
+ * -- at the old size, one modest repaint took hundreds of round trips
+ * and was measurably, visibly slow (multiple real seconds to render one
+ * frame). 256 KiB cuts that to single digits for a typical window.
+ * kcalloc()'d once per pipe() call (not a fixed pool), so this only
+ * costs real heap for pipes actually in use -- affordable for the small
+ * number of pipes/ptys any one PureUnix session actually has open. */
+#define PUREUNIX_PIPE_SIZE (256 * 1024)
 typedef struct pipe_buf {
     uint8_t data[PUREUNIX_PIPE_SIZE];
     size_t head, tail, count;

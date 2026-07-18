@@ -383,6 +383,15 @@ int fcntl(int fd, int cmd, ...)
         if (arg & 0x0008) pu_flags |= PU_O_APPEND;
         if (arg & 0x0200) pu_flags |= PU_O_CREAT;
         if (arg & 0x0400) pu_flags |= PU_O_TRUNC;
+        /* O_NONBLOCK (newlib's _FNONBLOCK, 0x4000) was chosen in
+         * include/pureunix/fcntl.h to numerically equal newlib's own
+         * value, so no bit remapping is needed here -- just don't let it
+         * fall through the cracks like the whitelist above used to
+         * silently do (real bug: fcntl(fd, F_SETFL, O_NONBLOCK) appeared
+         * to succeed but never actually reached f->flags, found while
+         * fixing a real bidirectional-pipe deadlock in the Qt QPA port,
+         * docs/qt-port.md). */
+        if (arg & 0x4000) pu_flags |= 0x4000;
         arg = pu_flags;
     }
 
@@ -396,6 +405,7 @@ int fcntl(int fd, int cmd, ...)
         if (r & PU_O_APPEND) nl_flags |= 0x0008;
         if (r & PU_O_CREAT)  nl_flags |= 0x0200;
         if (r & PU_O_TRUNC)  nl_flags |= 0x0400;
+        if (r & 0x4000)      nl_flags |= 0x4000;
         return nl_flags;
     }
     return r;

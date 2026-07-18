@@ -7,6 +7,7 @@
 #define PUREUNIX_QPA_INTEGRATION_H
 
 #include <qpa/qplatformintegration.h>
+#include <QtCore/QByteArray>
 #include <QtCore/QScopedPointer>
 
 QT_BEGIN_NAMESPACE
@@ -40,10 +41,18 @@ public:
     int writeFd() const { return m_writeFd; }
 
     // Sends a fully-framed message (header + payload) to `pude` over
-    // m_writeFd. Safe to call even when !connected() (a silent no-op) --
-    // every real caller already only exists because a QPureUnixWindow was
-    // constructed, and this lets a Phase 1-style standalone test (no real
-    // `pude` on the other end) run without crashing.
+    // m_writeFd with a real blocking write. Safe to call even when
+    // !connected() (a silent no-op) -- every real caller already only
+    // exists because a QPureUnixWindow was constructed, and this lets a
+    // Phase 1-style standalone test (no real `pude` on the other end) run
+    // without crashing.
+    //
+    // Blocking here is deliberate and safe, not an oversight -- see this
+    // function's own definition in pureunixintegration.cpp for the full
+    // reasoning (a real bidirectional-pipe deadlock this was once
+    // mistakenly "fixed" for by making this non-blocking too, which broke
+    // large-payload throughput instead; the actual fix lives entirely on
+    // `pude`'s own side, user/pude_qtclient.c's send_message()).
     void sendMessage(uint32_t type, const void *payload, uint32_t len) const;
 
     // Registers/unregisters the one active window so incoming pude ->

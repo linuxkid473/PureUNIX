@@ -255,12 +255,12 @@ def main():
         qemu.click_at(*menu_item_center(QTCLIENT_WIDGETS_INDEX))
         time.sleep(2.0)
         shot("w03-widgets-window-just-spawned.ppm")
-        print("=== waiting up to 20s for [002] to confirm the window really painted ===")
+        print("=== waiting up to 30s for [002] to confirm the window really painted ===")
         try:
-            qemu.wait_for(r"\[002\]", 20)
+            qemu.wait_for(r"\[002\]", 30)
             print("[002] observed")
         except TimeoutError:
-            print("WARN: [002] never printed within 20s")
+            print("WARN: [002] never printed within 30s")
         time.sleep(2.0)
         shot("w04-widgets-window-settled.ppm")
 
@@ -273,12 +273,16 @@ def main():
         shot("w05-lineedit-typed.ppm")
 
         print("=== clicking the QPushButton (real signal/slot round trip) ===")
-        # Button row is near the bottom of the 420x320 client area, left
-        # side (QHBoxLayout: button then click-count label).
-        qemu.click_at(cx + 40, cy + 280)
+        # Button row sits near the bottom of the *actual*, Qt-layout-grown
+        # window (docs/qt-port.md's Phase 5 repaint-loop fix means this is
+        # no longer the fixed 420x320 default_client_w/h -- the real
+        # QVBoxLayout/QTextEdit/QHBoxLayout combination settles noticeably
+        # bigger). Measured from a real w04 screendump rather than derived
+        # from the old fixed size.
+        qemu.click_at(cx + 139, cy + 297)
         time.sleep(0.5)
         shot("w06-after-button-click-1.ppm")
-        qemu.click_at(cx + 40, cy + 280)
+        qemu.click_at(cx + 139, cy + 297)
         time.sleep(0.5)
         shot("w07-after-button-click-2.ppm")
 

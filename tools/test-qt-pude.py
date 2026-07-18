@@ -182,11 +182,9 @@ class QemuSession:
 MENU_BTN_X, MENU_BTN_Y, MENU_BTN_W, MENU_BTN_H = 8, 8, 90, 26
 MENU_ITEM_W, MENU_ITEM_H = 170, 28
 # g_apps[] order: PUTerm(0), Calculator(1), PUFiles(2), PUText(3),
-# Settings(4), Qt Application(5, qtclient_app_class) -- user/pude.c.
-# (qtclient_widgets_app_class exists in user/pude_qtclient.c but is
-# deliberately NOT registered in g_apps[] yet -- see that file's own
-# comment on the real infinite-repaint-loop bug this hits.)
-NUM_APPS = 6
+# Settings(4), Qt Application(5, qtclient_app_class), Qt Widgets Test
+# (6, qtclient_widgets_app_class) -- user/pude.c.
+NUM_APPS = 7
 QTCLIENT_INDEX = 5
 
 

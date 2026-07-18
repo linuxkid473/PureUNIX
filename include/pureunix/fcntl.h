@@ -8,6 +8,11 @@
 #define O_CREAT  0x100
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
+/* Chosen to equal newlib's own O_NONBLOCK/_FNONBLOCK (sys/_default_fcntl.h)
+ * so user/newlib_syscalls.c's fcntl() F_SETFL/F_GETFL translation can pass
+ * this bit straight through with no remapping, same as every other flag
+ * here already does. */
+#define O_NONBLOCK 0x4000
 
 #define SEEK_SET 0
 #define SEEK_CUR 1

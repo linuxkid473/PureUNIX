@@ -1039,7 +1039,124 @@ the known 343/345 baseline, every other `tools/vt-scripts/*.txt` still
    `SIGKILL`, so a future app that doesn't cleanly exit on SIGHUP for
    some other reason can never hang the whole desktop again either.
 
+## Phase 5/6 follow-up: the real root causes, found and fixed
+
+Everything below this line documents what the "genuine architectural
+blocker" (see the original Phase 5 writeup, kept intact further down for
+the historical bisection trail) actually turned out to be. **Short
+version: it was never one bug, and the original theory (a resize
+size-mismatch) was a red herring.** Three independent, real bugs
+combined to look like one infinite repaint loop:
+
+1. **A real resize-forwarding gap** — Qt really did decide a widget
+   needed more room than `pude`'s `app_class_t.default_client_w/h`
+   granted at spawn time, and there was genuinely no protocol message for
+   "the client needs to be resized" (only the WM-driven `S2C_RESIZE` for
+   user drag-resizes existed). Fixed with a new C2S message,
+   `PU_QPA_C2S_RESIZE_REQUEST` (`user/pureunix_qpa_protocol.h`), sent by
+   `QPureUnixWindow::setGeometry()` whenever Qt calls it after the window
+   already exists, and applied on `pude`'s side in
+   `user/pude_qtclient.c`'s `qtclient_poll()` via a *delta* applied to
+   the whole-window `pude_window_t.w/h` (never needs to know
+   `pude.c`'s own private chrome-size constants).
+
+2. **A real bidirectional-pipe deadlock** — once resize was fixed, real
+   end-to-end testing (typing, clicking) surfaced a second, much more
+   serious bug: `pude`'s own single-threaded WM loop can call a blocking
+   `write()` to forward input (mouse/keyboard) to a Qt client at the
+   *exact same moment* that client is itself blocked mid-`write()`
+   sending a large `PU_QPA_C2S_DAMAGE` repaint back over the *other*
+   pipe. Neither side can make progress — a genuine two-process
+   deadlock, not just a slow round-trip, and indistinguishable from the
+   outside from "an infinite repaint loop" (the client just never
+   responds again). Fixed with real `O_NONBLOCK` support end-to-end:
+   - `arch/i386/syscall.c`'s `pipe_write()` and `pipe_read()` both now
+     honor `O_NONBLOCK` (`pipe_write()` already had a first pass at this;
+     `pipe_read()` had none at all — see bug 3 below for why that
+     mattered independently).
+   - `user/pude_qtclient.c`'s `send_message()` (the `pude` -> client
+     direction — small control/input messages) now does one real
+     non-blocking, all-or-nothing `write()`, dropping the message
+     entirely rather than partially writing it if the pipe is full. This
+     is the side that actually had to change to break the deadlock:
+     `pude`'s own read of the *other* direction
+     (`qtclient_poll()`) was already non-blocking/poll-gated from Phase
+     4, so once `pude`'s own writes also can't block, `pude`'s WM loop
+     can never freeze, and it always eventually drains whatever the
+     client is sending — no matter how long that side takes.
+   - The client's own `QPureUnixIntegration::sendMessage()` (the
+     *client* -> `pude` direction, used for potentially-huge
+     `PU_QPA_C2S_DAMAGE` payloads) was, for a while, *also* converted to
+     a non-blocking queued/notifier-based send — this turned out to be
+     unnecessary once `pude`'s side was fixed, and measurably hurt
+     throughput (see bug 3). It was reverted back to a plain blocking
+     `::write()`; see that function's own comment for the reasoning.
+
+3. **A real kernel bug found while fixing bug 2**: `fcntl(fd, F_SETFL,
+   O_NONBLOCK)` appeared to succeed but silently never reached the
+   file's actual flags. `user/newlib_syscalls.c`'s `fcntl()` translates
+   newlib's `O_*` bit layout to/from this kernel's own
+   (`include/pureunix/fcntl.h`) — the `F_SETFL`/`F_GETFL` translation
+   only whitelisted `O_WRONLY`/`O_APPEND`/`O_CREAT`/`O_TRUNC` and dropped
+   every other bit, including `O_NONBLOCK`, on the floor. This is a
+   *general* kernel bug, not Qt-specific — it broke `O_NONBLOCK` for
+   every caller on this target, including Qt's own internal
+   `QThreadPipe` self-pipe (`qcore_unix_p.h`'s `qt_safe_pipe(...,
+   O_NONBLOCK)`), which drains itself in a loop that reads until EAGAIN —
+   with no real `O_NONBLOCK`, that second, empty-pipe `read()` blocked
+   forever, which looked exactly like a hung event loop (`awake()` fired
+   once and then nothing, ever). Found by tracing real `fcntl()`
+   arguments/return values end-to-end, not by guessing. Fixed by adding
+   `O_NONBLOCK` to the F_SETFL/F_GETFL bit-translation whitelist
+   (`user/newlib_syscalls.c`) and giving `include/pureunix/fcntl.h` its
+   own `O_NONBLOCK` definition (chosen to numerically equal newlib's own
+   value, so no remapping is needed, same as every other flag there).
+
+4. **A real, separate throughput problem**, found once the deadlock/hang
+   were fixed and rendering was *technically* correct but painfully
+   slow: `PUREUNIX_PIPE_SIZE` (`include/pureunix/task.h`) was 4096 bytes
+   (one x86 page) — a single `PU_QPA_C2S_DAMAGE` message (a whole
+   window's raw ARGB32 pixels) is easily hundreds of KB, so one modest
+   repaint took hundreds of round trips between `pude` and the client
+   process, each one a real context switch. This is what made the
+   non-blocking async queue in bug 2 look necessary (input got
+   processed, just extremely slowly) when a much simpler and more
+   effective fix was available: raised `PUREUNIX_PIPE_SIZE` to 256 KiB
+   (`kcalloc()`'d per `pipe()` call, not a fixed pool — cheap for the
+   small number of pipes any one session has open). Combined with the
+   plain-blocking-write revert in bug 2, this made a full window repaint
+   fast enough to be interactive.
+
+**Verified end-to-end** (`tools/test-qt-widgets-pude.py`,
+`tools/test-qt-pude.py`, both against `build/qpa-scratch.iso`): the
+QtWidgets test window (`QMainWindow` + `QLabel`/`QLineEdit`/`QTextEdit`/
+`QPushButton`) now renders completely and correctly at its
+layout-driven size (546×320, grown from the 420×320 the window was
+spawned at), and `QPushButton::clicked` fires for real — confirmed via
+`[003]` printing twice for two real synthetic clicks, not just a
+"nothing crashed" check. `qtclient_widgets_app_class` is now registered
+in `user/pude.c`'s `g_apps[]` (previously deliberately left out until
+this was fixed).
+
+**Known remaining cosmetic issue, not investigated further**: the
+simpler `user/qtwindowtest.cpp` (a bare `QRasterWindow`, no widgets)
+sometimes settles into a partially-painted state — the top portion of
+its `fillRect()` renders correctly but a strip at the bottom stays
+black — and it doesn't self-correct on later repaints in that specific
+demo (no widget ever triggers a second paint there). Root cause not
+traced; likely a narrower version of the same resize/content-size-sync
+edge case from bug 1 above, specific to that demo's exact
+construction-time `resize(320, 240)` call timing. Does not reproduce in
+the QtWidgets test, which is the more representative real-app case (and
+is what actually matters for hosting something like PCManFM-Qt). Worth
+a look if a future real ported app shows the same symptom.
+
 ## Phase 5 attempt: real QtWidgets — genuine architectural blocker found (unfixed)
+
+*(Historical bisection trail from the original investigation — kept
+as-is below since the actual root causes, found later, are documented
+above. The "not yet found" root-cause theory in this section was wrong;
+see above for what it actually was.)*
 
 `user/qtwidgetstest.cpp` (a real, unmodified `QApplication` +
 `QMainWindow` + `QVBoxLayout`/`QHBoxLayout` + `QLabel`/`QLineEdit`/

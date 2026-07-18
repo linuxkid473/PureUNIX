@@ -64,6 +64,21 @@ void QPureUnixWindow::setGeometry(const QRect &rect)
     // visible), same as every other QPlatformWindow implementation does.
     QPlatformWindow::setGeometry(rect);
     QWindowSystemInterface::handleGeometryChange(window(), rect);
+
+    // Tell PUDE for real (docs/qt-port.md's Phase 5 "genuine architectural
+    // blocker" -- see PU_QPA_C2S_RESIZE_REQUEST's own comment,
+    // user/pureunix_qpa_protocol.h): a layout that decides it needs more
+    // room than the window's initial size calls exactly this, and
+    // without PUDE ever learning about it, PUDE kept rendering (and
+    // bounds-checking incoming damage against) the *original* size
+    // forever. Sent unconditionally rather than only when the size
+    // actually changed -- PUDE's own handling is already idempotent
+    // (qtclient_state_t's resize_content() no-ops on an unchanged size),
+    // so there's no benefit to this file also tracking "did it change".
+    pu_qpa_size_t sz;
+    sz.w = rect.width();
+    sz.h = rect.height();
+    m_integration->sendMessage(PU_QPA_C2S_RESIZE_REQUEST, &sz, sizeof(sz));
 }
 
 void QPureUnixWindow::setVisible(bool visible)

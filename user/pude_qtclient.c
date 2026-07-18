@@ -26,12 +26,19 @@
  * "never blocks, always makes progress" idiom PUTerm's own poll()
  * already uses for its pty master reads.
  *
- * The PUDE -> client direction (resize/close/keyboard/mouse/focus) is
- * real, small, blocking writes -- see user/qpa_pureunix/
- * pureunixintegration.cpp's sendMessage() for why that's an accepted
- * simplification (input events are tiny relative to the real 4096-byte
- * pipe buffer) rather than something this file also needs to guard
- * against blocking on.
+ * The PUDE -> client direction (resize/close/keyboard/mouse/focus) is a
+ * real, non-blocking, all-or-nothing write per message (see this file's
+ * own send_message()) -- NOT a small blocking write like an earlier
+ * version of this file used. A blocking write here can deadlock the
+ * entire desktop: pude's single-threaded WM loop can be sending input
+ * here at the exact moment the client is itself blocked mid-write()
+ * sending a large PU_QPA_C2S_DAMAGE payload back over the *other* pipe
+ * (real, reproduced bug -- see git history/docs/qt-port.md). Since
+ * pude's own read of that C2S direction is always non-blocking/poll-
+ * gated (previous paragraph), the fix only needed to make THIS
+ * direction non-blocking too: once neither side can ever block on a
+ * write, the deadlock cycle can't form, regardless of how large or
+ * slow-draining the other side's payload is.
  */
 #include "pude_qtclient.h"
 #include "pude_gfx.h"
@@ -42,6 +49,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -90,6 +98,17 @@ typedef struct {
     uint8_t *rbuf;
     size_t rbuf_len;
     size_t rbuf_cap;
+
+    /* PU_QPA_C2S_RESIZE_REQUEST (user/pureunix_qpa_protocol.h's own
+     * comment has the full story): Qt's own layout can decide it needs a
+     * client area bigger than what this window was created with. Applied
+     * once per WM frame in qtclient_poll() (which alone has the
+     * pude_window_t* needed to actually resize the window's own chrome),
+     * not directly in handle_message() -- same "stash it, apply it where
+     * the right context exists" split resize_content() itself doesn't
+     * need since it only ever touches this struct's own fields. */
+    bool has_pending_resize;
+    int pending_resize_w, pending_resize_h;
 } qtclient_state_t;
 
 static bool rbuf_ensure(qtclient_state_t *st, size_t need)
@@ -166,6 +185,19 @@ static void handle_message(qtclient_state_t *st, uint32_t type, const uint8_t *p
         st->dirty = true;
         break;
     }
+    case PU_QPA_C2S_RESIZE_REQUEST: {
+        if (len < sizeof(pu_qpa_size_t)) {
+            break;
+        }
+        pu_qpa_size_t sz;
+        memcpy(&sz, payload, sizeof(sz));
+        if (sz.w > 0 && sz.h > 0 && sz.w <= 4096 && sz.h <= 4096) {
+            st->pending_resize_w = sz.w;
+            st->pending_resize_h = sz.h;
+            st->has_pending_resize = true;
+        }
+        break;
+    }
     case PU_QPA_C2S_SET_TITLE: {
         size_t n = len < sizeof(st->title) - 1 ? len : sizeof(st->title) - 1;
         memcpy(st->title, payload, n);
@@ -213,16 +245,47 @@ static void drain_messages(qtclient_state_t *st)
     }
 }
 
+/* Every S2C_* payload struct in user/pureunix_qpa_protocol.h is well
+ * under this -- generous headroom for a header + the largest one
+ * (pu_qpa_mouse_button_t) without needing to size this per-caller. */
+#define QTCLIENT_S2C_MSG_MAX 64
+
 static void send_message(qtclient_state_t *st, uint32_t type, const void *payload, uint32_t len)
 {
+    /* Real, non-blocking, all-or-nothing send -- NOT the small-blocking-
+     * write "accepted simplification" this function used to be (see
+     * git history/docs/qt-port.md for the full story): that design
+     * caused a genuine bidirectional-pipe deadlock. `pude`'s own single-
+     * threaded WM loop calls this (forwarding keyboard/mouse input) while
+     * the very same Qt client can itself be blocked mid-write() sending
+     * pude a large PU_QPA_C2S_DAMAGE repaint over the *other* pipe --
+     * a blocking write() here could freeze pude's entire WM loop
+     * forever, which in turn could never get back around to draining the
+     * client's own pending damage either. Every message here is tiny
+     * (see QTCLIENT_S2C_MSG_MAX) relative to the real 4096-byte pipe
+     * buffer, so this fits in one combined, single write() call whenever
+     * the client is keeping up at all -- if it doesn't fit right now
+     * (client genuinely backed up), the whole message is dropped rather
+     * than partially written, since a partial header+payload would
+     * desync every future message's framing forever. Dropping an
+     * occasional input event under real backpressure (the client would
+     * have to be badly behind) is far preferable to a hung desktop. */
+    if (len > QTCLIENT_S2C_MSG_MAX - sizeof(pu_qpa_msg_header_t)) {
+        return; /* not reachable by any real caller today -- see the enum above */
+    }
+    uint8_t buf[QTCLIENT_S2C_MSG_MAX];
     pu_qpa_msg_header_t hdr;
     hdr.type = type;
     hdr.len = len;
-    /* See this file's own header comment on why a small blocking write
-     * here is an accepted simplification, not a real risk in practice. */
-    write(st->write_fd, &hdr, sizeof(hdr));
+    memcpy(buf, &hdr, sizeof(hdr));
     if (len > 0) {
-        write(st->write_fd, payload, len);
+        memcpy(buf + sizeof(hdr), payload, len);
+    }
+    size_t total = sizeof(hdr) + len;
+    fcntl(st->write_fd, F_SETFL, O_NONBLOCK);
+    ssize_t n = write(st->write_fd, buf, total);
+    if (n < 0 || (size_t)n != total) {
+        return; /* dropped -- client's own input pipe is currently full */
     }
 }
 
@@ -494,6 +557,31 @@ static bool qtclient_poll(pude_window_t *win, void *state)
 
     if (st->protocol_error) {
         st->child_alive = false;
+    }
+
+    /* Applies a pending PU_QPA_C2S_RESIZE_REQUEST (see that enum's own
+     * comment) -- this is the one place in this file that actually has
+     * both the pude_window_t* (whole-window geometry, WM-owned) and the
+     * client's own idea of its new client-area size, so it's the only
+     * place this can happen. win->w/win->h already equal client_w/h plus
+     * a constant chrome amount (border + title bar, both private to
+     * user/pude.c) -- rather than duplicating those constants here, this
+     * just applies the *delta* between the old and new client size,
+     * which maps 1:1 onto the same delta in whole-window size regardless
+     * of what the chrome thickness actually is. Exactly the same
+     * pude_window_t.w/h fields a user's own drag-resize already mutates
+     * (user/pude.c) -- no new WM concept, just a second way to drive it. */
+    if (st->has_pending_resize) {
+        st->has_pending_resize = false;
+        int new_w = st->pending_resize_w;
+        int new_h = st->pending_resize_h;
+        if (new_w < win->cls->min_client_w) new_w = win->cls->min_client_w;
+        if (new_h < win->cls->min_client_h) new_h = win->cls->min_client_h;
+        if (new_w != st->content_w || new_h != st->content_h) {
+            win->w += new_w - st->content_w;
+            win->h += new_h - st->content_h;
+            resize_content(st, new_w, new_h);
+        }
     }
 
     if (win->title[0] == '\0' || st->title_changed) {
