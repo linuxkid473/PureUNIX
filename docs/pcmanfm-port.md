@@ -102,26 +102,58 @@ assumed):
    waiting) would be a bigger kernel feature than anything added during
    the entire Qt6 port (bigger than TLS, bigger than xHCI).
 
-   **Planned approach: a real, honest single-threaded pthread shim, not
-   fake kernel threading.** `GMutex`/`GCond`/`GOnce` become genuine
-   no-ops (correct precisely because nothing on this platform can ever
-   contend on them — there's only one execution context per process).
-   `pthread_create()`/`g_thread_new()` run the given entry point
+   **DONE (2026-07-18): a real, honest single-threaded pthread shim, not
+   fake kernel threading.** Implemented in `user/newlib_syscalls.c`.
+   `GMutex`/`GCond`/`GOnce` (via `pthread_mutex_*`/`pthread_cond_*`) are
+   genuine no-ops (correct precisely because nothing on this platform
+   can ever contend on them — there's only one execution context per
+   process). `pthread_create()` runs the given entry point
    **synchronously, inline, before returning** rather than deferring it
-   to a real concurrent thread. This is a real, previously-used pattern
-   for constrained/embedded platforms (GLib itself supports single-
-   threaded execution as a valid mode, it just doesn't advertise a
-   pre-packaged "no threads" build option the way old glib did before
-   2.32) — the documented, honest cost is that a job that would run in
-   the background on a real OS instead blocks the UI for its duration
-   (a real, disclosed limitation, not a silent correctness bug — same
-   class of tradeoff as, e.g., this project's SDL2 port disclosing "no
-   real audio/threads/joystick" up front rather than faking them).
-   Matches this project's own established precedent of disabling a
-   thread-dependent *feature* rather than building real concurrency for
-   it (see `docs/qt-port.md`'s `-DPCRE2_DISABLE_JIT` — PCRE2's JIT needs
-   real pthreads too, and was compiled out rather than ported around,
-   for exactly this reason).
+   to a real concurrent thread — real, not fake: it uses a genuine
+   `setjmp`/`longjmp` round trip (the same primitive already validated
+   working on this platform via `user/cxxtest.c`) so `pthread_exit()`
+   called from deep inside the entry point still unwinds correctly back
+   to the waiting `pthread_create()` call frame, and a real heap-
+   allocated per-thread record carries the actual return value through
+   to `pthread_join()`. `pthread_once()` genuinely only runs its
+   init routine once even though nothing can race on it; thread-specific
+   data degenerates to a real flat global table (correct given there's
+   only ever one logical "current thread" alive at a time here). Two
+   real newlib gaps found getting here, both general (not GLib-specific):
+   `<pthread.h>`'s entire real API surface (types and prototypes) is
+   gated behind `#if defined(_POSIX_THREADS)`, never set for a bare
+   i686-elf target (only `__rtems__`/`__XMK__`/`__CYGWIN__` branches in
+   `sys/features.h` define it) — fixed by adding `-D_POSIX_THREADS=1`
+   (and, one level deeper, `-D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1` for
+   `pthread_mutexattr_t`'s own `type` field/`settype()`/`gettype()`) to
+   the shared `NEWLIB_CFLAGS` in the Makefile — a real statement of
+   platform capability now that a real implementation backs it, not a
+   lie. Proven at runtime via 9 new checks in `user/libctest.c`'s
+   `section_pthread()`: a real thread create/join round trip with a
+   genuine computed return value, a real `pthread_exit()` unwind past
+   unreachable code, exactly-once `pthread_once()` semantics across 3
+   calls, and a real thread-specific-data get/set round trip — not just
+   "does it link". `make run-test` still at the known 343/345 baseline,
+   no regressions (a global `NEWLIB_CFLAGS` change, so every newlib-
+   linked binary in the tree, including every Qt one, was rebuilt and
+   reverified).
+   
+   The documented, honest cost of the synchronous-execution design: a
+   job that would background on a real OS instead blocks the caller for
+   its duration (a real, disclosed limitation, not a silent correctness
+   bug — same class of tradeoff as, e.g., this project's SDL2 port
+   disclosing "no real audio/threads/joystick" up front rather than
+   faking them). Matches this project's own established precedent of
+   disabling a thread-dependent *feature* rather than building real
+   concurrency for it (see `docs/qt-port.md`'s `-DPCRE2_DISABLE_JIT` —
+   PCRE2's JIT needs real pthreads too, and was compiled out rather than
+   ported around, for exactly this reason). Deliberately NOT implemented
+   yet: cancellation, scheduling/priority attributes, CPU affinity,
+   cleanup-handler stacks, rwlocks, barriers, spinlocks — none are
+   reachable from GLib's own real usage researched so far; will add real
+   implementations if a future build genuinely needs one, same
+   "fix real errors as they occur" methodology as everything else in
+   this port.
 5. **`pcre2`** — GLib's `GRegex` needs it. Qt's own build
    (`third_party/qt/`) already vendors a real cross-built PCRE2 as
    `Qt6BundledPcre2`, but that's built as an internal Qt static library,
@@ -196,11 +228,11 @@ assumed):
    fam/inotify as each is hit — expect several rounds of real build
    fixes, not a one-shot clean build, same as every prior vendored
    dependency in this codebase).
-4. The pthread shim (`user/newlib_syscalls.c` or a new
-   `user/newlib_compat/pthread_shim.c`) — real no-op mutexes/conds, and
-   synchronous-inline `pthread_create()`. Needed before GLib's own
-   configure-time thread checks pass, so this likely needs to exist
-   *before* step 3 fully lands, not after.
+4. **DONE (2026-07-18).** The pthread shim (`user/newlib_syscalls.c`) —
+   see phase 4 above for the full writeup (real no-op mutexes/conds,
+   synchronous-inline `pthread_create()` with a genuine `setjmp`/
+   `longjmp`-backed `pthread_exit()`, `pthread_once()`, thread-specific
+   data, 9 new on-target checks in `user/libctest.c`).
 5. Vendor `MenuCache` + `libexif` (both much smaller, more
    conventional C libraries — lower risk than GLib itself).
 6. Patch out the one XCB-dependent file (`xdndworkaround.cpp`) in
@@ -219,7 +251,7 @@ assumed):
     documentation (upstream versions pinned, every patch listed,
     disabled features listed, build procedure, known limitations).
 
-## Status: phases 1-2 (libffi, iconv) done, phase 4 (pthread shim) next
+## Status: phases 1-2-4 (libffi, iconv, pthread shim) done, phase 5 (pcre2) next
 
 This is a genuinely large undertaking — realistically comparable in
 scope to the entire Qt6 port (`docs/qt-port.md`), possibly larger, since

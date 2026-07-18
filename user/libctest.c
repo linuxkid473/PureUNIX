@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <iconv.h>
 #include <math.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,6 +260,108 @@ static void section_iconv(void)
     iconv_close(cd2);
 }
 
+/* ------------------------------------------------------------------ pthread */
+
+/* Real single-threaded pthread shim (user/newlib_syscalls.c, added for
+ * the PCManFM-Qt port's GLib dependency, docs/pcmanfm-port.md) —
+ * pthread_create() genuinely runs the entry point synchronously before
+ * returning, so these checks confirm the *real* mechanics (a genuine
+ * setjmp/longjmp round trip for pthread_exit(), a genuine heap-allocated
+ * per-thread record carrying a real retval through to pthread_join(),
+ * a genuinely-once pthread_once(), a real thread-specific-data table),
+ * not just "does it link". */
+
+static void *pthread_worker_returns_value(void *arg)
+{
+    int *n = (int *)arg;
+    return (void *)(intptr_t)(*n * 2);
+}
+
+static void *pthread_worker_calls_exit(void *arg)
+{
+    (void)arg;
+    pthread_exit((void *)(intptr_t)999);
+    return (void *)(intptr_t)111; /* unreachable -- proves pthread_exit() really unwound past this */
+}
+
+static int g_once_call_count = 0;
+static void once_routine(void)
+{
+    g_once_call_count++;
+}
+
+static void section_pthread(void)
+{
+    t_begin("pthread_mutex_init/lock/unlock/destroy");
+    {
+        pthread_mutex_t m;
+        check_int("pthread_mutex_init()", 0, pthread_mutex_init(&m, NULL));
+        check_int("pthread_mutex_lock()", 0, pthread_mutex_lock(&m));
+        check_int("pthread_mutex_trylock() (never contended here)", 0, pthread_mutex_trylock(&m));
+        check_int("pthread_mutex_unlock()", 0, pthread_mutex_unlock(&m));
+        check_int("pthread_mutex_destroy()", 0, pthread_mutex_destroy(&m));
+    }
+
+    t_begin("pthread_cond_wait() returns immediately (real, correct here — see newlib_syscalls.c's own comment)");
+    {
+        pthread_mutex_t m;
+        pthread_cond_t c;
+        pthread_mutex_init(&m, NULL);
+        pthread_cond_init(&c, NULL);
+        check_int("pthread_cond_wait() returns 0 without blocking", 0, pthread_cond_wait(&c, &m));
+        check_int("pthread_cond_signal()", 0, pthread_cond_signal(&c));
+        pthread_cond_destroy(&c);
+        pthread_mutex_destroy(&m);
+    }
+
+    t_begin("pthread_create()/pthread_join(): real synchronous execution + real retval round trip");
+    {
+        pthread_t tid;
+        int arg = 21;
+        int rc = pthread_create(&tid, NULL, pthread_worker_returns_value, &arg);
+        check_int("pthread_create() returns 0", 0, rc);
+        void *retval = NULL;
+        check_int("pthread_join() returns 0", 0, pthread_join(tid, &retval));
+        check_int("joined thread's real retval == 42", 42, (int)(intptr_t)retval);
+    }
+
+    t_begin("pthread_exit(): a real setjmp/longjmp round trip past the rest of the entry point");
+    {
+        pthread_t tid;
+        pthread_create(&tid, NULL, pthread_worker_calls_exit, NULL);
+        void *retval = NULL;
+        pthread_join(tid, &retval);
+        check_int("retval came from pthread_exit(999), not the unreachable return(111)", 999, (int)(intptr_t)retval);
+    }
+
+    t_begin("pthread_self()/pthread_equal()");
+    {
+        pthread_t self1 = pthread_self();
+        pthread_t self2 = pthread_self();
+        check_true("pthread_self() is stable across calls", pthread_equal(self1, self2));
+    }
+
+    t_begin("pthread_once(): init_routine runs exactly once across 3 calls");
+    {
+        pthread_once_t once = PTHREAD_ONCE_INIT;
+        pthread_once(&once, once_routine);
+        pthread_once(&once, once_routine);
+        pthread_once(&once, once_routine);
+        check_int("once_routine() ran exactly 1 time", 1, g_once_call_count);
+    }
+
+    t_begin("pthread_key_create()/setspecific()/getspecific()/key_delete()");
+    {
+        pthread_key_t key;
+        check_int("pthread_key_create()", 0, pthread_key_create(&key, NULL));
+        int value = 1234;
+        check_int("pthread_setspecific()", 0, pthread_setspecific(key, &value));
+        void *got = pthread_getspecific(key);
+        check_true("pthread_getspecific() returns the real stored pointer", got == &value);
+        check_int("pthread_key_delete()", 0, pthread_key_delete(key));
+    }
+}
+
 /* ------------------------------------------------------------------ file I/O */
 
 static void section_file_io(void)
@@ -311,6 +414,7 @@ int main(void)
     section_math();
     section_setjmp();
     section_iconv();
+    section_pthread();
     section_file_io();
 
     printf("\n=== %d/%d passed", g_pass, g_num);

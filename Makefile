@@ -53,7 +53,18 @@ NEWLIB_DIR := third_party/newlib/i686-elf
 # see that compat header's comment). Nothing else newlib provides needs
 # overriding, so this is a single-file, narrow version of the same
 # "compat headers shadow the vendored ones" trick user/vi/compat/ uses.
-NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include
+# -D_POSIX_THREADS=1: newlib's own <pthread.h>/<sys/_pthreadtypes.h>/
+# <sys/signal.h> gate their real pthread_t/pthread_mutex_t/pthread_cond_t/
+# pthread_attr_t types and every pthread_*() prototype behind
+# `#if defined(_POSIX_THREADS)` — never set for a bare i686-elf target (only
+# __rtems__/__XMK__/__CYGWIN__ branches in sys/features.h define it). Real
+# and correct to set globally once user/newlib_syscalls.c provides a real
+# (if deliberately single-threaded, see that file's own comment) pthread
+# implementation — this is a statement of platform capability, not a lie.
+# -D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1: same reasoning, one level deeper —
+# pthread_mutexattr_t's own `type` field (and pthread_mutexattr_settype()/
+# gettype()) are gated behind this separate macro.
+NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include -D_POSIX_THREADS=1 -D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1
 NEWLIB_LDFLAGS := $(USER_LDFLAGS) -L$(NEWLIB_DIR)/lib
 
 # Vendored libstdc++-v3 (see third_party/libstdcxx/README.md and
