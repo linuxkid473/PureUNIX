@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <grp.h>
+#include <iconv.h>
 #include <limits.h>
 #include <poll.h>
 #include <pwd.h>
@@ -37,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -2731,4 +2733,106 @@ void *pu_fb_mmap(void)
 int pu_pty_create(int fds[2])
 {
     return raw_syscall(PU_SYS_PTY_CREATE, (int)fds, 0, 0);
+}
+
+/* ---- iconv (<iconv.h>) ----
+ *
+ * newlib's own configure.host has no case for this bare i686-elf target,
+ * so <iconv.h> is declared (see third_party/newlib/i686-elf/include/
+ * iconv.h) but never actually implemented anywhere in the vendored
+ * libc.a — a real gap, not a subtle one (confirmed: `nm libc.a` has zero
+ * iconv_open/iconv/iconv_close symbols at all). GLib (docs/pcmanfm-
+ * port.md) uses iconv() pervasively for charset conversion, so this port
+ * needs a real one.
+ *
+ * Deliberately narrow, not a general iconv: this whole system only ever
+ * runs in a single, fixed UTF-8 locale (there is no locale database, no
+ * setlocale() beyond the "C" default — see the recurring "Detected locale
+ * \"C\" ... not UTF-8" warning throughout docs/qt-port.md) and every
+ * string that will ever actually flow through this function already *is*
+ * UTF-8 (or a strict subset of it, ASCII). So the only conversion that
+ * can ever genuinely be needed here is UTF-8-family-to-UTF-8-family,
+ * which is a real, correct identity/passthrough — not a lie standing in
+ * for iconv's full multi-charset-table behavior, which this platform has
+ * no real use for and no locale data to back anyway. Any other charset
+ * pair is rejected with a real errno, exactly like a real iconv() report-
+ * ing "I don't have this conversion" — not silently mistranslated.
+ */
+
+/* iconv_t is just `void *` on this newlib (sys/_types.h's _iconv_t) — a
+ * real per-conversion descriptor isn't needed since there's only one
+ * supported conversion "kind" (identity), so this sentinel is the only
+ * value iconv_open() below ever hands back. */
+#define PU_ICONV_UTF8_IDENTITY ((iconv_t)1)
+
+/* True for every charset name this platform can genuinely treat as
+ * "already UTF-8 compatible bytes": real UTF-8 (spelled a few common
+ * ways) and 7-bit ASCII (a strict subset of UTF-8, so passthrough is
+ * still a correct, not approximate, identity conversion for it) — plus
+ * the couple of POSIX default-locale spellings glib's own locale-
+ * detection code can plausibly ask for on a system with no locale
+ * database (see this function's own header comment). Anything else is
+ * honestly unsupported, not silently mistranslated. */
+static bool pu_iconv_charset_is_utf8_compatible(const char *name)
+{
+    static const char *const compatible[] = {
+        "UTF-8", "UTF8", "ASCII", "US-ASCII", "ANSI_X3.4-1968", "C", "POSIX",
+    };
+    for (size_t i = 0; i < sizeof(compatible) / sizeof(compatible[0]); i++) {
+        if (strcasecmp(name, compatible[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+iconv_t iconv_open(const char *tocode, const char *fromcode)
+{
+    if (!tocode || !fromcode ||
+        !pu_iconv_charset_is_utf8_compatible(tocode) ||
+        !pu_iconv_charset_is_utf8_compatible(fromcode)) {
+        errno = EINVAL;
+        return (iconv_t)-1;
+    }
+    return PU_ICONV_UTF8_IDENTITY;
+}
+
+size_t iconv(iconv_t cd, char **restrict inbuf, size_t *restrict inbytesleft,
+             char **restrict outbuf, size_t *restrict outbytesleft)
+{
+    if (cd != PU_ICONV_UTF8_IDENTITY) {
+        errno = EBADF;
+        return (size_t)-1;
+    }
+    /* POSIX: inbuf == NULL or *inbuf == NULL resets conversion state and
+     * returns 0 — the only "state" this identity conversion ever has is
+     * none, so this is trivially already satisfied either way. */
+    if (!inbuf || !*inbuf) {
+        return 0;
+    }
+    size_t n = *inbytesleft < *outbytesleft ? *inbytesleft : *outbytesleft;
+    memcpy(*outbuf, *inbuf, n);
+    *inbuf += n;
+    *inbytesleft -= n;
+    *outbuf += n;
+    *outbytesleft -= n;
+    if (*inbytesleft > 0) {
+        /* Real POSIX behavior: output exhausted before input — copy as
+         * much as fits (already done above) and report E2BIG so the
+         * caller knows to supply more output space and call again. */
+        errno = E2BIG;
+        return (size_t)-1;
+    }
+    /* 0 irreversible (non-identical) conversions performed — a real,
+     * accurate count for this identity conversion, not a placeholder. */
+    return 0;
+}
+
+int iconv_close(iconv_t cd)
+{
+    if (cd != PU_ICONV_UTF8_IDENTITY) {
+        errno = EBADF;
+        return -1;
+    }
+    return 0;
 }

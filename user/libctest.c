@@ -13,6 +13,8 @@
  * numbered, a failure never stops the run, and a summary prints at the end.
  */
 #include <ctype.h>
+#include <errno.h>
+#include <iconv.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -216,6 +218,47 @@ static void section_setjmp(void)
     }
 }
 
+/* ------------------------------------------------------------------ iconv */
+
+/* Real narrow iconv() (user/newlib_syscalls.c, added for the PCManFM-Qt
+ * port's GLib dependency, docs/pcmanfm-port.md) — UTF-8-family identity
+ * conversion only, real EINVAL for anything else. Exercises the actual
+ * public API (iconv_open/iconv/iconv_close), not the internal helper. */
+static void section_iconv(void)
+{
+    iconv_t cd = iconv_open("UTF-8", "UTF-8");
+    check_true("iconv_open(UTF-8, UTF-8) succeeds", cd != (iconv_t)-1);
+
+    char src[] = "Hello, PureUnix! \xc3\xa9\xc3\xa8"; /* includes real 2-byte UTF-8 (é, è) */
+    char dst[64];
+    char *inp = src;
+    char *outp = dst;
+    size_t inleft = strlen(src);
+    size_t outleft = sizeof(dst);
+    size_t rc = iconv(cd, &inp, &inleft, &outp, &outleft);
+    check_true("iconv() identity conversion returns 0 (no irreversible conversions)", rc == 0);
+    check_int("iconv() consumed all input bytes", 0, (int)inleft);
+    *outp = '\0';
+    check_true("iconv() output byte-for-byte identical to input", strcmp(dst, src) == 0);
+
+    iconv_close(cd);
+
+    iconv_t bad = iconv_open("ISO-8859-1", "UTF-8");
+    check_true("iconv_open() correctly rejects an unsupported real charset (ISO-8859-1)", bad == (iconv_t)-1);
+
+    char small_src[] = "0123456789";
+    char small_dst[4];
+    iconv_t cd2 = iconv_open("UTF-8", "UTF-8");
+    char *inp2 = small_src;
+    char *outp2 = small_dst;
+    size_t inleft2 = strlen(small_src);
+    size_t outleft2 = sizeof(small_dst);
+    size_t rc2 = iconv(cd2, &inp2, &inleft2, &outp2, &outleft2);
+    check_true("iconv() with too-small output buffer reports E2BIG", rc2 == (size_t)-1 && errno == E2BIG);
+    check_int("iconv() still copied as much as fit in the output buffer", 0, (int)outleft2);
+    iconv_close(cd2);
+}
+
 /* ------------------------------------------------------------------ file I/O */
 
 static void section_file_io(void)
@@ -267,6 +310,7 @@ int main(void)
     section_ctype();
     section_math();
     section_setjmp();
+    section_iconv();
     section_file_io();
 
     printf("\n=== %d/%d passed", g_pass, g_num);

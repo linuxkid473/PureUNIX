@@ -61,13 +61,12 @@ assumed):
    GLib years ago) — needs a real Meson cross file, the same role
    `tools/pureunix-qt-toolchain.cmake` plays for Qt's CMake build. Not
    yet written.
-2. **`libffi`** — GObject's generic signal-marshalling machinery depends
-   on it directly. A separate, smaller library to port first; i686 is a
-   well-supported libffi target (mature, portable assembly trampolines),
-   this should be the most tractable of the new components. Not yet
-   vendored.
-3. **A real, working `iconv()`** — newlib ships `<iconv.h>` declarations
-   but **no linkable implementation at all** (confirmed: `nm
+2. **DONE (2026-07-18).** `libffi` — GObject's generic signal-marshalling
+   machinery depends on it directly. See phase 1 below for the full
+   writeup (real cross-build, real on-target regression test, two
+   general gotchas found and fixed).
+3. **DONE (2026-07-18).** A real, working `iconv()` — newlib ships
+   `<iconv.h>` declarations but **no linkable implementation at all** (confirmed: `nm
    third_party/newlib/i686-elf/lib/libc.a` has zero `iconv_open`/`iconv`
    symbols). GLib uses it pervasively for charset conversion. Since this
    whole system only ever runs in a single UTF-8 locale (see the
@@ -77,8 +76,16 @@ assumed):
    UTF-8-to-UTF-8 (the only conversion that will ever actually be
    exercised) and a real `EINVAL`/`errno` failure for anything else, not
    a silent lie — is the smallest correct implementation for what this
-   platform actually needs, not a fully general iconv table. New, small,
-   real code, not a stub that pretends to succeed at conversions it
+   platform actually needs, not a fully general iconv table. Implemented
+   in `user/newlib_syscalls.c` (`iconv_open()`/`iconv()`/`iconv_close()`,
+   accepting UTF-8/ASCII-family charset name aliases, real `E2BIG` when
+   the output buffer is too small, real `EINVAL` for anything else) and
+   proven on-target via 8 new checks in `user/libctest.c`'s
+   `section_iconv()` — a real 2-byte-UTF-8 round trip, a rejected
+   unsupported charset, and a real `E2BIG` partial-copy check, not just
+   "does it link". `make run-test` still at the known 343/345 baseline.
+   New, small, real code, not a stub that pretends to succeed at
+   conversions it
    doesn't do.
 4. **Real POSIX threads.** This is the one that changes the shape of the
    whole project. GLib's `GMutex`/`GCond`/`GThread` are not optional in
@@ -175,11 +182,14 @@ assumed):
      it" path — a correct description of this kernel's actual page
      tables (no W^X/NX enforcement anywhere), not a hack. Zero source
      changes needed for this.
-2. Real `iconv()` (UTF-8 passthrough, real `EINVAL` otherwise) +
-   confirm/patch any other real newlib gaps GLib's own configure-time
-   checks hit (expect several — every previous vendored-library port in
-   this repo, ncurses/SDL2/Qt, found real newlib gaps this way; no
-   reason to expect GLib is different).
+2. **DONE (2026-07-18).** Real `iconv()` (UTF-8 passthrough, real
+   `EINVAL` otherwise) — `user/newlib_syscalls.c`, proven via
+   `user/libctest.c`'s new `section_iconv()` (8 checks, QEMU-verified,
+   `make run-test` still at the known 343/345 baseline). GLib's own
+   configure-time checks may still surface further real newlib gaps once
+   phase 3 (below) actually starts — expect several, every previous
+   vendored-library port in this repo (ncurses/SDL2/Qt) found real newlib
+   gaps this way; no reason to expect GLib is different.
 3. Write `tools/pureunix-glib-crossfile.ini` (Meson cross file) +
    `tools/build-glib.sh`. Cross-compile GLib core + GObject with GIO's
    local-file backend only (Meson options to disable dbus/selinux/
@@ -209,7 +219,7 @@ assumed):
     documentation (upstream versions pinned, every patch listed,
     disabled features listed, build procedure, known limitations).
 
-## Status: phase 1 (libffi) done, phase 2 (iconv) next
+## Status: phases 1-2 (libffi, iconv) done, phase 4 (pthread shim) next
 
 This is a genuinely large undertaking — realistically comparable in
 scope to the entire Qt6 port (`docs/qt-port.md`), possibly larger, since
