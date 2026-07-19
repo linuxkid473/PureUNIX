@@ -141,6 +141,11 @@ enum {
     PU_SYS_STATFS = 65,
     PU_SYS_SET_TLS = 66,
     PU_SYS_POLL = 67,
+    PU_SYS_SOCKET = 68,
+    PU_SYS_BIND = 69,
+    PU_SYS_LISTEN = 70,
+    PU_SYS_ACCEPT = 71,
+    PU_SYS_CONNECT = 72,
 };
 
 /* Mirrors arch/i386/syscall.c's SYS_POLL wire struct exactly (int32_t fd +
@@ -3642,68 +3647,78 @@ int res_query(const char *dname, int dnsclass, int type,
 const struct in6_addr in6addr_any = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
 const struct in6_addr in6addr_loopback = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
 
+/* socket()/bind()/listen()/accept()/connect(): real for AF_UNIX/
+ * SOCK_STREAM (kernel/unix_socket.c, added for the PCManFM-Qt port's
+ * MenuCache dependency — its real menu-cache-daemon listens on exactly
+ * this kind of socket; see docs/pcmanfm-port.md phase 6 and
+ * include/pureunix/syscall.h's own SYS_SOCKET/.../SYS_CONNECT comment
+ * for the full design). AF_INET/AF_INET6 remain the honest ENOSYS stub
+ * documented just above this function — this is local-IPC-only, not a
+ * real network stack. */
 int socket(int domain, int type, int protocol)
 {
-    (void)domain;
-    (void)type;
-    (void)protocol;
-    errno = ENOSYS;
-    return -1;
+    if (domain != AF_UNIX || type != SOCK_STREAM || protocol != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int r = raw_syscall(PU_SYS_SOCKET, domain, type, protocol);
+    return r < 0 ? fail(r) : r;
 }
 
 int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    (void)fd;
-    (void)addr;
     (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!addr || addr->sa_family != AF_UNIX) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int r = raw_syscall(PU_SYS_CONNECT, fd, (int)addr, 0);
+    return r < 0 ? fail(r) : r;
 }
 
 int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
-    (void)fd;
-    (void)addr;
     (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!addr || addr->sa_family != AF_UNIX) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int r = raw_syscall(PU_SYS_BIND, fd, (int)addr, 0);
+    return r < 0 ? fail(r) : r;
 }
 
 int listen(int fd, int backlog)
 {
-    (void)fd;
-    (void)backlog;
-    errno = ENOSYS;
-    return -1;
+    int r = raw_syscall(PU_SYS_LISTEN, fd, backlog, 0);
+    return r < 0 ? fail(r) : r;
 }
 
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 {
-    (void)fd;
-    (void)addr;
-    (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    /* Real AF_UNIX accept() reports no peer address (an anonymous
+     * client, matching real Linux/BSD getpeername() behavior on a
+     * connected-but-never-bound AF_UNIX client socket) — honest, not
+     * fabricated: this kernel's connect() never records a client-side
+     * bind path at all (see kernel/unix_socket.c's own comment on why
+     * accept()'d sockets have no path), so there is nothing real to
+     * report here. */
+    if (addr && addrlen) {
+        *addrlen = 0;
+    }
+    int r = raw_syscall(PU_SYS_ACCEPT, fd, 0, 0);
+    return r < 0 ? fail(r) : r;
 }
 
 long recv(int fd, void *buf, size_t len, int flags)
 {
-    (void)fd;
-    (void)buf;
-    (void)len;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    return read(fd, buf, len);
 }
 
 long send(int fd, const void *buf, size_t len, int flags)
 {
-    (void)fd;
-    (void)buf;
-    (void)len;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    return write(fd, buf, len);
 }
 
 long recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)

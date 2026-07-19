@@ -1,0 +1,10 @@
+# Runs the real libexif regression test (user/libexiftest.c) from a
+# freshly booted VT1 shell and waits for its final summary line — proves
+# the vendored libexif cross-build (third_party/libexif/i686-elf,
+# tools/build-libexif.sh, docs/pcmanfm-port.md phase 6) actually works at
+# runtime, not just links: exif_data_new_from_file() genuinely parses a
+# real camera JPEG's EXIF tags (Make/Model) via fopen()/fread().
+WAIT #\s*$
+TYPE /bin/libexiftest.elf
+WAIT libexiftest: (\d+)/\1 passed
+SLEEP 1

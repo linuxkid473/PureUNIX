@@ -19,6 +19,7 @@
 #include <pureunix/termios.h>
 #include <pureunix/time.h>
 #include <pureunix/tty.h>
+#include <pureunix/unix_socket.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vga.h>
 #include <pureunix/vmm.h>
@@ -395,6 +396,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_write(f, buf, len);
         }
+        if (f->kind == FD_KIND_SOCKET) {
+            return (uint32_t)unix_socket_write(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
+        }
         if (f->kind == FD_KIND_PTY) {
             int r = f->pty_is_master ? pty_master_write(f->pty, buf, len)
                                        : pty_slave_write(f->pty, buf, len);
@@ -473,6 +477,9 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
 
         if (f->kind == FD_KIND_PIPE) {
             return (uint32_t)pipe_read(f, buf, len);
+        }
+        if (f->kind == FD_KIND_SOCKET) {
+            return (uint32_t)unix_socket_read(f->usock, buf, len, (f->flags & O_NONBLOCK) != 0);
         }
         if (f->kind == FD_KIND_PTY) {
             int r = f->pty_is_master ? pty_master_read(f->pty, buf, len)
@@ -1929,6 +1936,116 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
             pit_sleep(10);
             elapsed_ms += 10;
         }
+    }
+    /* ---- Real AF_UNIX domain sockets (kernel/unix_socket.c) ----
+     * See include/pureunix/syscall.h's own SYS_SOCKET/.../SYS_CONNECT
+     * comment for the full rationale/wire layout. AF_UNIX/SOCK_STREAM
+     * values below must match user/newlib_compat/sys/socket.h's own
+     * AF_UNIX=1/SOCK_STREAM=1 exactly (the kernel has no <sys/socket.h>
+     * of its own to pull these from, same situation as SYS_POLL's own
+     * POLLIN/POLLOUT constants just above). */
+    case SYS_SOCKET: {
+        enum { PU_AF_UNIX = 1, PU_SOCK_STREAM = 1 };
+        int domain = (int)regs->ebx;
+        int type = (int)regs->ecx;
+        int protocol = (int)regs->edx;
+        if (domain != PU_AF_UNIX) {
+            return (uint32_t)-EAFNOSUPPORT;
+        }
+        if (type != PU_SOCK_STREAM || protocol != 0) {
+            return (uint32_t)-EPROTOTYPE;
+        }
+        task_t *t = task_current();
+        int fd = find_free_fd(t, 0);
+        if (fd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+        unix_socket_t *s = unix_socket_alloc();
+        open_file_t *f = open_file_alloc(FD_KIND_SOCKET);
+        if (!s || !f) {
+            unix_socket_unref(s);
+            if (f) {
+                f->refcount = 0;
+            }
+            return (uint32_t)-ENOMEM;
+        }
+        f->usock = s;
+        t->fds[fd].used = true;
+        t->fds[fd].closed_explicitly = false;
+        t->fds[fd].cloexec = false;
+        t->fds[fd].file = f;
+        return (uint32_t)fd;
+    }
+    case SYS_BIND: {
+        int fd = (int)regs->ebx;
+        const struct sockaddr_un_wire { uint16_t sun_family; char sun_path[108]; } *addr =
+            (const struct sockaddr_un_wire *)regs->ecx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_SOCKET) {
+            return (uint32_t)-EBADF;
+        }
+        if (!addr) {
+            return (uint32_t)-EINVAL;
+        }
+        char path[PUREUNIX_MAX_PATH];
+        strncpy(path, addr->sun_path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        return (uint32_t)unix_socket_bind(t->fds[fd].file->usock, path);
+    }
+    case SYS_LISTEN: {
+        int fd = (int)regs->ebx;
+        int backlog = (int)regs->ecx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_SOCKET) {
+            return (uint32_t)-EBADF;
+        }
+        return (uint32_t)unix_socket_listen(t->fds[fd].file->usock, backlog);
+    }
+    case SYS_ACCEPT: {
+        int fd = (int)regs->ebx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_SOCKET) {
+            return (uint32_t)-EBADF;
+        }
+        int newfd = find_free_fd(t, 0);
+        if (newfd < 0) {
+            return (uint32_t)-EMFILE;
+        }
+        unix_socket_t *accepted = unix_socket_accept(t->fds[fd].file->usock);
+        if (!accepted) {
+            return (uint32_t)-EINVAL;
+        }
+        open_file_t *nf = open_file_alloc(FD_KIND_SOCKET);
+        if (!nf) {
+            unix_socket_unref(accepted);
+            return (uint32_t)-ENOMEM;
+        }
+        nf->usock = accepted;
+        t->fds[newfd].used = true;
+        t->fds[newfd].closed_explicitly = false;
+        t->fds[newfd].cloexec = false;
+        t->fds[newfd].file = nf;
+        return (uint32_t)newfd;
+    }
+    case SYS_CONNECT: {
+        int fd = (int)regs->ebx;
+        const struct sockaddr_un_wire { uint16_t sun_family; char sun_path[108]; } *addr =
+            (const struct sockaddr_un_wire *)regs->ecx;
+        task_t *t = task_current();
+        if (fd < 0 || fd >= MAX_OPEN_FILES || !t->fds[fd].used || !t->fds[fd].file ||
+            t->fds[fd].file->kind != FD_KIND_SOCKET) {
+            return (uint32_t)-EBADF;
+        }
+        if (!addr) {
+            return (uint32_t)-EINVAL;
+        }
+        char path[PUREUNIX_MAX_PATH];
+        strncpy(path, addr->sun_path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        return (uint32_t)unix_socket_connect(t->fds[fd].file->usock, path);
     }
     case SYS_GETTIMEOFDAY: {
         uint32_t *out = (uint32_t *)regs->ebx;

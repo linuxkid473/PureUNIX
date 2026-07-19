@@ -1,0 +1,11 @@
+# Runs the real AF_UNIX kernel socket subsystem test (user/unixsocktest.c)
+# from a freshly booted VT1 shell and waits for its final summary line —
+# proves the new kernel/unix_socket.c primitive (docs/pcmanfm-port.md
+# phase 6 — added to make MenuCache's real menu-cache-daemon actually
+# work) genuinely works at runtime: real socket()/bind()/listen()/
+# accept()/connect() and real bidirectional byte transfer across a real
+# fork()'d client/server pair.
+WAIT #\s*$
+TYPE /bin/unixsocktest.elf
+WAIT unixsocktest: (\d+)/\1 passed
+SLEEP 1

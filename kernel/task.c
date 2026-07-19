@@ -9,6 +9,7 @@
 #include <pureunix/string.h>
 #include <pureunix/task.h>
 #include <pureunix/time.h>
+#include <pureunix/unix_socket.h>
 #include <pureunix/vfs.h>
 #include <pureunix/vmm.h>
 #include <pureunix/vt.h>
@@ -147,6 +148,13 @@ int open_file_unref(open_file_t *f)
                 kfree(p);
             }
         }
+    } else if (f->kind == FD_KIND_SOCKET) {
+        /* Real AF_UNIX socket end (include/pureunix/unix_socket.h) —
+         * unix_socket_unref() itself handles waking a connected peer's
+         * blocked reader/writer (EOF/EPIPE) and reclaiming the pool
+         * slot, exactly like pty_master_unref()/pty_slave_unref() just
+         * below. */
+        unix_socket_unref(f->usock);
     } else if (f->kind == FD_KIND_PTY) {
         /* Real PTY pair (include/pureunix/pty.h) — the pty_t itself lives
          * in kernel/pty.c's own fixed pool (not kmalloc'd), so there's

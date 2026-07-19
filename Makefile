@@ -490,6 +490,52 @@ $(GLIBTEST_ELF): $(BUILD)/user/glibtest.o $(BUILD)/user/newlib_crt0_asm.o $(BUIL
 		-Wl,--start-group -lgio-2.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lgthread-2.0 \
 		-lintl -lz -lpcre2-8 -lffi -lc -lm -Wl,--end-group -lgcc -o $@
 
+# libexif (docs/pcmanfm-port.md phase 6 — third new dependency, needed by
+# libfm-qt for JPEG EXIF orientation). Vendored via tools/build-libexif.sh,
+# same pattern as libffi/PCRE2 above. By far the easiest of the three: no
+# GLib, no pthread, no IPC — pure fopen()/fread() byte parsing.
+LIBEXIF_DIR := third_party/libexif/i686-elf
+LIBEXIF_CFLAGS := $(NEWLIB_CFLAGS) -isystem $(LIBEXIF_DIR)/include
+LIBEXIF_LDFLAGS := $(NEWLIB_LDFLAGS) -L$(LIBEXIF_DIR)/lib
+# Real fixture for user/libexiftest.c — a real camera-shot JPEG with a
+# genuine Pentax MakerNote, already committed as part of libexif's own
+# vendored upstream test suite (not duplicated into extra-files/, which
+# is a local-only, gitignored staging dir — see .gitignore's own
+# comment).
+LIBEXIF_TEST_JPG := third_party/libexif/libexif-0.6.26/test/testdata/pentax_makernote_variant_2.jpg
+
+$(BUILD)/user/libexiftest.o: user/libexiftest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(LIBEXIF_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/libexiftest.d
+
+LIBEXIFTEST_ELF := $(BUILD)/user/libexiftest.elf
+
+$(LIBEXIFTEST_ELF): $(BUILD)/user/libexiftest.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LIBEXIF_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/libexiftest.o \
+		-Wl,--start-group -lexif -lc -lm -Wl,--end-group -lgcc -o $@
+
+# Real AF_UNIX kernel socket subsystem test (kernel/unix_socket.c,
+# docs/pcmanfm-port.md phase 6 — added to make MenuCache's real
+# menu-cache-daemon actually work, not just link). Plain newlib, no
+# extra library dependency.
+UNIXSOCKTEST_ELF := $(BUILD)/user/unixsocktest.elf
+
+$(BUILD)/user/unixsocktest.o: user/unixsocktest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/unixsocktest.d
+
+$(UNIXSOCKTEST_ELF): $(BUILD)/user/unixsocktest.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/unixsocktest.o \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
 $(BUILD)/user/ncdemo.o: user/ncdemo.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(NCURSES_CFLAGS) -MMD -MP -c $< -o $@
@@ -1033,7 +1079,7 @@ $(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_as
 
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -1373,9 +1419,9 @@ EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubs
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(LIBEXIF_TEST_JPG) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 disk: $(DISK) $(DISK2)
 
@@ -1386,9 +1432,9 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(LIBEXIF_TEST_JPG) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the

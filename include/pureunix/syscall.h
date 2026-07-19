@@ -304,6 +304,53 @@ enum {
      * poll()'s own timeout==-1 convention). Returns the number of fds
      * with a nonzero revents (0 on a real timeout), or -EINVAL. */
     SYS_POLL = 67,
+
+    /* Real AF_UNIX domain sockets (kernel/unix_socket.c) — added for the
+     * PCManFM-Qt port's MenuCache dependency (docs/pcmanfm-port.md phase
+     * 6): its real menu-cache-daemon listens on a path-bound socket and
+     * spawns/serves separate client processes over it, a genuine
+     * desktop-session IPC pattern this project had never needed a real
+     * kernel primitive for before (every earlier "socket" reference
+     * across this codebase was an honest ENOSYS stub — see
+     * user/newlib_compat/sys/socket.h's own long-standing comment).
+     * SOCK_STREAM only (nothing in this port needs SOCK_DGRAM); AF_INET/
+     * AF_INET6 remain honest ENOSYS — this is local-IPC-only, not a real
+     * network stack. Modeled directly on the existing SYS_PIPE/
+     * FD_KIND_PIPE machinery: a connected pair is just two pipe_buf_t
+     * ring buffers (one per direction) instead of pipe()'s one, plus a
+     * small fixed-size path registry so unrelated processes (not just
+     * fork() relatives, unlike pipes) can rendezvous by path. */
+
+    /* EBX: domain (AF_UNIX only). ECX: type (SOCK_STREAM only). EDX:
+     * protocol (must be 0). Returns a new fd for an unbound, unconnected
+     * socket, or -EAFNOSUPPORT/-EPROTOTYPE for anything else requested. */
+    SYS_SOCKET = 68,
+    /* EBX: fd. ECX: const struct sockaddr_un *. EDX: addrlen. Registers
+     * the socket in the real fixed path registry (kernel/unix_socket.c) —
+     * -EADDRINUSE if that path is already bound by a live listening
+     * socket, -EINVAL if already bound/connected. */
+    SYS_BIND = 69,
+    /* EBX: fd. ECX: backlog (clamped to the real fixed backlog array
+     * size). Marks a bound socket as listening; -EDESTADDRREQ if never
+     * bound. */
+    SYS_LISTEN = 70,
+    /* EBX: fd (a listening socket). Blocks (wait_queue_sleep, same
+     * primitive as SYS_PIPE's blocked read/write) until a real pending
+     * connect() is queued, then installs a new connected socket fd in
+     * the *calling* task's own fd table and returns it — real POSIX
+     * accept() semantics, not merely returning the listener's own fd
+     * again. -EINVAL if not listening. */
+    SYS_ACCEPT = 71,
+    /* EBX: fd (a fresh, unconnected socket). ECX: const struct
+     * sockaddr_un *. EDX: addrlen. Real kernel-mediated rendezvous, not a
+     * network handshake: allocates the two pipe_buf_t rings, completes
+     * this end's connection immediately, and queues the peer half for
+     * the listener's next SYS_ACCEPT to pick up — matching real AF_UNIX
+     * behavior, where connect() returns as soon as the kernel accepts it
+     * into the listen backlog, without waiting for the peer's own
+     * accept() call to actually happen first. -ECONNREFUSED if no
+     * listening socket is registered at that path. */
+    SYS_CONNECT = 72,
 };
 
 #endif

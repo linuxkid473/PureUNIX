@@ -357,6 +357,55 @@ assumed):
    data, 9 new on-target checks in `user/libctest.c`).
 5. Vendor `MenuCache` + `libexif` (both much smaller, more
    conventional C libraries — lower risk than GLib itself).
+   - **libexif — DONE (2026-07-19).** Vendored 0.6.26
+     (`third_party/libexif/i686-elf/`, `tools/build-libexif.sh`) — no
+     GLib, no pthread, no IPC, pure `fopen()`/`fread()` byte parsing, by
+     far the easiest dependency in this whole port. Real on-target test
+     `user/libexiftest.c` (7/7 passed, QEMU-verified) genuinely parses a
+     real camera JPEG's EXIF `Make`/`Model` tags via
+     `exif_data_new_from_file()` against a real fixture
+     (`extra-files/pentax-exif-test.jpg`, from libexif's own upstream
+     test suite) — not just a link check.
+   - **libfm-extra (MenuCache's own bootstrap dependency) — DONE
+     (2026-07-19).** libfm 1.3.2's real, upstream-documented
+     `--with-extra-only` circular-dependency workaround (libmenu-cache's
+     `menu-cache-gen` tool needs it; libfm itself needs libmenu-cache) —
+     vendored 1.3.2 (not the newer 1.4.1 git tag, which has no published
+     release tarball and would need gtk-doc/intltool host tools to
+     bootstrap from `configure.ac`), `third_party/libfm-extra/i686-elf/`,
+     `tools/build-libfm-extra.sh`. Needed `intltool` installed on the
+     host (a real build-time tool dependency, not a target one) and one
+     new real vendored header,
+     `user/newlib_compat/libintl.h` — verbatim upstream
+     `github.com/frida/proxy-libintl` (tag 0.5, the exact version Meson
+     already auto-selected as GLib's own `intl` dependency fallback
+     during phase 3) — `tools/build-glib.sh`'s own vendoring step never
+     captured this one public header even though the real, linkable
+     `libintl.a` was already there.
+   - **Real new AF_UNIX kernel socket subsystem — DONE (2026-07-19), see
+     `docs/pcmanfm-port.md`'s own companion memory
+     `project_af_unix_sockets` for the full writeup.** Discovered mid-way
+     through researching MenuCache's real architecture: its
+     `menu-cache-daemon` genuinely listens on a path-bound `AF_UNIX`
+     socket for unrelated client processes to `connect()` to — every
+     earlier "socket" reference in this codebase (since the BusyBox
+     port) had been an honest `ENOSYS` stub. User explicitly chose to
+     implement this for real (a genuine new kernel subsystem, not a
+     userspace port) rather than deferring the daemon as a disclosed
+     limitation. New `include/pureunix/unix_socket.h` +
+     `kernel/unix_socket.c` (`SOCK_STREAM` only — modeled directly on
+     the existing `SYS_PIPE`/`kernel/pty.c` machinery: a connected pair
+     is just two `pipe_buf_t` rings, one per direction, plus a small
+     fixed pool + path registry), 5 new syscalls (`SYS_SOCKET`/
+     `SYS_BIND`/`SYS_LISTEN`/`SYS_ACCEPT`/`SYS_CONNECT` = 68-72), new
+     `FD_KIND_SOCKET`. Real bug found by the new on-target test
+     (`user/unixsocktest.c`, 9/9 passed after the fix): all 5 new
+     userspace wrapper functions initially called the shared `fail()`
+     helper unconditionally instead of only on `r < 0`, silently
+     converting every real success into a fabricated failure — caught
+     immediately by testing in QEMU rather than trusting a clean
+     compile+link. `make run-test` still at the known 343/345 baseline;
+     zero regressions from adding an entirely new kernel subsystem.
 6. Patch out the one XCB-dependent file (`xdndworkaround.cpp`) in
    `libfm-qt` — smallest real patch in this whole port, disables exactly
    one X11-specific drag-and-drop compatibility feature that has no
@@ -373,15 +422,19 @@ assumed):
     documentation (upstream versions pinned, every patch listed,
     disabled features listed, build procedure, known limitations).
 
-## Status: phases 1-2-3-4-5 all done (libffi, iconv, GLib/GObject/GIO, pthread shim, pcre2); phase 6 (MenuCache + libexif) next
+## Status: phases 1-5 all done; phase 6 in progress (libexif done, libfm-extra bootstrap done, real AF_UNIX kernel sockets done; MenuCache gen/daemon/client itself next)
 
 GLib/GObject/GIO (phase 3) turned out to be, as expected, the largest
 single undertaking in this port so far — comparable to the entire Qt6
 port (`docs/qt-port.md`) in the sheer number of real platform gaps
-found and fixed, all documented in phase 3's own entry above. With it
-done, the remaining phases (MenuCache, libexif, the one XCB patch,
-libfm-qt itself, then pcmanfm-qt itself) are all much smaller,
-conventional C/C++ libraries — lower risk than GLib itself, following
-the same incremental methodology that got Qt6 and now GLib itself
-working: each phase gets its own real, working, tested artifact before
-moving to the next.
+found and fixed, all documented in phase 3's own entry above. Phase 6
+(MenuCache) turned out to have its own real, non-trivial piece — a
+genuine new AF_UNIX domain socket kernel subsystem, not just another
+userspace library port, needed for MenuCache's real daemon architecture
+(see phase 5's own entry above and `project_af_unix_sockets` memory) —
+but with libexif, libfm-extra, and that new socket primitive all done
+and QEMU-verified, the actual MenuCache library/daemon/generator build
+itself is next, followed by the one real XCB patch, then libfm-qt and
+pcmanfm-qt themselves. Each phase gets its own real, working, tested
+artifact before moving to the next, the same incremental methodology
+that got Qt6 and GLib themselves working.

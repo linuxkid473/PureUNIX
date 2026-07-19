@@ -32,4 +32,15 @@
 #define ENOLCK   37  /* no locks available (fcntl advisory-lock table exhausted) */
 #define ENODEV   19  /* no such device (SYS_FB_GETINFO/SYS_FB_BLIT with no framebuffer) */
 
+/* Real AF_UNIX socket errors (kernel/unix_socket.c) — numeric values
+ * matching newlib's own sys/errno.h exactly, same convention as every
+ * other code above. */
+#define EAFNOSUPPORT 106 /* address family not supported (SYS_SOCKET) */
+#define EPROTOTYPE   107 /* wrong socket type for the address family (SYS_SOCKET) */
+#define ECONNREFUSED 111 /* SYS_CONNECT found no listening socket at that path */
+#define EADDRINUSE   112 /* SYS_BIND: path already bound by a live listening socket */
+#define EDESTADDRREQ 121 /* SYS_LISTEN on a socket that was never bound */
+#define EISCONN      127 /* SYS_CONNECT/SYS_BIND/SYS_LISTEN on an already-connected socket */
+#define ENOTCONN     128 /* read/write on a socket that isn't connected yet */
+
 #endif

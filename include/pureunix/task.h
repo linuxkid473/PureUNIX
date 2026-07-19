@@ -29,9 +29,16 @@ typedef enum fd_kind {
      * represents, exactly like FD_KIND_PIPE's pipe_buf/pipe_is_write_end
      * above. Created only by SYS_PTY_CREATE. */
     FD_KIND_PTY = 4,
+    /* A real AF_UNIX domain socket end (include/pureunix/unix_socket.h,
+     * kernel/unix_socket.c) — `usock` names which one, exactly like
+     * FD_KIND_PIPE's pipe_buf/FD_KIND_PTY's pty above. Created by
+     * SYS_SOCKET (fresh, unconnected) or SYS_ACCEPT (fresh, already
+     * connected). */
+    FD_KIND_SOCKET = 5,
 } fd_kind_t;
 
 struct pty;
+struct unix_socket;
 
 /* Ring buffer shared by both ends of one pipe() call — allocated once per
  * pipe() (SYS_PIPE, arch/i386/syscall.c) and freed once both ends' last
@@ -105,6 +112,12 @@ typedef struct open_file {
      * the same `pty` pointer, exactly like FD_KIND_PIPE's pipe_buf above. */
     struct pty *pty;
     bool pty_is_master;
+
+    /* FD_KIND_SOCKET: the real AF_UNIX socket end this description
+     * represents (include/pureunix/unix_socket.h, kernel/
+     * unix_socket.c) — created fresh by either SYS_SOCKET or
+     * SYS_ACCEPT, exactly like FD_KIND_PTY's pty above. */
+    struct unix_socket *usock;
 } open_file_t;
 
 /* One slot in a task's file descriptor table. Slots 0/1/2 start out with
