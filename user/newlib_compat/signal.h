@@ -20,6 +20,24 @@ extern "C" {
 
 #include_next <signal.h>
 
+/* newlib's sys/signal.h defines sigaddset/sigdelset/sigemptyset/
+ * sigfillset/sigismember as BOTH real function declarations AND
+ * function-like macros of the same name (a real, deliberate glibc-style
+ * fast-path idiom) — but a macro-shadowed name breaks any C++ call site
+ * that qualifies it with `::` (e.g. `::sigemptyset(&mask)`, used by real
+ * upstream code like pcmanfm-qt's own signal-handling setup): the
+ * preprocessor still expands the macro first, leaving a bare `::`
+ * immediately followed by `(`, a hard syntax error ("expected
+ * id-expression before '(' token"). Undefining the macros here restores
+ * the real function declarations already present in the header above as
+ * the only way to call these — real definitions are in
+ * user/newlib_syscalls.c. */
+#undef sigaddset
+#undef sigdelset
+#undef sigemptyset
+#undef sigfillset
+#undef sigismember
+
 #ifndef SA_RESTART
 #define SA_RESTART   0x10000000
 #endif

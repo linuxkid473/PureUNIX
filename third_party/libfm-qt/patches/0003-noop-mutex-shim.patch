@@ -1,11 +1,21 @@
---- a/src/CMakeLists.txt	2026-07-19 20:31:12
-+++ b/src/CMakeLists.txt	2026-07-19 20:31:30
-@@ -172,8 +172,11 @@
+--- a/src/CMakeLists.txt	2026-07-19 21:24:50
++++ b/src/CMakeLists.txt	2026-07-19 21:26:57
+@@ -172,8 +172,21 @@
  # install(EXPORT)-ed. Guarding it behind XCB_FOUND (matching every other
  # XCB guard already added by that same patch) avoids ever passing the
  # empty string at all.
-+# pureunix-compat/mutex shadows the real (disabled) <mutex> for this
-+# target's own compiles only — see that file's own comment for why.
++# pureunix-compat/mutex (see that file's own comment) shadows the real
++# (disabled) <mutex> for THIS target's own compiles via the PRIVATE entry
++# below. But several of this library's own INSTALLED public headers
++# (folder.h, iconinfo.h, mimetype.h, ...) also do a plain `#include <mutex>`
++# -- any downstream consumer of this library (pcmanfm-qt itself) needs the
++# exact same shim on ITS OWN include path too, or it hits the identical
++# "'mutex' is not a member of 'std'" error the moment it includes one of
++# those headers. INTERFACE entries below (mirroring the existing
++# BUILD_INTERFACE/INSTALL_INTERFACE pair for the parent include dir)
++# propagate it to any real consumer automatically; see this patch's other
++# hunks for the matching install(FILES)/file(COPY) steps that put the
++# actual shim file at those two locations.
  target_include_directories(${LIBFM_QT_LIBRARY_NAME}
 -    PRIVATE "${Qt6Gui_PRIVATE_INCLUDE_DIRS}"
 +    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/pureunix-compat"
@@ -13,9 +23,34 @@
          core/legacy
      PUBLIC
          "${GLIB_INCLUDE_DIRS}"
+@@ -183,6 +196,8 @@
+     INTERFACE
+         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+         "$<BUILD_INTERFACE:${LIBFM_QT_INTREE_INCLUDE_DIR}>"
++        "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/libfm-qt6/pureunix-compat>"
++        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/pureunix-compat>"
+ )
+ 
+ target_compile_definitions(${LIBFM_QT_LIBRARY_NAME}
+@@ -208,6 +223,15 @@
+     FILES_MATCHING PATTERN "*.h"
+ )
+ 
++# pureunix-compat/mutex has no extension, so the *.h pattern above misses
++# it -- installed separately so real downstream consumers (pcmanfm-qt
++# itself) get it at the exact path the INTERFACE include dir above points
++# at.
++install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/pureunix-compat/mutex"
++    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/libfm-qt6/pureunix-compat"
++    COMPONENT Devel
++)
++
+ generate_export_header(${LIBFM_QT_LIBRARY_NAME}
+     EXPORT_MACRO_NAME LIBFM_QT_API
+ )
 --- /dev/null
 +++ b/src/pureunix-compat/mutex
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,55 @@
 +// Real, minimal drop-in for <mutex>'s std::mutex/std::lock_guard on
 +// PureUnix, where neither exists at all: libstdc++ was vendored with
 +// --disable-libstdcxx-threads (see tools/build-libstdcxx.sh's own
@@ -29,11 +64,18 @@
 +// mutual exclusion that can never actually be contended here — a real,
 +// correct no-op for this platform, not a fabricated stub.
 +//
-+// This header shadows the real (disabled) <mutex> for this target only:
-+// target_include_directories() below adds this directory as a plain -I
-+// entry, which GCC always searches before the toolchain's own -isystem
-+// libstdc++ path, regardless of ordering on the command line — so every
-+// `#include <mutex>` in this tree keeps working completely unmodified.
++// This header shadows the real (disabled) <mutex> for this target's own
++// compiles (src/CMakeLists.txt's PRIVATE target_include_directories entry
++// adds this directory as a plain -I entry, which GCC always searches
++// before the toolchain's own -isystem libstdc++ path, regardless of
++// ordering on the command line) AND for any real downstream consumer of
++// this library's installed headers, several of which also use
++// std::mutex/std::lock_guard directly (folder.h, iconinfo.h, mimetype.h,
++// thumbnailer.h, volumemanager.h, userinfocache.h, fileoperationjob.h,
++// dirlistjob.h) — propagated via this same target's INTERFACE
++// BUILD_INTERFACE/INSTALL_INTERFACE include-dir entries. Every
++// `#include <mutex>` anywhere in this tree (or in a consumer like
++// pcmanfm-qt) keeps working completely unmodified.
 +#ifndef PUREUNIX_LIBFMQT_MUTEX_SHIM
 +#define PUREUNIX_LIBFMQT_MUTEX_SHIM
 +

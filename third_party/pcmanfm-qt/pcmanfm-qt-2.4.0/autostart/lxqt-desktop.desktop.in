@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Exec=pcmanfm-qt --desktop --profile=lxqt
+TryExec=pcmanfm-qt
+OnlyShowIn=LXQt;
+X-LXQt-Module=true
+
+#TRANSLATIONS_DIR=translations

@@ -60,6 +60,7 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int socketpair(int domain, int type, int protocol, int sv[2]);
 long recv(int fd, void *buf, size_t len, int flags);
 long send(int fd, const void *buf, size_t len, int flags);
 long recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);

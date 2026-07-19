@@ -112,4 +112,24 @@ cp -R "${INSTALL_ROOT}/usr/local/include" "${VENDOR_DIR}/include" 2>/dev/null ||
 cp -R "${INSTALL_ROOT}/usr/local/lib" "${VENDOR_DIR}/lib" 2>/dev/null || \
 	cp -R "${INSTALL_ROOT}/usr/lib" "${VENDOR_DIR}/lib"
 
+# Every vendored .pc file's own `prefix=` line bakes in the --prefix=/usr
+# passed to `meson setup` above (a real path that exists on this host, but
+# is NOT where these files actually live) -- harmless for the direct
+# pkg-config lookups elsewhere in this port (which only ever use pkg-config
+# output as a HINT, then fall back to real CMAKE_FIND_ROOT_PATH searches),
+# but a real, separate problem for anything that FREEZES pkg-config's
+# resolved paths into a generated file at build time and commits it (e.g.
+# libfm-qt's own exported fm-qt6-targets.cmake, which bakes in whatever
+# MENUCACHE_INCLUDE_DIRS resolved to via libmenu-cache.pc's own
+# `Requires: glib-2.0` chain, at the time tools/build-libfm-qt.sh was run
+# -- a real bug this exact line fixes). Rewritten to the same self-relative
+# `${pcfiledir}/../..` convention libffi.pc/libmenu-cache.pc already use,
+# so it stays correct regardless of where this repo (or its vendored
+# third_party/ tree) is checked out.
+echo "==> Fixing up vendored .pc files' prefix= to be self-relative"
+for pc in "${VENDOR_DIR}"/lib/pkgconfig/*.pc; do
+	sed -i.bak 's|^prefix=.*|prefix=${pcfiledir}/../..|' "${pc}"
+	rm -f "${pc}.bak"
+done
+
 echo "==> Done. Review changes under ${VENDOR_DIR} and commit them."

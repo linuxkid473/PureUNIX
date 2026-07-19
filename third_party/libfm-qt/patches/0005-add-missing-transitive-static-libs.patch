@@ -1,0 +1,34 @@
+--- a/src/CMakeLists.txt	2026-07-19 21:47:35
++++ b/src/CMakeLists.txt	2026-07-19 21:48:12
+@@ -139,6 +139,21 @@
+     DESTINATION "${CMAKE_INSTALL_DATADIR}/cmake/${LIBFM_QT_LIBRARY_NAME}"
+     COMPONENT Devel
+ )
++
++# FindGLIB.cmake only resolves glib-2.0/gio-2.0/gobject-2.0/gthread-2.0
++# themselves — not gmodule-2.0, zlib, or libffi, all three of which our
++# real vendored libgio-2.0.a/libgobject-2.0.a genuinely reference symbols
++# from (g_module_*, inflate*, ffi_*). On a normal Linux desktop this is
++# invisible: shared libraries carry their own DT_NEEDED transitive
++# dependencies automatically. PureUnix links everything statically, where
++# a .a archive's own internal dependencies are never pulled in
++# automatically — they must be listed explicitly, or any final consumer
++# that actually references these symbols (pcmanfm-qt itself, the first
++# real *executable* — not static library — this stack has produced) fails
++# at link time with real "undefined reference" errors.
++find_library(PUREUNIX_GMODULE_LIBRARY NAMES gmodule-2.0)
++find_library(PUREUNIX_ZLIB_LIBRARY NAMES z)
++find_library(PUREUNIX_LIBFFI_LIBRARY NAMES ffi)
+ 
+ target_link_libraries(${LIBFM_QT_LIBRARY_NAME}
+     PRIVATE
+@@ -149,6 +164,9 @@
+         ${GLIB_GIO_LIBRARIES}
+         ${GLIB_GOBJECT_LIBRARIES}
+         ${GLIB_GTHREAD_LIBRARIES}
++        ${PUREUNIX_GMODULE_LIBRARY}
++        ${PUREUNIX_ZLIB_LIBRARY}
++        ${PUREUNIX_LIBFFI_LIBRARY}
+         ${MENUCACHE_LIBRARIES}
+         ${XCB_LIBRARIES}
+         ${EXIF_LIBRARIES}

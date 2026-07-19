@@ -1,0 +1,329 @@
+--- a/CMakeLists.txt	2026-07-19 21:01:54
++++ b/CMakeLists.txt	2026-07-19 21:17:27
+@@ -16,17 +16,39 @@
+ # Minimum versions
+ set(LIBFMQT_MINIMUM_VERSION "2.4.0")
+ set(LXQTBT_MINIMUM_VERSION "2.4.0")
+-set(QT_MINIMUM_VERSION "6.6.0")
++# Lowered to match PureUnix's real vendored Qt 6.5.3 (same real, verified
++# reasoning as libfm-qt's own patch: no 6.6-only API is actually used).
++set(QT_MINIMUM_VERSION "6.5.3")
+ set(SHELLQT_MINIMUM_VERSION "6.0.0")
+ 
+ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+ 
+-find_package(Qt6DBus ${QT_MINIMUM_VERSION} REQUIRED)
+-find_package(Qt6LinguistTools ${QT_MINIMUM_VERSION} REQUIRED)
++# Qt6DBus is a separate qtbase module never cross-built for PureUnix (only
++# Core+Gui+Widgets were, see third_party/qt/README.md) -- there is no real
++# D-Bus daemon/library on this platform at all, so building it would be a
++# whole new IPC subsystem, not a "minimal patch". Made optional; the real,
++# disclosed cost is single-instance enforcement/the org.freedesktop.FileManager1
++# service (see pcmanfm/application.cpp's own comment) -- every launch just
++# opens its own new instance, which matches how PUDE itself launches one
++# fresh process per app-open anyway.
++find_package(Qt6DBus ${QT_MINIMUM_VERSION})
+ find_package(Qt6Widgets ${QT_MINIMUM_VERSION} REQUIRED)
+ find_package(fm-qt6 ${LIBFMQT_MINIMUM_VERSION} REQUIRED)
+ find_package(lxqt2-build-tools ${LXQTBT_MINIMUM_VERSION} REQUIRED)
+-find_package(LayerShellQt ${SHELLQT_MINIMUM_VERSION} REQUIRED)
++# LayerShellQt is Wayland-only (its one real use, desktopwindow.cpp's
++# desktop-background layer-shell setup, is already runtime-guarded behind
++# Application::underWayland() -- see this project's own libfm-qt
++# XCB-optional patch for the identical shape of fix). PureUnix has neither
++# X11 nor Wayland, so this is never buildable here at all; optional.
++find_package(LayerShellQt ${SHELLQT_MINIMUM_VERSION})
++# XCB isn't find_package()-d by upstream pcmanfm-qt at all (real desktop
++# Linux systems already have libxcb on the system linker path via Qt's own
++# xcb QPA plugin dependency chain) -- desktopwindow.cpp's one real XCB use
++# (setting the EWMH _NET_WM_WINDOW_TYPE_DESKTOP hint) is already
++# runtime-guarded behind `QGuiApplication::platformName() == "xcb"`, same
++# shape as libfm-qt's own XCB-optional patch. Added here explicitly since
++# PureUnix has no system XCB at all to implicitly link against.
++find_package(XCB)
+ 
+ message(STATUS "Building ${PROJECT_NAME} with Qt ${Qt6Core_VERSION}")
+ 
+@@ -34,7 +56,10 @@
+ include(GNUInstallDirs)
+ include(LXQtPreventInSourceBuilds)
+ include(LXQtConfigVars)
+-include(LXQtTranslateTs)
++# LXQtTranslateTs dropped: same reason as libfm-qt's own patch (its
++# lxqt_translate_ts() call below is also removed) -- that module does a
++# hard find_package(Qt6 "6.6" REQUIRED COMPONENTS LinguistTools) at
++# *include* time, and Qt6LinguistTools was never cross-built here.
+ include(LXQtTranslateDesktop)
+ include(LXQtCompilerSettings NO_POLICY_SCOPE)
+ 
+--- a/pcmanfm/CMakeLists.txt	2026-07-19 21:01:54
++++ b/pcmanfm/CMakeLists.txt	2026-07-19 21:10:26
+@@ -18,26 +18,31 @@
+     desktopentrydialog.cpp
+ )
+ 
+-qt6_add_dbus_adaptor(pcmanfm_DBUS_SRCS
+-    org.pcmanfm.Application.xml
+-    application.h
+-    PCManFM::Application
+-    applicationadaptor
+-    ApplicationAdaptor
+-)
++# Qt6DBus was never cross-built for PureUnix (see top-level CMakeLists.txt's
++# own comment) -- qt6_add_dbus_adaptor() itself is a Qt6::DBus CMake macro
++# that wouldn't exist at all without it.
++if(Qt6DBus_FOUND)
++    qt6_add_dbus_adaptor(pcmanfm_DBUS_SRCS
++        org.pcmanfm.Application.xml
++        application.h
++        PCManFM::Application
++        applicationadaptor
++        ApplicationAdaptor
++    )
+ 
+-qt6_add_dbus_adaptor(pcmanfm_DBUS_SRCS
+-    org.freedesktop.FileManager1.xml
+-    application.h
+-    PCManFM::Application
+-    applicationadaptorfreedesktopfilemanager
+-    ApplicationAdaptorFreeDesktopFileManager
+-)
++    qt6_add_dbus_adaptor(pcmanfm_DBUS_SRCS
++        org.freedesktop.FileManager1.xml
++        application.h
++        PCManFM::Application
++        applicationadaptorfreedesktopfilemanager
++        ApplicationAdaptorFreeDesktopFileManager
++    )
+ 
+-# qt6_add_dbus_adaptor() already generated the moc files. It also marked the
+-# files with SKIP_AUTOMOC but we still need to mark them with SKIP_AUTOGEN.
+-# TODO: Check if this behaviour is a CMake bug.
+-set_source_files_properties(${pcmanfm_DBUS_SRCS} PROPERTIES SKIP_AUTOGEN ON)
++    # qt6_add_dbus_adaptor() already generated the moc files. It also marked the
++    # files with SKIP_AUTOMOC but we still need to mark them with SKIP_AUTOGEN.
++    # TODO: Check if this behaviour is a CMake bug.
++    set_source_files_properties(${pcmanfm_DBUS_SRCS} PROPERTIES SKIP_AUTOGEN ON)
++endif()
+ 
+ set(pcmanfm_UIS
+     main-win.ui
+@@ -52,12 +57,9 @@
+     desktopentrydialog.ui
+ )
+ 
+-# add translation for pcmanfm-qt
+-lxqt_translate_ts(QM_FILES
+-    UPDATE_TRANSLATIONS ${UPDATE_TRANSLATIONS}
+-    SOURCES ${pcmanfm_SRCS} ${pcmanfm_UIS}
+-    INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}/translations"
+-)
++# Translations skipped entirely -- see top-level CMakeLists.txt's own
++# comment (Qt6LinguistTools/qttools was never cross-built for PureUnix).
++set(QM_FILES)
+ 
+ # translate desktop entry files for pcmanfm-qt and desktop preferences
+ lxqt_translate_desktop(DESKTOP_FILES
+@@ -89,10 +91,21 @@
+ 
+ target_link_libraries(pcmanfm-qt
+     Qt6::Widgets
+-    Qt6::DBus
+-    LayerShellQtInterface
+     fm-qt6
+ )
++if(Qt6DBus_FOUND)
++    target_link_libraries(pcmanfm-qt Qt6::DBus)
++    target_compile_definitions(pcmanfm-qt PRIVATE HAVE_QTDBUS)
++endif()
++if(TARGET LayerShellQtInterface)
++    target_link_libraries(pcmanfm-qt LayerShellQtInterface)
++    target_compile_definitions(pcmanfm-qt PRIVATE HAVE_LAYERSHELLQT)
++endif()
++if(XCB_FOUND)
++    target_link_libraries(pcmanfm-qt ${XCB_LIBRARIES})
++    target_include_directories(pcmanfm-qt PRIVATE ${XCB_INCLUDE_DIRS})
++    target_compile_definitions(pcmanfm-qt PRIVATE HAVE_XCB)
++endif()
+ 
+ install(TARGETS pcmanfm-qt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+ 
+--- a/pcmanfm/application.cpp	2026-07-19 21:01:54
++++ b/pcmanfm/application.cpp	2026-07-19 21:38:22
+@@ -21,9 +21,11 @@
+ #include "application.h"
+ #include "mainwindow.h"
+ #include "desktopwindow.h"
++#ifdef HAVE_QTDBUS
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
+ #include <QDBusInterface>
++#endif
+ #include <QDir>
+ #include <QVector>
+ #include <QLocale>
+@@ -35,6 +37,11 @@
+ #include <QScreen>
+ #include <QWindow>
+ #include <QFileSystemWatcher>
++// Real, general missing-include bug (independent of any PureUnix patch):
++// upstream relies on some other Qt header transitively pulling in
++// QStandardPaths, which doesn't happen against this port's minimal
++// Core+Gui+Widgets-only Qt build.
++#include <QStandardPaths>
+ 
+ #include <algorithm>
+ 
+@@ -49,22 +56,27 @@
+ #include <libfm-qt6/core/folderconfig.h>
+ #include <libfm-qt6/core/fileinfojob.h>
+ 
++#ifdef HAVE_QTDBUS
+ #include "applicationadaptor.h"
+ #include "applicationadaptorfreedesktopfilemanager.h"
++#endif
+ #include "preferencesdialog.h"
+ #include "desktoppreferencesdialog.h"
+ #include "autorundialog.h"
+ #include "launcher.h"
+ #include "xdgdir.h"
+ #include "connectserverdialog.h"
++// <X11/Xlib.h> was unused dead cruft in this file (nothing here
++// references any of its symbols) -- dropped, not guarded, matching
++// libfm-qt's own fontbutton.cpp patch for the identical situation.
+ 
+-#include <X11/Xlib.h>
+ 
+-
+ namespace PCManFM {
+ 
++#ifdef HAVE_QTDBUS
+ static const char* serviceName = "org.pcmanfm.PCManFM";
+ static const char* ifaceName = "org.pcmanfm.Application";
++#endif
+ 
+ int ProxyStyle::styleHint(StyleHint hint, const QStyleOption* option, const QWidget* widget, QStyleHintReturn* returnData) const {
+     Application* app = static_cast<Application*>(qApp);
+@@ -101,6 +113,7 @@
+ 
+     underWayland_ = QGuiApplication::platformName() == QStringLiteral("wayland");
+ 
++#ifdef HAVE_QTDBUS
+     // QDBusConnection::sessionBus().registerObject("/org/pcmanfm/Application", this);
+     QDBusConnection dbus = QDBusConnection::sessionBus();
+     if(dbus.registerService(QLatin1String(serviceName))) {
+@@ -152,6 +165,19 @@
+         // we're not the first instance
+         isPrimaryInstance = false;
+     }
++#else
++    // No real D-Bus daemon/library exists on PureUnix at all (see this
++    // project's own top-level CMakeLists.txt comment) -- single-instance
++    // enforcement and the org.freedesktop.FileManager1 service are a
++    // real, disclosed, non-functional limitation here. Every launch is
++    // its own primary instance, which matches how PUDE itself launches
++    // one fresh process per app-open anyway (there's no persistent
++    // daemon/session for a second launch to even find).
++    isPrimaryInstance = true;
++    setStyle(new ProxyStyle());
++    connect(this, &Application::aboutToQuit, this, &Application::onAboutToQuit);
++    installSigtermHandler();
++#endif
+ }
+ 
+ Application::~Application() {
+@@ -289,6 +315,7 @@
+             }
+         }
+     }
++#ifdef HAVE_QTDBUS
+     else {
+         QDBusConnection dbus = QDBusConnection::sessionBus();
+         QDBusInterface iface(QLatin1String(serviceName), QStringLiteral("/Application"), QLatin1String(ifaceName), dbus, this);
+@@ -328,6 +355,11 @@
+             }
+         }
+     }
++    // isPrimaryInstance is unconditionally true without HAVE_QTDBUS (see
++    // this file's own constructor comment), so this branch is otherwise
++    // genuinely unreachable -- guarded rather than deleted so it comes
++    // back for free if a real D-Bus port is ever attempted.
++#endif
+     return keepRunning;
+ }
+ 
+--- a/pcmanfm/desktopwindow.cpp	2026-07-19 21:01:54
++++ b/pcmanfm/desktopwindow.cpp	2026-07-19 21:11:56
+@@ -45,8 +45,10 @@
+ 
+ #include <algorithm>
+ 
++#ifdef HAVE_LAYERSHELLQT
+ #include <LayerShellQt/shell.h>
+ #include <LayerShellQt/window.h>
++#endif
+ 
+ #include "./application.h"
+ #include "mainwindow.h"
+@@ -64,8 +66,10 @@
+ #include "desktopentrydialog.h"
+ 
+ #include <QScreen>
++#ifdef HAVE_XCB
+ #include <xcb/xcb.h>
+ #include <X11/Xlib.h>
++#endif
+ 
+ #define MIN_SLIDE_INTERVAL 5*60000 // 5 min
+ #define MAX_SLIDE_INTERVAL (24*60+55)*60000 // 24 h and 55 min
+@@ -203,6 +207,7 @@
+     if(static_cast<Application*>(qApp)->underWayland()) {
+         setAttribute(Qt::WA_TranslucentBackground);
+         winId();
++#ifdef HAVE_LAYERSHELLQT
+         if(QWindow* win = windowHandle()) {
+             if(LayerShellQt::Window* layershell = LayerShellQt::Window::get(win)) {
+                 layershell->setLayer(LayerShellQt::Window::Layer::LayerBackground);
+@@ -216,6 +221,13 @@
+                 layershell->setScope(QStringLiteral("desktop")); // just for distinguishing it
+             }
+         }
++#endif
++        // underWayland() is unconditionally false on PureUnix (our QPA
++        // platformName is "pureunix", never "wayland" -- see
++        // Application::underWayland()'s own real, unmodified check), so
++        // this whole branch was already dead code on this platform even
++        // when LayerShellQt did compile; HAVE_LAYERSHELLQT only needed to
++        // avoid a real compile-time dependency PureUnix can't satisfy.
+     }
+ }
+ 
+@@ -1924,6 +1936,7 @@
+             break;
+         }
+         // set freedesktop.org EWMH hints properly
++#ifdef HAVE_XCB
+         if(QGuiApplication::platformName() == QStringLiteral("xcb")) {
+             if(auto x11NativeInterfce = qApp->nativeInterface<QNativeInterface::QX11Application>()) {
+                 xcb_connection_t* con = x11NativeInterfce->connection();
+@@ -1935,6 +1948,7 @@
+                 xcb_change_property(con, XCB_PROP_MODE_REPLACE, effectiveWinId(), prop_atom, XA_ATOM, 32, 1, &atom);
+             }
+         }
++#endif
+         break;
+     }
+ #undef FontChange // FontChange is defined in the headers of XLib and clashes with Qt, let's undefine it.
+--- a/pcmanfm/desktopwindow.h	2026-07-19 21:13:06
++++ b/pcmanfm/desktopwindow.h	2026-07-19 21:13:37
+@@ -29,7 +29,9 @@
+ #include <QPoint>
+ #include <QByteArray>
+ #include <QScreen>
+-#include <xcb/xcb.h>
++// <xcb/xcb.h> was unused dead cruft in this file (nothing here
++// references any of its symbols) -- dropped, not guarded, matching
++// libfm-qt's own fontbutton.cpp patch for the identical situation.
+ #include <libfm-qt6/core/folder.h>
+ 
+ namespace Fm {

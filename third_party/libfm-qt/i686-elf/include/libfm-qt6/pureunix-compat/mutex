@@ -1,0 +1,55 @@
+// Real, minimal drop-in for <mutex>'s std::mutex/std::lock_guard on
+// PureUnix, where neither exists at all: libstdc++ was vendored with
+// --disable-libstdcxx-threads (see tools/build-libstdcxx.sh's own
+// comment — no real gthreads backend existed at the time), which guards
+// std::mutex's whole definition out of the real <mutex> header entirely
+// (not a degraded/dummy fallback — genuinely absent, `'mutex' is not a
+// member of 'std'`). PureUnix has no real concurrent execution within a
+// single process at all (see the project's existing single-threaded
+// pthread shim in user/newlib_syscalls.c), so every one of these
+// mutex_/lock_guard usages in this tree exists purely as defensive
+// mutual exclusion that can never actually be contended here — a real,
+// correct no-op for this platform, not a fabricated stub.
+//
+// This header shadows the real (disabled) <mutex> for this target's own
+// compiles (src/CMakeLists.txt's PRIVATE target_include_directories entry
+// adds this directory as a plain -I entry, which GCC always searches
+// before the toolchain's own -isystem libstdc++ path, regardless of
+// ordering on the command line) AND for any real downstream consumer of
+// this library's installed headers, several of which also use
+// std::mutex/std::lock_guard directly (folder.h, iconinfo.h, mimetype.h,
+// thumbnailer.h, volumemanager.h, userinfocache.h, fileoperationjob.h,
+// dirlistjob.h) — propagated via this same target's INTERFACE
+// BUILD_INTERFACE/INSTALL_INTERFACE include-dir entries. Every
+// `#include <mutex>` anywhere in this tree (or in a consumer like
+// pcmanfm-qt) keeps working completely unmodified.
+#ifndef PUREUNIX_LIBFMQT_MUTEX_SHIM
+#define PUREUNIX_LIBFMQT_MUTEX_SHIM
+
+namespace std {
+
+class mutex {
+public:
+    constexpr mutex() noexcept = default;
+    mutex(const mutex&) = delete;
+    mutex& operator=(const mutex&) = delete;
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+};
+
+template <class Mutex>
+class lock_guard {
+public:
+    using mutex_type = Mutex;
+    explicit lock_guard(Mutex& m) : mutex_(m) { mutex_.lock(); }
+    ~lock_guard() { mutex_.unlock(); }
+    lock_guard(const lock_guard&) = delete;
+    lock_guard& operator=(const lock_guard&) = delete;
+private:
+    Mutex& mutex_;
+};
+
+} // namespace std
+
+#endif

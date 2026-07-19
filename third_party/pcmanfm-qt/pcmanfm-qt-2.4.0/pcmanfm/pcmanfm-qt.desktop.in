@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Exec=pcmanfm-qt %U
+MimeType=inode/directory;
+Icon=pcmanfm-qt
+Categories=FileManager;Utility;Core;Qt;
+StartupNotify=true

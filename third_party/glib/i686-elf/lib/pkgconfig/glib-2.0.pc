@@ -1,4 +1,4 @@
-prefix=/usr
+prefix=${pcfiledir}/../..
 bindir=${prefix}/bin
 datadir=${prefix}/share
 includedir=${prefix}/include

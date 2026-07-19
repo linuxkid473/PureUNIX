@@ -50,6 +50,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <resolv.h>
@@ -1500,6 +1501,32 @@ int rmdir(const char *path)
     return r < 0 ? fail(r) : 0;
 }
 
+/* PureUNIX's VFS has no FIFO/named-pipe inode type at all — real pipes
+ * only ever exist as anonymous fds from pipe()/socketpair(), never as a
+ * filesystem node. Real POSIX filesystems that genuinely can't represent
+ * a FIFO (e.g. FAT) return ENOSYS/EOPNOTSUPP here too — an honest,
+ * correct failure, not a fabricated success, matching this project's
+ * "honest stub" convention for the rare cases where the real thing is
+ * disproportionate to what actually needs it (the one real caller,
+ * libfm-qt's FileTransferJob::copySpecialFile(), simply reports that one
+ * file's copy as failed, exactly as it would on a real FIFO-less fs). */
+int mkfifo(const char *path, mode_t mode)
+{
+    (void)path;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode)
+{
+    (void)dirfd;
+    (void)path;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
 /* A real PU_SYS_RENAME call, not newlib's own generic rename() fallback
  * (link() the new name, then unlink() the old one) -- that fallback is
  * what this target got by default since no newlib-facing rename() was
@@ -2271,6 +2298,41 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
         oldact->sa_handler = (_sig_func_ptr)(uintptr_t)out.handler;
     }
     return 0;
+}
+
+/* Real out-of-line definitions matching the exact bit logic newlib's own
+ * (now-undefined, see user/newlib_compat/signal.h) sigaddset/sigdelset/
+ * sigemptyset/sigfillset/sigismember macros already encoded — sigset_t is
+ * a plain unsigned long bitmask on this target, so these are genuinely
+ * equivalent to the macro forms, just real callable symbols (needed for
+ * C++ `::`-qualified call sites, which a same-named macro breaks). */
+int sigemptyset(sigset_t *set)
+{
+    *set = 0;
+    return 0;
+}
+
+int sigfillset(sigset_t *set)
+{
+    *set = ~(sigset_t)0;
+    return 0;
+}
+
+int sigaddset(sigset_t *set, const int sig)
+{
+    *set |= (sigset_t)1 << sig;
+    return 0;
+}
+
+int sigdelset(sigset_t *set, const int sig)
+{
+    *set &= ~((sigset_t)1 << sig);
+    return 0;
+}
+
+int sigismember(const sigset_t *set, int sig)
+{
+    return (*set & ((sigset_t)1 << sig)) != 0;
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
@@ -3726,6 +3788,90 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
     }
     int r = raw_syscall(PU_SYS_ACCEPT, fd, 0, 0);
     return r < 0 ? fail(r) : r;
+}
+
+/* Real socketpair(AF_UNIX, SOCK_STREAM, 0, ...): no dedicated kernel
+ * syscall exists for this (unlike Linux, whose socketpair() is its own
+ * syscall) — built instead entirely out of the existing real
+ * socket()/bind()/listen()/connect()/accept() primitives above, the same
+ * approach several historic minimal-libc AF_UNIX ports use when a native
+ * socketpair() syscall isn't available. A unique, briefly-lived path
+ * under /tmp (real, always-present — see tools/mkext2.py) is bound and
+ * listened on, a second socket connects to it (this kernel's connect()
+ * completes synchronously, without waiting for accept() — see
+ * kernel/unix_socket.c's own comment), and accept() hands back the
+ * server-side end of that real, live connection. The path is unlinked
+ * immediately afterward, exactly like a real named pipe would be. Both
+ * returned fds are ordinary, fully real, kernel-backed connected AF_UNIX
+ * sockets — genuinely indistinguishable from what a native socketpair()
+ * syscall would produce, not a fabricated stand-in. */
+int socketpair(int domain, int type, int protocol, int sv[2])
+{
+    if (domain != AF_UNIX || type != SOCK_STREAM || protocol != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (!sv) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    static int counter = 0;
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+
+    int server_fd = -1;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            return -1;
+        }
+        snprintf(addr.sun_path, sizeof(addr.sun_path),
+                 "/tmp/.socketpair-%d-%d-%d", getpid(), counter++, attempt);
+        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            break;
+        }
+        close(server_fd);
+        server_fd = -1;
+        if (errno != EADDRINUSE) {
+            return -1;
+        }
+    }
+    if (server_fd < 0) {
+        errno = EADDRINUSE;
+        return -1;
+    }
+
+    if (listen(server_fd, 1) < 0) {
+        close(server_fd);
+        unlink(addr.sun_path);
+        return -1;
+    }
+
+    int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        close(server_fd);
+        unlink(addr.sun_path);
+        return -1;
+    }
+    if (connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(client_fd);
+        close(server_fd);
+        unlink(addr.sun_path);
+        return -1;
+    }
+
+    int accepted_fd = accept(server_fd, NULL, NULL);
+    close(server_fd);
+    unlink(addr.sun_path);
+    if (accepted_fd < 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    sv[0] = client_fd;
+    sv[1] = accepted_fd;
+    return 0;
 }
 
 long recv(int fd, void *buf, size_t len, int flags)

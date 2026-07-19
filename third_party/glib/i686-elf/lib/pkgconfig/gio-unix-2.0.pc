@@ -1,4 +1,4 @@
-prefix=/usr
+prefix=${pcfiledir}/../..
 includedir=${prefix}/include
 
 Name: GIO unix specific APIs
