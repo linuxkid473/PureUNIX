@@ -59,11 +59,19 @@ EXT2_MAGIC        = 0xEF53
 INODE_SIZE        = 128
 INODES_PER_GROUP  = 1024
 BLOCKS_PER_GROUP  = 8192          # max for 1 KB blocks (1 bitmap block = 8192 bits)
-NUM_GROUPS        = 6              # see the module docstring's "Why 3 block
+NUM_GROUPS        = 7              # see the module docstring's "Why 3 block
                                    # groups" (purely additive extra
                                    # capacity, same reasoning applies to
-                                   # every group added since) -- 48 MB
-                                   # total. Raised from 3 (24 MB) for the
+                                   # every group added since) -- 56 MB
+                                   # total. Raised from 6 (48 MB) for the
+                                   # PCManFM-Qt port's MenuCache phase
+                                   # (docs/pcmanfm-port.md): the real
+                                   # image filled up exactly (RuntimeError:
+                                   # EXT2 image full) once
+                                   # menu-cache-gen/menu-cached +
+                                   # libmenu-cache's own headers landed
+                                   # on top of everything already there.
+                                   # Raised from 3 (24 MB) for the
                                    # Qt 6 port (docs/qt-port.md): a real
                                    # statically-linked Qt Core program
                                    # (user/qtcoretest.cpp, ~6-7 MB
@@ -966,12 +974,20 @@ def add_extra_file(fs, dir_cache: dict, host_path: str, dest_path: str):
     (add_docs), e.g. an IWAD placed for Chocolate Doom testing
     (docs/chocolate-doom-port.md's Testing section: "an IWAD ... on the
     persistent filesystem must remain available across reboot" --
-    verified by placing one this way, not by hand-editing the image)."""
+    verified by placing one this way, not by hand-editing the image).
+
+    Mirrors the host file's own executable bit (real os.access() check,
+    matching a real `cp -p`, not just add_bin()'s own always-EXEC_MODE
+    assumption -- most extra-files are data, not programs) -- found
+    necessary for real ELF binaries placed this way (menu-cache-gen/
+    menu-cached, docs/pcmanfm-port.md phase 6) that otherwise landed as
+    0644 and failed X_OK at exec() time with a real, correct EACCES."""
     dest_path = dest_path.strip('/')
     parent, _, name = dest_path.rpartition('/')
     parent_ino = ensure_dir(fs, dir_cache, '/' + parent) if parent else ROOT_INO
+    mode = EXEC_MODE if os.access(host_path, os.X_OK) else DEFAULT_FILE_MODE
     with open(host_path, 'rb') as f:
-        fs.add_file(parent_ino, name, f.read())
+        fs.add_file(parent_ino, name, f.read(), mode=mode)
 
 
 def main(argv):

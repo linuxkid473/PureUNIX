@@ -1941,6 +1941,25 @@ int execvp(const char *file, char *const argv[])
  * "not installed" failure a real Unix without lsof/strace would give. */
 #define EXECL_MAX_ARGS 32
 
+int execl(const char *path, const char *arg0, ...)
+{
+    const char *argv[EXECL_MAX_ARGS];
+    int n = 0;
+    argv[n++] = arg0;
+    va_list ap;
+    va_start(ap, arg0);
+    while (n < EXECL_MAX_ARGS - 1) {
+        const char *next = va_arg(ap, const char *);
+        argv[n++] = next;
+        if (!next) {
+            break;
+        }
+    }
+    va_end(ap);
+    argv[EXECL_MAX_ARGS - 1] = NULL;
+    return execve(path, (char *const *)argv, environ);
+}
+
 int execlp(const char *file, const char *arg0, ...)
 {
     const char *argv[EXECL_MAX_ARGS];

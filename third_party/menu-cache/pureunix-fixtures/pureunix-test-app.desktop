@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PureUnix Test App
+Comment=A real .desktop file for menu-cache-gen's own on-target test
+Exec=/bin/hello.elf
+Icon=utilities-terminal
+Categories=Utility;
+Terminal=false

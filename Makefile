@@ -504,6 +504,33 @@ LIBEXIF_LDFLAGS := $(NEWLIB_LDFLAGS) -L$(LIBEXIF_DIR)/lib
 # comment).
 LIBEXIF_TEST_JPG := third_party/libexif/libexif-0.6.26/test/testdata/pentax_makernote_variant_2.jpg
 
+# MenuCache (docs/pcmanfm-port.md phase 6 — fourth new dependency, needed
+# by libfm-qt's "Applications" XDG-menu view). Vendored + built via
+# tools/build-menu-cache.sh into third_party/menu-cache/i686-elf/ (real
+# libmenu-cache.a + real menu-cache-gen/menu-cached ELF binaries) plus
+# third_party/menu-cache/pureunix-fixtures/ (a real, minimal XDG
+# applications.menu + one real .desktop file for on-target testing).
+# menu-cached/menu-cache-gen must land at exactly /usr/libexec/
+# menu-cache/ on the real filesystem — that path is baked into
+# libmenu-cache.a/menu-cached at compile time (real, standard
+# $(pkglibexecdir), not something we chose).
+MENU_CACHE_DIR := third_party/menu-cache/i686-elf
+MENU_CACHE_FIXTURES := third_party/menu-cache/pureunix-fixtures
+
+MENUCACHETEST_ELF := $(BUILD)/user/menucachetest.elf
+
+$(BUILD)/user/menucachetest.o: user/menucachetest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(NEWLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/menucachetest.d
+
+$(MENUCACHETEST_ELF): $(BUILD)/user/menucachetest.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(NEWLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/menucachetest.o \
+		-Wl,--start-group -lc -lm -Wl,--end-group -lgcc -o $@
+
 $(BUILD)/user/libexiftest.o: user/libexiftest.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(LIBEXIF_CFLAGS) -MMD -MP -c $< -o $@
@@ -1079,7 +1106,7 @@ $(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_as
 
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -1419,9 +1446,9 @@ EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubs
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(LIBEXIF_TEST_JPG) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) $(LIBEXIF_TEST_JPG) $(MENU_CACHE_DIR)/bin/menu-cache-gen $(MENU_CACHE_DIR)/bin/menu-cached $(MENU_CACHE_FIXTURES)/applications.menu $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg --extra-file $(MENU_CACHE_DIR)/bin/menu-cache-gen:/usr/libexec/menu-cache/menu-cache-gen --extra-file $(MENU_CACHE_DIR)/bin/menu-cached:/usr/libexec/menu-cache/menu-cached --extra-file $(MENU_CACHE_FIXTURES)/applications.menu:/etc/xdg/menus/applications.menu --extra-file $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop:/usr/share/applications/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 disk: $(DISK) $(DISK2)
 
@@ -1432,9 +1459,9 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(LIBEXIF_TEST_JPG) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) $(LIBEXIF_TEST_JPG) $(MENU_CACHE_DIR)/bin/menu-cache-gen $(MENU_CACHE_DIR)/bin/menu-cached $(MENU_CACHE_FIXTURES)/applications.menu $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) \
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg --extra-file $(MENU_CACHE_DIR)/bin/menu-cache-gen:/usr/libexec/menu-cache/menu-cache-gen --extra-file $(MENU_CACHE_DIR)/bin/menu-cached:/usr/libexec/menu-cache/menu-cached --extra-file $(MENU_CACHE_FIXTURES)/applications.menu:/etc/xdg/menus/applications.menu --extra-file $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop:/usr/share/applications/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the

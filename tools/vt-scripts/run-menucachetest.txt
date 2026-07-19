@@ -1,0 +1,10 @@
+# Runs the real MenuCache regression test (user/menucachetest.c) from a
+# freshly booted VT1 shell and waits for its final summary line — proves
+# the vendored menu-cache-gen cross-build (third_party/menu-cache/i686-elf,
+# tools/build-menu-cache.sh, docs/pcmanfm-port.md phase 6) genuinely
+# parses a real XDG applications.menu + .desktop file and writes a real
+# cache file — not just a link check.
+WAIT #\s*$
+TYPE /bin/menucachetest.elf
+WAIT menucachetest: (\d+)/\1 passed
+SLEEP 1

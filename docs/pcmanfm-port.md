@@ -363,8 +363,11 @@ assumed):
      far the easiest dependency in this whole port. Real on-target test
      `user/libexiftest.c` (7/7 passed, QEMU-verified) genuinely parses a
      real camera JPEG's EXIF `Make`/`Model` tags via
-     `exif_data_new_from_file()` against a real fixture
-     (`extra-files/pentax-exif-test.jpg`, from libexif's own upstream
+     `exif_data_new_from_file()` against a real fixture (referenced
+     directly from libexif's own already-committed vendored test suite,
+     `third_party/libexif/libexif-0.6.26/test/testdata/`, not duplicated
+     into `extra-files/` — that directory is local-only and gitignored,
+     see its own `.gitignore` comment), from libexif's own upstream
      test suite) — not just a link check.
    - **libfm-extra (MenuCache's own bootstrap dependency) — DONE
      (2026-07-19).** libfm 1.3.2's real, upstream-documented
@@ -406,6 +409,80 @@ assumed):
      immediately by testing in QEMU rather than trusting a clean
      compile+link. `make run-test` still at the known 343/345 baseline;
      zero regressions from adding an entirely new kernel subsystem.
+   - **MenuCache itself — DONE (2026-07-19).** Vendored 1.1.0 (not the
+     newer 1.1.1 git tag — same "no published release tarball, would
+     need gtk-doc/intltool to bootstrap `configure.ac`" reasoning as
+     libfm-extra's own version choice), `third_party/menu-cache/i686-elf/`
+     (`tools/build-menu-cache.sh`) — real `libmenu-cache.a`, and real,
+     standalone `menu-cache-gen`/`menu-cached` ELF binaries (neither
+     actually links against `libmenu-cache.a` itself, checked directly in
+     their own `Makefile.am` — only its generated headers — so each of
+     the 3 build targets succeeds/fails independently of the other two;
+     `libmenu-cache.a` itself hits the same known libtool-archival
+     limitation as every other vendored dependency, tolerated the same
+     way). Two real, version-specific build fixes: `-fcommon` (1.1.0's
+     own `menu-tags.h` declares its `menuTag_*` globals without `extern`,
+     real pre-GCC10 tentative-definition-linking behavior this exact
+     source relies on — modern GCC defaults to `-fno-common`, turning
+     that into hard multiple-definition link errors; upstream's own next
+     release fixed this for real by adding `extern` throughout, but
+     backporting that fix would need the same gtk-doc/intltool
+     bootstrap this vendoring deliberately avoided) and `-lgmodule-2.0`
+     (GIO's own `giomodule.c` — `g_module_*` — needs the separate
+     `libgmodule-2.0.a` GLib's own build already produced but this
+     script hadn't linked in yet).
+
+     `menu-cached`/`menu-cache-gen` **must** land at exactly
+     `/usr/libexec/menu-cache/` on the real filesystem — a real,
+     compile-time-baked path (`$(pkglibexecdir)`, confirmed via `strings`
+     on the real compiled binaries, not assumed), wired via
+     `tools/mkext2.py`'s `--extra-file` mechanism alongside a real,
+     minimal XDG fixture (`third_party/menu-cache/pureunix-fixtures/`:
+     one real `applications.menu` + one real `.desktop` file). Found and
+     fixed a real, general `tools/mkext2.py` bug in the process:
+     `add_extra_file()` always used mode 0644 regardless of the host
+     file's own permissions, so these two real ELF binaries landed
+     non-executable and failed `exec()` with a real, correct `EACCES` —
+     fixed by mirroring the host file's own executable bit (`os.access(...,
+     os.X_OK)`), a real, general fix benefiting any future extra-file
+     that happens to be a program, not just these two. Also needed a
+     real `execl()` (declared by newlib, never defined — `execlp()`
+     already existed as a template) and a bigger EXT2 image (`NUM_GROUPS`
+     6→7, 48→56 MiB — the real, growing binary/vendor-source footprint
+     finally exceeded the old fixed size, a real `RuntimeError: EXT2
+     image full`, not a bug).
+
+     **Real, disclosed architecture finding, not tested against
+     directly**: `libmenu-cache.a`'s own convenience client API
+     (`menu_cache_lookup()`/`_sync()`) structurally requires a
+     persistent background `GThread` (`server_io_thread()` — a genuine
+     `while(fd >= 0) { blocking read(fd, ...); ... }` loop, confirmed by
+     reading the real upstream source, not guessed) for the lifetime of
+     the calling process's connection to `menu-cached`. This platform's
+     pthread shim (phase 4 above) deliberately runs `pthread_create()`'s
+     entry point synchronously inline, since no real preemptive
+     threading exists on this kernel (and building one would be a
+     kernel undertaking larger than this entire port) — so calling that
+     API would hang forever inside `g_thread_new()`'s own synchronous
+     execution of that infinite read loop. The real
+     `menu-cache-daemon` and the real AF_UNIX socket primitive it needs
+     both build and are independently verified working
+     (`user/unixsocktest.c`); only this one convenience wrapper's own
+     threading assumption is the real, disclosed gap. `user/
+     menucachetest.c` (9/9 passed, QEMU-verified) instead exercises the
+     real, genuinely single-shot, non-threaded `menu-cache-gen` tool
+     directly via `fork()`+`exec()` — real XDG menu/desktop-entry
+     parsing, a real generated cache file whose content is checked
+     against the real fixture, not a link check. A future libfm-qt
+     "Applications" menu view would need to either accept this as a
+     real, disclosed non-functional feature (matching this port's other
+     GIO scope limitations — no D-Bus, no `GVolumeMonitor`, no live
+     `GFileMonitor`) or have a small real single-threaded replacement
+     client written against the same real wire protocol/socket — not
+     attempted here, out of scope for this phase. `make run-test` still
+     at the known 343/345 baseline; every other on-target test (glibtest/
+     libexiftest/unixsocktest/pcre2test_pu/libffitest/cxxtest) still
+     passes — zero regressions.
 6. Patch out the one XCB-dependent file (`xdndworkaround.cpp`) in
    `libfm-qt` — smallest real patch in this whole port, disables exactly
    one X11-specific drag-and-drop compatibility feature that has no
@@ -422,7 +499,7 @@ assumed):
     documentation (upstream versions pinned, every patch listed,
     disabled features listed, build procedure, known limitations).
 
-## Status: phases 1-5 all done; phase 6 in progress (libexif done, libfm-extra bootstrap done, real AF_UNIX kernel sockets done; MenuCache gen/daemon/client itself next)
+## Status: phases 1-6 all done (libffi, iconv, GLib/GObject/GIO, pthread shim, PCRE2, libexif+libfm-extra+AF_UNIX sockets+MenuCache); phase 7 (the one XCB patch) next, then libfm-qt/pcmanfm-qt themselves
 
 GLib/GObject/GIO (phase 3) turned out to be, as expected, the largest
 single undertaking in this port so far — comparable to the entire Qt6
@@ -432,9 +509,13 @@ found and fixed, all documented in phase 3's own entry above. Phase 6
 genuine new AF_UNIX domain socket kernel subsystem, not just another
 userspace library port, needed for MenuCache's real daemon architecture
 (see phase 5's own entry above and `project_af_unix_sockets` memory) —
-but with libexif, libfm-extra, and that new socket primitive all done
-and QEMU-verified, the actual MenuCache library/daemon/generator build
-itself is next, followed by the one real XCB patch, then libfm-qt and
-pcmanfm-qt themselves. Each phase gets its own real, working, tested
-artifact before moving to the next, the same incremental methodology
-that got Qt6 and GLib themselves working.
+plus a real, disclosed architecture limitation in libmenu-cache.a's own
+convenience client API (structurally requires a persistent background
+thread this platform's single-threaded pthread shim can't provide; the
+real daemon/generator/socket primitive underneath all work and are
+independently verified). With all six phases done, the remaining work
+is the one real XCB patch in libfm-qt, then cross-compiling libfm-qt
+itself against everything built so far, then pcmanfm-qt itself. Each
+phase gets its own real, working, tested artifact before moving to the
+next, the same incremental methodology that got Qt6 and GLib themselves
+working.
