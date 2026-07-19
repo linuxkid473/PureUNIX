@@ -1,0 +1,18 @@
+--- a/girepository/cmph/meson.build
++++ b/girepository/cmph/meson.build
+@@ -44,6 +44,16 @@
+     '-Wno-unused-function',
+     '-Wno-return-type',
+     '-Wno-sometimes-uninitialized',
++    # cmph_uint32 is 'unsigned long' on i686 PureUnix (LP32, but GCC's
++    # -Werror=format=2 -- set globally by this project's own crossfile,
++    # not by GLib itself -- still distinguishes it from plain 'unsigned
++    # int' even though both are 4 bytes here); this vendored third-party
++    # library's own fprintf()/sprintf() debug-only diagnostic strings
++    # (bdz.c/bmz.c/brz.c/chd_ph.c) use %u for it throughout, same
++    # portability wart real 32-bit Linux/glibc builds also hit. Same
++    # "suppress, don't rewrite vendored code" precedent as every other
++    # entry already in this list.
++    '-Wno-format',
+   ])
+ endif

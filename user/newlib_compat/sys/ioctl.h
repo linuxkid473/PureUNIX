@@ -34,6 +34,12 @@ extern "C" {
  * consumer of either. */
 #define TIOCSWINSZ 7
 #define TIOCSCTTY  8
+/* FIONREAD: real, standard BSD/glibc request name, but a stub value here
+ * — nothing in the kernel's real ioctl() dispatch (arch/i386/syscall.c)
+ * handles it, since its only caller (GIO's g_socket_get_available_bytes())
+ * can never reach a live fd on this platform (socket() is an honest
+ * ENOSYS stub, see user/newlib_compat/sys/socket.h). */
+#define FIONREAD   9
 
 struct winsize {
     unsigned short ws_row;

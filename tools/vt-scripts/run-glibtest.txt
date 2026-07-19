@@ -1,0 +1,10 @@
+# Runs the real GLib/GObject/GIO regression test (user/glibtest.c) from a
+# freshly booted VT1 shell and waits for its final summary line — proves
+# the vendored GLib cross-build (third_party/glib/i686-elf,
+# tools/build-glib.sh, docs/pcmanfm-port.md phase 3/6) actually works at
+# runtime, not just links: real GObject type registration/signals and
+# real GIO local-file enumeration/read against PureUnix's actual VFS.
+WAIT #\s*$
+TYPE /bin/glibtest.elf
+WAIT glibtest: (\d+)/\1 passed
+SLEEP 1

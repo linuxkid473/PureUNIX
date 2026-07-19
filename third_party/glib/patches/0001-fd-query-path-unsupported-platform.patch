@@ -1,0 +1,21 @@
+--- a/glib/glib-unix.c
++++ b/glib/glib-unix.c
+@@ -1006,6 +1006,18 @@
+   g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOSYS,
+                "g_unix_fd_query_path() not supported on HURD");
+   return NULL;
++#elif defined (__PUREUNIX__)
++  /*
++   * PureUnix has no /proc/self/fd (Linux), F_GETPATH (Darwin/BSD), or
++   * F_KINFO (FreeBSD) equivalent to recover a path from a bare fd — a
++   * real, disclosed platform limitation, not a build-time gap. Same
++   * graceful runtime-error precedent as the Hurd case just above,
++   * rather than the unconditional #error every other unrecognized
++   * platform hits below.
++   */
++  g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOSYS,
++               "g_unix_fd_query_path() not supported on PureUnix");
++  return NULL;
+ #else
+   #error "g_unix_fd_query_path() not supported on this platform"
+ #endif

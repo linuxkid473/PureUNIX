@@ -57,6 +57,17 @@ struct addrinfo {
 #define NI_NAMEREQD    0x08
 #define NI_DGRAM       0x10
 #define NI_NUMERICSCOPE 0x100
+#define NI_MAXHOST 1025
+#define NI_MAXSERV 32
+
+/* Real, standard glibc/BSD h_errno values (gethostbyname()'s errno
+ * equivalent) — real constants, only ever observed here via the honest
+ * res_query()/gethostbyname() failures already wired up in
+ * user/newlib_syscalls.c. */
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
 
 #define EAI_BADFLAGS  -1
 #define EAI_NONAME    -2

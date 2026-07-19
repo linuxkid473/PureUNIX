@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: PCRE2
+Description: PCRE2 8-bit library
+Version: 10.47
+Libs: -L${libdir} -lpcre2-8
+Cflags: -I${includedir}

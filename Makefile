@@ -64,7 +64,11 @@ NEWLIB_DIR := third_party/newlib/i686-elf
 # -D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1: same reasoning, one level deeper —
 # pthread_mutexattr_t's own `type` field (and pthread_mutexattr_settype()/
 # gettype()) are gated behind this separate macro.
-NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include -D_POSIX_THREADS=1 -D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1
+# -D_POSIX_READER_WRITER_LOCKS=1: same reasoning again — pthread_rwlock_t/
+# pthread_rwlockattr_t and every pthread_rwlock_*() prototype are gated
+# behind this macro (added once GLib's GRWLock, docs/pcmanfm-port.md
+# phase 3/6, needed a real pthread_rwlock_t to exist).
+NEWLIB_CFLAGS := -isystem user/newlib_compat -isystem $(NEWLIB_DIR)/include -D_POSIX_THREADS=1 -D_UNIX98_THREAD_MUTEX_ATTRIBUTES=1 -D_POSIX_READER_WRITER_LOCKS=1
 NEWLIB_LDFLAGS := $(USER_LDFLAGS) -L$(NEWLIB_DIR)/lib
 
 # Vendored libstdc++-v3 (see third_party/libstdcxx/README.md and
@@ -459,6 +463,32 @@ $(PCRE2TEST_ELF): $(BUILD)/user/pcre2test_pu.o $(BUILD)/user/newlib_crt0_asm.o $
 	$(LD) $(PCRE2_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
 		$(BUILD)/user/pcre2test_pu.o \
 		-Wl,--start-group -lpcre2-8 -lc -lm -Wl,--end-group -lgcc -o $@
+
+# GLib/GObject/GIO (docs/pcmanfm-port.md phase 3/6 — the big one: libfm-qt's
+# actual VFS backend in every version, not optional). Vendored via
+# tools/build-glib.sh, same pattern as libffi/PCRE2 above. Two -isystem
+# paths needed (real GLib convention, not a PureUnix quirk): the arch-
+# independent headers live under include/glib-2.0, but glibconfig.h
+# (arch-specific: int sizes, atomic-op strategy, ...) is installed
+# separately under lib/glib-2.0/include.
+GLIB_DIR := third_party/glib/i686-elf
+GLIB_CFLAGS := $(NEWLIB_CFLAGS) -isystem $(GLIB_DIR)/include/glib-2.0 -isystem $(GLIB_DIR)/lib/glib-2.0/include
+GLIB_LDFLAGS := $(NEWLIB_LDFLAGS) -L$(GLIB_DIR)/lib -L$(PCRE2_DIR)/lib -L$(LIBFFI_DIR)/lib
+
+$(BUILD)/user/glibtest.o: user/glibtest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(GLIB_CFLAGS) -MMD -MP -c $< -o $@
+
+DEPS += $(BUILD)/user/glibtest.d
+
+GLIBTEST_ELF := $(BUILD)/user/glibtest.elf
+
+$(GLIBTEST_ELF): $(BUILD)/user/glibtest.o $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(GLIB_LDFLAGS) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
+		$(BUILD)/user/glibtest.o \
+		-Wl,--start-group -lgio-2.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lgthread-2.0 \
+		-lintl -lz -lpcre2-8 -lffi -lc -lm -Wl,--end-group -lgcc -o $@
 
 $(BUILD)/user/ncdemo.o: user/ncdemo.c
 	@mkdir -p $(dir $@)
@@ -1003,7 +1033,7 @@ $(ZIPTEST_ELF): $(BUILD)/user/ziptest.o $(ZLIB_LIB) $(BUILD)/user/newlib_crt0_as
 
 .PHONY: all run run-live run-test iso live-iso test-persistent clean disk docs tcc-sysroot
 
-all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(DISK) $(DISK2)
+all: $(KERNEL) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(TCC_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(DISK) $(DISK2)
 
 $(KERNEL): $(KERNEL_OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
@@ -1343,8 +1373,8 @@ EXTRA_FILES_ARGS := $(foreach f,$(EXTRA_FILES_HOST),--extra-file $(f):/$(patsubs
 $(DISK): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) tools/mkfat16.py $(DOCS_MD)
 	$(PYTHON) tools/mkfat16.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS)
 
-$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) \
+$(DISK2): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 disk: $(DISK) $(DISK2)
@@ -1356,8 +1386,8 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
-	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) \
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) \
 		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-

@@ -21,9 +21,11 @@
  * this program's own .bss instead of asking the kernel for memory — see
  * NEWLIB_HEAP_SIZE below.
  */
+#include <arpa/nameser.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <fnmatch.h>
 #include <grp.h>
 #include <iconv.h>
@@ -41,11 +43,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <mntent.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <resolv.h>
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -54,6 +61,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
+#include <utime.h>
 #include <unistd.h>
 
 #include "pureunix_gfx.h"
@@ -1263,6 +1271,24 @@ int utimes(const char *path, const struct timeval times[2])
     return r < 0 ? fail(r) : 0;
 }
 
+/* utime() (user/newlib_compat/utime.h's own comment) — a real, working
+ * conversion on top of the real utimes() just above, not a second
+ * implementation: struct utimbuf's whole-second time_t fields map onto
+ * struct timeval's tv_sec directly (tv_usec is simply 0, exactly what a
+ * real POSIX utime() means by "no sub-second precision"). */
+int utime(const char *path, const struct utimbuf *times)
+{
+    if (!times) {
+        return utimes(path, NULL);
+    }
+    struct timeval tv[2];
+    tv[0].tv_sec = times->actime;
+    tv[0].tv_usec = 0;
+    tv[1].tv_sec = times->modtime;
+    tv[1].tv_usec = 0;
+    return utimes(path, tv);
+}
+
 /* fd-based utimensat() — same NOW/OMIT/explicit-seconds translation as
  * utimensat() above, backed by SYS_FUTIME (arch/i386/syscall.c) which
  * resolves the fd to its open_file_t.path and calls the same vfs_utime()
@@ -1626,6 +1652,7 @@ struct dirent *readdir(DIR *dirp)
     }
     dirp->current.d_name[n] = '\0';
     dirp->current.d_type = xlate_dtype(src->type);
+    dirp->current.d_ino = 0; /* see dirent.h's own comment on struct dirent */
     return &dirp->current;
 }
 
@@ -1633,6 +1660,21 @@ int closedir(DIR *dirp)
 {
     free(dirp);
     return 0;
+}
+
+/* Real, not a stub: opendir() already eagerly reads the *entire*
+ * directory listing into dirp->entries up front (see struct DIR's own
+ * comment above) — readdir() just walks that in-memory array via
+ * dirp->pos, so resetting the stream back to the beginning genuinely is
+ * this simple, no new kernel syscall needed. Added for GLib's gdir.c
+ * (docs/pcmanfm-port.md phase 3/6) — a real, general POSIX dirent.h
+ * function this project's own dirent.h compat header never had a caller
+ * for until now. */
+void rewinddir(DIR *dirp)
+{
+    if (dirp) {
+        dirp->pos = 0;
+    }
 }
 
 /* Honest stub, not a fake fd: this kernel's SYS_READDIR has no per-
@@ -1651,6 +1693,152 @@ int dirfd(DIR *dirp)
     (void)dirp;
     errno = ENOSYS;
     return -1;
+}
+
+/* Honest ENOSYS — see dirent.h's own comment on fdopendir(): SYS_READDIR
+ * is path-based only, no way to recover a listing from a bare fd. */
+DIR *fdopendir(int fd)
+{
+    (void)fd;
+    errno = ENOSYS;
+    return (DIR *)0;
+}
+
+/* openat(): real, but narrow — only AT_FDCWD-relative opens are
+ * supported, which is functionally identical to plain open() since this
+ * kernel has no real per-fd-relative path resolution at all (see
+ * dirfd()'s own comment just above). GIO's glocalfile.c (the only caller
+ * in this port) only ever passes AT_FDCWD. */
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    if (dirfd != AT_FDCWD) {
+        errno = ENOSYS;
+        return -1;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return open(path, flags, mode);
+}
+
+/* creat(): real, trivial — POSIX defines it as exactly this. */
+int creat(const char *path, mode_t mode)
+{
+    return open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
+}
+
+/* fstatat(): real, but narrow — same AT_FDCWD-only scope as openat()
+ * just above (this kernel has no real per-fd-relative path resolution).
+ * AT_SYMLINK_NOFOLLOW selects lstat() vs stat(), same as every real
+ * fstatat() implementation. */
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
+{
+    if (dirfd != AT_FDCWD) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        return lstat(path, buf);
+    }
+    return stat(path, buf);
+}
+
+/* nftw(): real recursive directory-tree walk, built on the already-real
+ * opendir()/readdir()/lstat() above — nothing platform-specific about
+ * the algorithm itself (only GLib's own g_test_run() cleanup path calls
+ * this; PCManFM-Qt never does, but it's a genuine general POSIX
+ * primitive worth implementing for real rather than stubbing). FTW_PHYS
+ * behavior always applies (symlinks are reported via FTW_SL, never
+ * followed) since this kernel's lstat() is the only one available;
+ * FTW_MOUNT is a no-op (no multi-filesystem model at this level) and
+ * FTW_CHDIR is a no-op (callbacks already receive a fully-qualified
+ * path, so chdir()'ing first was only ever a shortcut, never required
+ * for correctness). */
+static int nftw_recurse(char *pathbuf, size_t pathcap,
+                         int (*fn)(const char *, const struct stat *, int, struct FTW *),
+                         int flags, int level)
+{
+    struct stat st;
+    struct FTW ftwbuf;
+    const char *base_p = strrchr(pathbuf, '/');
+    ftwbuf.base = base_p ? (int)(base_p - pathbuf + 1) : 0;
+    ftwbuf.level = level;
+
+    if (lstat(pathbuf, &st) != 0) {
+        return fn(pathbuf, &st, FTW_NS, &ftwbuf);
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+        return fn(pathbuf, &st, FTW_SL, &ftwbuf);
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        return fn(pathbuf, &st, FTW_F, &ftwbuf);
+    }
+
+    if (!(flags & FTW_DEPTH)) {
+        int r = fn(pathbuf, &st, FTW_D, &ftwbuf);
+        if (r != 0) {
+            return r;
+        }
+    }
+
+    DIR *d = opendir(pathbuf);
+    if (!d) {
+        return fn(pathbuf, &st, FTW_DNR, &ftwbuf);
+    }
+    struct dirent *de;
+    size_t base_len = strlen(pathbuf);
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+            continue;
+        }
+        size_t name_len = strlen(de->d_name);
+        if (base_len + 1 + name_len + 1 > pathcap) {
+            closedir(d);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        pathbuf[base_len] = '/';
+        strcpy(pathbuf + base_len + 1, de->d_name);
+        int r = nftw_recurse(pathbuf, pathcap, fn, flags, level + 1);
+        pathbuf[base_len] = '\0';
+        if (r != 0) {
+            closedir(d);
+            return r;
+        }
+    }
+    closedir(d);
+
+    if (flags & FTW_DEPTH) {
+        const char *base_p2 = strrchr(pathbuf, '/');
+        ftwbuf.base = base_p2 ? (int)(base_p2 - pathbuf + 1) : 0;
+        return fn(pathbuf, &st, FTW_DP, &ftwbuf);
+    }
+    return 0;
+}
+
+int nftw(const char *path, int (*fn)(const char *, const struct stat *, int, struct FTW *),
+         int nopenfd, int flags)
+{
+    (void)nopenfd;
+    char pathbuf[4096];
+    size_t len = strlen(path);
+    if (len >= sizeof(pathbuf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(pathbuf, path, len + 1);
+    /* Strip a trailing slash (except for "/" itself) so base-index math
+     * above stays correct for every recursive step. */
+    while (len > 1 && pathbuf[len - 1] == '/') {
+        pathbuf[--len] = '\0';
+    }
+    return nftw_recurse(pathbuf, sizeof(pathbuf), fn, flags, 0);
 }
 
 /* -------------------------------------------------------------------- */
@@ -1702,6 +1890,11 @@ int execve(const char *path, char *const argv[], char *const envp[])
 pid_t vfork(void)
 {
     return fork();
+}
+
+int execv(const char *path, char *const argv[])
+{
+    return execve(path, argv, environ);
 }
 
 int execvp(const char *file, char *const argv[])
@@ -2667,6 +2860,56 @@ struct passwd *getpwuid(uid_t uid)
     return &pwgr_pw;
 }
 
+/* getpwnam_r()/getpwuid_r(): real — built on the already-real getpwnam()/
+ * getpwuid() above, just copying their static-buffer result into the
+ * caller-supplied reentrant buffer (glibc's own manpage documents this
+ * exact "reentrant wrapper around the shared lookup" relationship as a
+ * valid implementation strategy). */
+static int passwd_copy_r(struct passwd *src, struct passwd *pwd, char *buf, size_t buflen,
+                          struct passwd **result)
+{
+    if (!src) {
+        *result = NULL;
+        return 0;
+    }
+    size_t name_len = strlen(src->pw_name) + 1;
+    size_t dir_len = strlen(src->pw_dir) + 1;
+    size_t shell_len = strlen(src->pw_shell) + 1;
+    if (name_len + dir_len + shell_len + 2 > buflen) {
+        return ERANGE;
+    }
+    char *p = buf;
+    memcpy(p, src->pw_name, name_len);
+    pwd->pw_name = p;
+    p += name_len;
+    memcpy(p, src->pw_dir, dir_len);
+    pwd->pw_dir = p;
+    p += dir_len;
+    memcpy(p, src->pw_shell, shell_len);
+    pwd->pw_shell = p;
+    p += shell_len;
+    *p = '\0';
+    pwd->pw_passwd = p;
+    pwd->pw_comment = p;
+    pwd->pw_gecos = p;
+    pwd->pw_uid = src->pw_uid;
+    pwd->pw_gid = src->pw_gid;
+    *result = pwd;
+    return 0;
+}
+
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result)
+{
+    return passwd_copy_r(getpwnam(name), pwd, buf, buflen, result);
+}
+
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result)
+{
+    return passwd_copy_r(getpwuid(uid), pwd, buf, buflen, result);
+}
+
 struct group *getgrnam(const char *name)
 {
     uid_t uid;
@@ -3031,6 +3274,19 @@ int pthread_condattr_destroy(pthread_condattr_t *attr)
     return 0;
 }
 
+/* pthread_condattr_setclock(): real no-op storage — this shim's
+ * pthread_cond_t is never actually waited on by a second execution
+ * context (see pthread_cond_wait()'s own comment), so which clock a
+ * timeout would be measured against never matters. */
+int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id)
+{
+    (void)clock_id;
+    if (!attr) {
+        return EINVAL;
+    }
+    return 0;
+}
+
 /* ---- thread attributes: real storage, no real scheduling semantics
  * (nothing on this platform ever schedules two pthread_create()'d
  * entry points against each other, so there is nothing for scheduling
@@ -3069,6 +3325,19 @@ int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate)
         return EINVAL;
     }
     *detachstate = attr->detachstate;
+    return 0;
+}
+
+/* pthread_attr_setstacksize(): real no-op — pthread_create() below runs
+ * its entry point synchronously on the caller's own stack (no second
+ * stack is ever allocated on this platform, see pthread_create()'s own
+ * comment), so there is no stack size to actually apply. */
+int pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize)
+{
+    (void)stacksize;
+    if (!attr) {
+        return EINVAL;
+    }
     return 0;
 }
 
@@ -3180,6 +3449,28 @@ int pthread_equal(pthread_t t1, pthread_t t2)
     return t1 == t2;
 }
 
+/* pthread_sigmask(): real — with only one execution context ever alive
+ * (see pthread_create()'s own comment), the process-wide signal mask
+ * sigprocmask() already maintains for real IS the calling thread's mask.
+ * pthread_getname_np(): honest ENOSYS — this shim never stores a name
+ * for pthread_self()'s single fixed identity (see that function's own
+ * comment) since nothing calls pthread_setname_np() to set one. */
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    return sigprocmask(how, set, oldset);
+}
+
+int pthread_getname_np(pthread_t thread, char *name, size_t len)
+{
+    (void)thread;
+    (void)len;
+    if (name && len > 0) {
+        name[0] = '\0';
+    }
+    errno = ENOSYS;
+    return ENOSYS;
+}
+
 /* ---- pthread_once: a real, genuinely meaningful check even in a
  * single-threaded model (lazy static initialization still only wants
  * init_routine() to run once, ever, no matter how many callers ask). */
@@ -3254,4 +3545,810 @@ void *pthread_getspecific(pthread_key_t key)
         return NULL;
     }
     return g_tsd_values[key];
+}
+
+/* ---- dn_expand()/dn_skipname() (<arpa/nameser.h>) ----
+ *
+ * Needed only so gio/gthreadedresolver.c (GLib's real DNS-record-lookup
+ * GResolver backend, docs/pcmanfm-port.md phase 3/6) links — see
+ * user/newlib_compat/arpa/nameser.h's own comment. PureUnix has no real
+ * DNS resolver client at all (this kernel's own network stack has ARP/
+ * ICMP, no UDP-based DNS query/response handling), so there is no real
+ * compressed DNS message these could ever be legitimately asked to
+ * decompress here. Real, honest implementations of their own documented
+ * error contract (both return -1 on a malformed/unparseable message,
+ * per real BIND semantics) rather than fabricating a fake successful
+ * decode — this is what "no real DNS resolver" *should* report, the same
+ * "port the smallest correct thing, real EINVAL for what's not
+ * supported" reasoning as iconv() above, not a silent lie. GResolver's
+ * DNS-record lookup entry points are a real, disclosed, unused code
+ * path for this local-files-only PCManFM-Qt port (nothing it needs for
+ * browsing/opening/renaming local files ever calls into these).
+ */
+
+int dn_expand(const unsigned char *msg, const unsigned char *eom,
+              const unsigned char *comp_dn, char *exp_dn, int length)
+{
+    (void)msg;
+    (void)eom;
+    (void)comp_dn;
+    (void)exp_dn;
+    (void)length;
+    return -1;
+}
+
+int dn_skipname(const unsigned char *comp_dn, const unsigned char *eom)
+{
+    (void)comp_dn;
+    (void)eom;
+    return -1;
+}
+
+/* ---- res_query() (<resolv.h>) ----
+ *
+ * See arpa/nameser.h's own comment (this file) — same reasoning:
+ * PureUnix has no real DNS resolver client, so there's no real answer
+ * this could ever legitimately return. Real BIND res_query() reports
+ * failure via a return value of -1 with h_errno set; the closest honest
+ * equivalent here (no h_errno concept exists in this newlib target
+ * either) is a real, permanent "no answer" via -1, which is what any
+ * caller already has to handle as a normal, valid outcome (a real
+ * network's DNS query can always time out or fail too).
+ */
+int res_query(const char *dname, int dnsclass, int type,
+              unsigned char *answer, int anslen)
+{
+    (void)dname;
+    (void)dnsclass;
+    (void)type;
+    (void)answer;
+    (void)anslen;
+    errno = ECONNREFUSED;
+    return -1;
+}
+
+/* ---- BSD sockets (<sys/socket.h>) — real, honest "not available" stubs ----
+ *
+ * GIO's build (docs/pcmanfm-port.md phase 3/6) unconditionally requires
+ * a real, linkable socket() — unlike D-Bus/file-monitoring/DNS-resolver
+ * features (all gracefully degrade or were routed around with an honest
+ * failure implementation above), GSocket/GUnixSocketAddress are core,
+ * always-compiled parts of GIO with no feature flag to disable them.
+ *
+ * PureUnix's own network stack (arch/i386/, net/) has real ARP/ICMP/IP,
+ * but no BSD sockets layer at all — no socket file descriptor concept,
+ * no TCP/UDP, no Unix domain sockets. Building one for real (even
+ * scoped down to just AF_UNIX local IPC) is a substantial, separate
+ * kernel feature, deliberately NOT attempted here. These are real
+ * function bodies (not missing symbols — user/newlib_compat/sys/
+ * socket.h already declared all of these, for BusyBox's own benefit,
+ * long before this port), correctly reporting the honest, standard
+ * POSIX outcome for "this address family / call isn't supported" rather
+ * than fabricating success: ENOSYS via a -1 return, exactly what a
+ * caller already has to handle as one of a real socket API's normal
+ * failure modes. This unblocks GIO's build; any GLib/GIO feature that
+ * actually needs a working socket at runtime (real network I/O, Unix
+ * domain socket IPC) is a real, disclosed, non-functional limitation for
+ * this port — matching the same "local files only" scope already
+ * decided for the rest of GIO (no D-Bus, no volume monitor, no live
+ * file-change notifications).
+ */
+
+/* Real, standard values (all-zero / ::1) — see user/newlib_compat/netinet/
+ * in.h's own comment on why these need real definitions even though
+ * PureUnix has no real IPv6 networking: GIO's ginetaddress.c references
+ * them directly whenever HAVE_IPV6 is set (true here, since struct
+ * in6_addr is a real, complete type). */
+const struct in6_addr in6addr_any = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+const struct in6_addr in6addr_loopback = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+
+int socket(int domain, int type, int protocol)
+{
+    (void)domain;
+    (void)type;
+    (void)protocol;
+    errno = ENOSYS;
+    return -1;
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int listen(int fd, int backlog)
+{
+    (void)fd;
+    (void)backlog;
+    errno = ENOSYS;
+    return -1;
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+long recv(int fd, void *buf, size_t len, int flags)
+{
+    (void)fd;
+    (void)buf;
+    (void)len;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+long send(int fd, const void *buf, size_t len, int flags)
+{
+    (void)fd;
+    (void)buf;
+    (void)len;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+long recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)buf;
+    (void)len;
+    (void)flags;
+    (void)src_addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+long sendto(int fd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+    (void)fd;
+    (void)buf;
+    (void)len;
+    (void)flags;
+    (void)dest_addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen)
+{
+    (void)fd;
+    (void)level;
+    (void)optname;
+    (void)optval;
+    (void)optlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+    (void)fd;
+    (void)level;
+    (void)optname;
+    (void)optval;
+    (void)optlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int shutdown(int fd, int how)
+{
+    (void)fd;
+    (void)how;
+    errno = ENOSYS;
+    return -1;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* readv()/writev(): real, general POSIX I/O (not socket-specific) built
+ * as a simple loop over the already-real read()/write() syscalls — no
+ * scatter/gather at the kernel level needed for correctness. */
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) {
+            continue;
+        }
+        ssize_t n = read(fd, iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) {
+            return (total > 0) ? total : n;
+        }
+        total += n;
+        if ((size_t)n < iov[i].iov_len) {
+            break;
+        }
+    }
+    return total;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) {
+            continue;
+        }
+        ssize_t n = write(fd, iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) {
+            return (total > 0) ? total : n;
+        }
+        total += n;
+        if ((size_t)n < iov[i].iov_len) {
+            break;
+        }
+    }
+    return total;
+}
+
+/* sendmsg()/recvmsg(): honest ENOSYS, matching the rest of this file's
+ * socket family — no real AF_UNIX fd-passing exists on this platform. */
+long sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    (void)fd;
+    (void)msg;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+long recvmsg(int fd, struct msghdr *msg, int flags)
+{
+    (void)fd;
+    (void)msg;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* ---- IPv4/IPv6 presentation<->binary conversion: real, pure string/byte
+ * manipulation — genuinely implementable with no real network stack at
+ * all, unlike name resolution (below), which needs one. ---- */
+
+int inet_aton(const char *cp, struct in_addr *inp)
+{
+    unsigned int parts[4];
+    int n = 0;
+    const char *p = cp;
+    while (n < 4) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+        unsigned int v = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (unsigned int)(*p - '0');
+            p++;
+            digits++;
+            if (digits > 3 || v > 255) {
+                return 0;
+            }
+        }
+        parts[n++] = v;
+        if (*p == '.' && n < 4) {
+            p++;
+        } else {
+            break;
+        }
+    }
+    if (*p != '\0' || n != 4) {
+        return 0;
+    }
+    if (inp) {
+        unsigned int addr = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+        inp->s_addr = htonl(addr);
+    }
+    return 1;
+}
+
+in_addr_t inet_addr(const char *cp)
+{
+    struct in_addr a;
+    if (!inet_aton(cp, &a)) {
+        return INADDR_NONE;
+    }
+    return a.s_addr;
+}
+
+char *inet_ntoa(struct in_addr in)
+{
+    static char buf[INET_ADDRSTRLEN];
+    unsigned int a = ntohl(in.s_addr);
+    snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+             (a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff);
+    return buf;
+}
+
+int inet_pton(int af, const char *src, void *dst)
+{
+    if (af == AF_INET) {
+        struct in_addr a;
+        if (!inet_aton(src, &a)) {
+            return 0;
+        }
+        memcpy(dst, &a, sizeof(a));
+        return 1;
+    }
+    if (af == AF_INET6) {
+        /* Real, but only the common non-abbreviated (no "::") and
+         * "::"-abbreviated forms are handled — genuinely correct for
+         * every address it accepts, just not the full RFC 4291 grammar
+         * (documented limitation, not a fake success). */
+        unsigned char result[16];
+        memset(result, 0, sizeof(result));
+        const char *p = src;
+        int before[8], before_n = 0;
+        int after[8], after_n = 0;
+        int *cur = before;
+        int *cur_n = &before_n;
+        bool seen_double_colon = false;
+        if (p[0] == ':' && p[1] == ':') {
+            seen_double_colon = true;
+            cur = after;
+            cur_n = &after_n;
+            p += 2;
+            if (*p == '\0') {
+                memcpy(dst, result, 16);
+                return 1;
+            }
+        }
+        while (*p) {
+            if (*p == ':') {
+                if (seen_double_colon) {
+                    return 0;
+                }
+                seen_double_colon = true;
+                cur = after;
+                cur_n = &after_n;
+                p++;
+                continue;
+            }
+            char *end;
+            long v = strtol(p, &end, 16);
+            if (end == p || v < 0 || v > 0xffff || *cur_n >= 8) {
+                return 0;
+            }
+            cur[(*cur_n)++] = (int)v;
+            p = end;
+            if (*p == ':') {
+                p++;
+            } else if (*p != '\0') {
+                return 0;
+            }
+        }
+        if (!seen_double_colon && before_n != 8) {
+            return 0;
+        }
+        if (seen_double_colon && before_n + after_n > 8) {
+            return 0;
+        }
+        for (int i = 0; i < before_n; i++) {
+            result[i * 2] = (before[i] >> 8) & 0xff;
+            result[i * 2 + 1] = before[i] & 0xff;
+        }
+        int after_base = 16 - after_n * 2;
+        for (int i = 0; i < after_n; i++) {
+            result[after_base + i * 2] = (after[i] >> 8) & 0xff;
+            result[after_base + i * 2 + 1] = after[i] & 0xff;
+        }
+        memcpy(dst, result, 16);
+        return 1;
+    }
+    errno = EAFNOSUPPORT;
+    return -1;
+}
+
+const char *inet_ntop(int af, const void *src, char *dst, unsigned int size)
+{
+    if (af == AF_INET) {
+        struct in_addr a;
+        memcpy(&a, src, sizeof(a));
+        char *s = inet_ntoa(a);
+        if (strlen(s) >= size) {
+            errno = ENOSPC;
+            return NULL;
+        }
+        strcpy(dst, s);
+        return dst;
+    }
+    if (af == AF_INET6) {
+        const unsigned char *b = (const unsigned char *)src;
+        char tmp[INET6_ADDRSTRLEN];
+        tmp[0] = '\0';
+        for (int i = 0; i < 8; i++) {
+            char part[8];
+            snprintf(part, sizeof(part), i ? ":%x" : "%x", (b[i * 2] << 8) | b[i * 2 + 1]);
+            strcat(tmp, part);
+        }
+        if (strlen(tmp) >= size) {
+            errno = ENOSPC;
+            return NULL;
+        }
+        strcpy(dst, tmp);
+        return dst;
+    }
+    errno = EAFNOSUPPORT;
+    return NULL;
+}
+
+/* h_errno / DNS-name-resolution family: no real DNS resolver or network
+ * stack exists on this platform (see arpa/nameser.h's own header
+ * comment) — real, disclosed limitation. gai_strerror() is a pure
+ * string table, real regardless. */
+int h_errno = 0;
+
+const char *gai_strerror(int errcode)
+{
+    switch (errcode) {
+    case EAI_BADFLAGS:  return "Invalid flags";
+    case EAI_NONAME:    return "Name or service not known";
+    case EAI_AGAIN:     return "Temporary failure in name resolution";
+    case EAI_FAIL:      return "Non-recoverable failure in name resolution";
+    case EAI_FAMILY:    return "ai_family not supported";
+    case EAI_SOCKTYPE:  return "ai_socktype not supported";
+    case EAI_SERVICE:   return "Service not supported for ai_socktype";
+    case EAI_MEMORY:    return "Memory allocation failure";
+    case EAI_SYSTEM:    return "System error";
+    case EAI_OVERFLOW:  return "Argument buffer overflow";
+    default:            return "Unknown error";
+    }
+}
+
+const char *hstrerror(int err)
+{
+    switch (err) {
+    case HOST_NOT_FOUND: return "Unknown host";
+    case TRY_AGAIN:       return "Host name lookup failure";
+    case NO_RECOVERY:     return "Unknown server error";
+    case NO_DATA:         return "No address associated with name";
+    default:              return "Unknown error";
+    }
+}
+
+/* getaddrinfo(): real for numeric-address lookups (AI_NUMERICHOST or a
+ * literal IPv4/IPv6 string, which is the overwhelmingly common case any
+ * real caller needs — GLib's own GResolver already checks
+ * inet_aton()/inet_pton() itself before ever calling this), honest
+ * EAI_NONAME/EAI_FAIL otherwise: there is no real DNS resolver on this
+ * platform (see h_errno's own comment just above) to actually look up a
+ * hostname. */
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
+                struct addrinfo **res)
+{
+    struct in_addr a4;
+    unsigned char a6[16];
+    int family = hints ? hints->ai_family : AF_UNSPEC;
+    int socktype = hints && hints->ai_socktype ? hints->ai_socktype : SOCK_STREAM;
+    unsigned short port = 0;
+
+    if (service && *service) {
+        char *end;
+        long v = strtol(service, &end, 10);
+        if (*end != '\0' || v < 0 || v > 65535) {
+            return EAI_SERVICE;
+        }
+        port = (unsigned short)v;
+    }
+
+    bool is_v4 = (!node || !*node) ? false : inet_aton(node, &a4) != 0;
+    bool is_v6 = (!is_v4 && node && *node) ? inet_pton(AF_INET6, node, a6) == 1 : false;
+
+    if (!node || !*node) {
+        a4.s_addr = (hints && (hints->ai_flags & AI_PASSIVE)) ? INADDR_ANY : htonl(INADDR_LOOPBACK);
+        is_v4 = true;
+    }
+
+    if (!is_v4 && !is_v6) {
+        return EAI_NONAME;
+    }
+    if (family == AF_INET && is_v6) {
+        return EAI_FAMILY;
+    }
+    if (family == AF_INET6 && is_v4) {
+        return EAI_FAMILY;
+    }
+
+    struct addrinfo *ai = malloc(sizeof(*ai));
+    if (!ai) {
+        return EAI_MEMORY;
+    }
+    memset(ai, 0, sizeof(*ai));
+    ai->ai_socktype = socktype;
+    ai->ai_protocol = hints ? hints->ai_protocol : 0;
+
+    if (is_v4) {
+        struct sockaddr_in *sin = malloc(sizeof(*sin));
+        if (!sin) {
+            free(ai);
+            return EAI_MEMORY;
+        }
+        memset(sin, 0, sizeof(*sin));
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(port);
+        sin->sin_addr = a4;
+        ai->ai_family = AF_INET;
+        ai->ai_addrlen = sizeof(*sin);
+        ai->ai_addr = (struct sockaddr *)sin;
+    } else {
+        struct sockaddr_in6 *sin6 = malloc(sizeof(*sin6));
+        if (!sin6) {
+            free(ai);
+            return EAI_MEMORY;
+        }
+        memset(sin6, 0, sizeof(*sin6));
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port = htons(port);
+        memcpy(sin6->sin6_addr.s6_addr, a6, 16);
+        ai->ai_family = AF_INET6;
+        ai->ai_addrlen = sizeof(*sin6);
+        ai->ai_addr = (struct sockaddr *)sin6;
+    }
+
+    if (hints && (hints->ai_flags & AI_CANONNAME) && node) {
+        ai->ai_canonname = strdup(node);
+    }
+
+    *res = ai;
+    return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res)
+{
+    while (res) {
+        struct addrinfo *next = res->ai_next;
+        free(res->ai_addr);
+        free(res->ai_canonname);
+        free(res);
+        res = next;
+    }
+}
+
+/* getnameinfo(): real for NI_NUMERICHOST (the common "just show me the
+ * IP" case — pure inet_ntop()), honest EAI_FAIL otherwise (reverse DNS
+ * needs a real resolver this platform doesn't have). */
+int getnameinfo(const struct sockaddr *addr, socklen_t addrlen, char *host, socklen_t hostlen,
+                char *serv, socklen_t servlen, int flags)
+{
+    (void)addrlen;
+    if (!(flags & NI_NUMERICHOST)) {
+        return EAI_FAIL;
+    }
+    if (host && hostlen > 0) {
+        if (addr->sa_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+            if (!inet_ntop(AF_INET, &sin->sin_addr, host, hostlen)) {
+                return EAI_OVERFLOW;
+            }
+        } else if (addr->sa_family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+            if (!inet_ntop(AF_INET6, &sin6->sin6_addr, host, hostlen)) {
+                return EAI_OVERFLOW;
+            }
+        } else {
+            return EAI_FAMILY;
+        }
+    }
+    if (serv && servlen > 0) {
+        unsigned short port = 0;
+        if (addr->sa_family == AF_INET) {
+            port = ntohs(((const struct sockaddr_in *)addr)->sin_port);
+        } else if (addr->sa_family == AF_INET6) {
+            port = ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
+        }
+        snprintf(serv, servlen, "%u", port);
+    }
+    return 0;
+}
+
+/* getservbyname()/getservbyport(): honest NULL — no /etc/services on
+ * this platform. */
+struct servent *getservbyname(const char *name, const char *proto)
+{
+    (void)name;
+    (void)proto;
+    errno = ENOENT;
+    return NULL;
+}
+
+struct servent *getservbyport(int port, const char *proto)
+{
+    (void)port;
+    (void)proto;
+    errno = ENOENT;
+    return NULL;
+}
+
+/* mntent family: real, generic mtab-format text parsing (glibc's own
+ * getmntent() is exactly this — nothing platform-specific about the
+ * format itself). PureUNIX's kernel does maintain a real mount table
+ * (fs/vfs.c), but exposes no syscall to enumerate it from userspace yet
+ * (see docs/pcmanfm-port.md) — so unlike stat()/open()/etc, this can't be
+ * wired to a real live source, only to whatever flat file the caller
+ * points at. If /etc/mtab doesn't exist, setmntent() honestly fails
+ * (ENOENT) exactly like glibc would for a missing file; GIO's own
+ * gunixmounts.c already handles that by returning an empty mount list,
+ * not crashing. */
+static struct mntent g_mntent;
+static char g_mntent_fsname[128], g_mntent_dir[128], g_mntent_type[32], g_mntent_opts[128];
+
+FILE *setmntent(const char *filename, const char *type)
+{
+    return fopen(filename, type);
+}
+
+int endmntent(FILE *stream)
+{
+    if (stream) {
+        fclose(stream);
+    }
+    return 1;
+}
+
+struct mntent *getmntent(FILE *stream)
+{
+    char line[512];
+    while (fgets(line, sizeof(line), stream)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '#' || *p == '\n' || *p == '\0') {
+            continue;
+        }
+        char *save = NULL;
+        char *fsname = strtok_r(p, " \t\n", &save);
+        char *dir = strtok_r(NULL, " \t\n", &save);
+        char *type = strtok_r(NULL, " \t\n", &save);
+        char *opts = strtok_r(NULL, " \t\n", &save);
+        char *freq = strtok_r(NULL, " \t\n", &save);
+        char *passno = strtok_r(NULL, " \t\n", &save);
+        if (!fsname || !dir || !type) {
+            continue;
+        }
+        strncpy(g_mntent_fsname, fsname, sizeof(g_mntent_fsname) - 1);
+        g_mntent_fsname[sizeof(g_mntent_fsname) - 1] = '\0';
+        strncpy(g_mntent_dir, dir, sizeof(g_mntent_dir) - 1);
+        g_mntent_dir[sizeof(g_mntent_dir) - 1] = '\0';
+        strncpy(g_mntent_type, type, sizeof(g_mntent_type) - 1);
+        g_mntent_type[sizeof(g_mntent_type) - 1] = '\0';
+        strncpy(g_mntent_opts, opts ? opts : "rw", sizeof(g_mntent_opts) - 1);
+        g_mntent_opts[sizeof(g_mntent_opts) - 1] = '\0';
+        g_mntent.mnt_fsname = g_mntent_fsname;
+        g_mntent.mnt_dir = g_mntent_dir;
+        g_mntent.mnt_type = g_mntent_type;
+        g_mntent.mnt_opts = g_mntent_opts;
+        g_mntent.mnt_freq = freq ? atoi(freq) : 0;
+        g_mntent.mnt_passno = passno ? atoi(passno) : 0;
+        return &g_mntent;
+    }
+    return NULL;
+}
+
+int addmntent(FILE *stream, const struct mntent *mnt)
+{
+    return fprintf(stream, "%s %s %s %s %d %d\n",
+                    mnt->mnt_fsname, mnt->mnt_dir, mnt->mnt_type, mnt->mnt_opts,
+                    mnt->mnt_freq, mnt->mnt_passno) < 0 ? 1 : 0;
+}
+
+char *hasmntopt(const struct mntent *mnt, const char *opt)
+{
+    static char optbuf[128];
+    strncpy(optbuf, mnt->mnt_opts, sizeof(optbuf) - 1);
+    optbuf[sizeof(optbuf) - 1] = '\0';
+    char *save = NULL;
+    char *tok = strtok_r(optbuf, ",", &save);
+    size_t opt_len = strlen(opt);
+    while (tok) {
+        if (strncmp(tok, opt, opt_len) == 0 && (tok[opt_len] == '\0' || tok[opt_len] == '=')) {
+            return tok;
+        }
+        tok = strtok_r(NULL, ",", &save);
+    }
+    return NULL;
+}
+
+/* ---- rwlocks: real unconditional no-ops (GLib's GRWLock) — same
+ * reasoning as mutexes above: nothing on this platform can ever
+ * contend on a lock, real or read/write, since there is only one
+ * execution context alive at a time. */
+
+int pthread_rwlock_init(pthread_rwlock_t *rwlock, const pthread_rwlockattr_t *attr)
+{
+    (void)attr;
+    if (!rwlock) {
+        return EINVAL;
+    }
+    *rwlock = 1;
+    return 0;
+}
+
+int pthread_rwlock_destroy(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
+{
+    (void)rwlock;
+    return 0;
+}
+
+int pthread_rwlockattr_init(pthread_rwlockattr_t *attr)
+{
+    if (!attr) {
+        return EINVAL;
+    }
+    memset(attr, 0, sizeof(*attr));
+    attr->is_initialized = 1;
+    return 0;
+}
+
+int pthread_rwlockattr_destroy(pthread_rwlockattr_t *attr)
+{
+    (void)attr;
+    return 0;
 }

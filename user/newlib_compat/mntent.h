@@ -20,6 +20,10 @@ extern "C" {
 #define MOUNTED "/etc/mtab"
 #define MNTTAB  "/etc/fstab"
 
+#define MNTOPT_RO   "ro"
+#define MNTOPT_RW   "rw"
+#define MNTOPT_DEFAULTS "defaults"
+
 struct mntent {
     char *mnt_fsname;
     char *mnt_dir;
