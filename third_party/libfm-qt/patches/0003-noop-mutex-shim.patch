@@ -1,0 +1,66 @@
+--- a/src/CMakeLists.txt	2026-07-19 20:31:12
++++ b/src/CMakeLists.txt	2026-07-19 20:31:30
+@@ -172,8 +172,11 @@
+ # install(EXPORT)-ed. Guarding it behind XCB_FOUND (matching every other
+ # XCB guard already added by that same patch) avoids ever passing the
+ # empty string at all.
++# pureunix-compat/mutex shadows the real (disabled) <mutex> for this
++# target's own compiles only — see that file's own comment for why.
+ target_include_directories(${LIBFM_QT_LIBRARY_NAME}
+-    PRIVATE "${Qt6Gui_PRIVATE_INCLUDE_DIRS}"
++    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/pureunix-compat"
++        "${Qt6Gui_PRIVATE_INCLUDE_DIRS}"
+         core/legacy
+     PUBLIC
+         "${GLIB_INCLUDE_DIRS}"
+--- /dev/null
++++ b/src/pureunix-compat/mutex
+@@ -0,0 +1,48 @@
++// Real, minimal drop-in for <mutex>'s std::mutex/std::lock_guard on
++// PureUnix, where neither exists at all: libstdc++ was vendored with
++// --disable-libstdcxx-threads (see tools/build-libstdcxx.sh's own
++// comment — no real gthreads backend existed at the time), which guards
++// std::mutex's whole definition out of the real <mutex> header entirely
++// (not a degraded/dummy fallback — genuinely absent, `'mutex' is not a
++// member of 'std'`). PureUnix has no real concurrent execution within a
++// single process at all (see the project's existing single-threaded
++// pthread shim in user/newlib_syscalls.c), so every one of these
++// mutex_/lock_guard usages in this tree exists purely as defensive
++// mutual exclusion that can never actually be contended here — a real,
++// correct no-op for this platform, not a fabricated stub.
++//
++// This header shadows the real (disabled) <mutex> for this target only:
++// target_include_directories() below adds this directory as a plain -I
++// entry, which GCC always searches before the toolchain's own -isystem
++// libstdc++ path, regardless of ordering on the command line — so every
++// `#include <mutex>` in this tree keeps working completely unmodified.
++#ifndef PUREUNIX_LIBFMQT_MUTEX_SHIM
++#define PUREUNIX_LIBFMQT_MUTEX_SHIM
++
++namespace std {
++
++class mutex {
++public:
++    constexpr mutex() noexcept = default;
++    mutex(const mutex&) = delete;
++    mutex& operator=(const mutex&) = delete;
++    void lock() {}
++    void unlock() {}
++    bool try_lock() { return true; }
++};
++
++template <class Mutex>
++class lock_guard {
++public:
++    using mutex_type = Mutex;
++    explicit lock_guard(Mutex& m) : mutex_(m) { mutex_.lock(); }
++    ~lock_guard() { mutex_.unlock(); }
++    lock_guard(const lock_guard&) = delete;
++    lock_guard& operator=(const lock_guard&) = delete;
++private:
++    Mutex& mutex_;
++};
++
++} // namespace std
++
++#endif

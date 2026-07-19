@@ -157,11 +157,19 @@ fi
 
 echo "==> Vendoring into ${VENDOR_DIR}"
 rm -rf "${VENDOR_DIR}"
-mkdir -p "${VENDOR_DIR}/include/libmenu-cache" "${VENDOR_DIR}/lib" "${VENDOR_DIR}/bin"
+mkdir -p "${VENDOR_DIR}/include/menu-cache" "${VENDOR_DIR}/lib" "${VENDOR_DIR}/bin"
 # menu-cache.h is templated (menu-cache.h.in -> menu-cache.h by
 # config.status) — it lands in the *build* tree (this script's own cwd),
 # not the pristine source tree, since this is an out-of-tree build.
-cp libmenu-cache/menu-cache.h "${VENDOR_DIR}/include/libmenu-cache/"
+# Installed under an "menu-cache" (not "libmenu-cache") include
+# subdirectory to match real upstream's own libmenu-cache.pc.in
+# (lib_menu_cache_includedir = $(includedir)/menu-cache) — libfm-qt's own
+# source uses both the flat <menu-cache.h> and nested
+# <menu-cache/menu-cache.h> include forms across different files, and
+# lxqt-build-tools' FindMenuCache.cmake only resolves both when the real
+# upstream layout is matched exactly (see third_party/menu-cache/i686-elf/
+# lib/pkgconfig/libmenu-cache.pc, which mirrors libmenu-cache.pc.in).
+cp libmenu-cache/menu-cache.h "${VENDOR_DIR}/include/menu-cache/"
 cp "${LIBFILE}" "${VENDOR_DIR}/lib/libmenu-cache.a"
 [ -f menu-cache-gen/menu-cache-gen ] && cp menu-cache-gen/menu-cache-gen "${VENDOR_DIR}/bin/"
 [ -f menu-cache-daemon/menu-cached ] && cp menu-cache-daemon/menu-cached "${VENDOR_DIR}/bin/"

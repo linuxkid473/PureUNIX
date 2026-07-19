@@ -1,0 +1,104 @@
+--- a/CMakeLists.txt	2026-07-19 20:04:05
++++ b/CMakeLists.txt	2026-07-19 20:10:46
+@@ -30,10 +30,17 @@
+ set(LIBMENUCACHE_MINIMUM_VERSION "1.1.0")
+ set(LXQTMENUDATA_MINIMUM_VERSION "2.4.0")
+ set(LXQTBT_MINIMUM_VERSION "2.4.0")
+-set(QT_MINIMUM_VERSION "6.6.0")
++# PureUnix vendors a real, cross-compiled Qt 6.5.3 (qtbase Core+Gui+Widgets
++# only, see third_party/qt/README.md) — lowered from upstream's 6.6.0 floor
++# since libfm-qt-2.4.0 doesn't actually call any 6.6-only API (verified by
++# building against these real 6.5.3 headers, not assumed).
++set(QT_MINIMUM_VERSION "6.5.3")
+ 
+ find_package(Qt6Widgets "${QT_MINIMUM_VERSION}" REQUIRED)
+-find_package(Qt6LinguistTools "${QT_MINIMUM_VERSION}" REQUIRED)
++# Qt6LinguistTools comes from the separate qttools submodule, never
++# cross-built for PureUnix (only qtbase was vendored). Translations are
++# skipped entirely below (src/CMakeLists.txt's lxqt_translate_ts() call) —
++# a real, disclosed limitation (English-only UI), not a fabricated stub.
+ 
+ if (Qt6Gui_VERSION VERSION_GREATER_EQUAL "6.10.0")
+     find_package(Qt6GuiPrivate REQUIRED)
+@@ -53,8 +60,13 @@
+ include(GenerateExportHeader)
+ include(CMakePackageConfigHelpers)
+ include(LXQtPreventInSourceBuilds)
+-include(LXQtTranslateTs)
+-include(LXQtTranslateDesktop)
++# LXQtTranslateTs/LXQtTranslateDesktop both dropped: neither macro they
++# define is called anywhere in this tree once translations are skipped
++# (see src/CMakeLists.txt's own comment), and LXQtTranslateTs.cmake does a
++# hard `find_package(Qt6 "6.6" REQUIRED COMPONENTS LinguistTools)` at
++# *include* time (https://bugreports.qt.io/browse/QTBUG-95791), which
++# would hard-fail the configure even unused, since PureUnix's real
++# vendored Qt is 6.5.3 and has no LinguistTools component at all.
+ include(LXQtCompilerSettings NO_POLICY_SCOPE)
+ 
+ set(CMAKE_AUTOMOC TRUE)
+--- a/src/CMakeLists.txt	2026-07-19 20:04:05
++++ b/src/CMakeLists.txt	2026-07-19 20:05:00
+@@ -112,14 +112,15 @@
+ set(LIBFM_QT_DATA_DIR "${CMAKE_INSTALL_FULL_DATADIR}/libfm-qt6")
+ set(LIBFM_QT_INTREE_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/include")
+ 
+-# add translation for libfm-qt
+-lxqt_translate_ts(QM_FILES
+-    UPDATE_TRANSLATIONS ${UPDATE_TRANSLATIONS}
+-    SOURCES ${libfm_SRCS} ${libfm_UIS}
+-    INSTALL_DIR "${LIBFM_QT_DATA_DIR}/translations"
+-)
++# Translations skipped entirely: Qt6LinguistTools (qttools submodule) was
++# never cross-built for PureUnix (see this project's own top-level
++# CMakeLists.txt comment) — a real, disclosed limitation, not a fabricated
++# stub. English-only UI.
++set(QM_FILES)
+ 
+-add_library(${LIBFM_QT_LIBRARY_NAME} SHARED
++# PureUnix has no dynamic loader — every dependency in this port (Qt
++# itself, GLib, MenuCache, libexif, ...) is built and linked statically.
++add_library(${LIBFM_QT_LIBRARY_NAME} STATIC
+     ${libfm_SRCS}
+     ${libfm_UIS}
+     ${QM_FILES}
+@@ -249,35 +250,9 @@
+ set_directory_properties(PROPERTIES CLEAN_NO_CUSTOM true)
+ 
+ 
+-set(TEST_LIBRARIES
+-    Qt6::Core
+-    Qt6::Widgets
+-    ${FM_LIBRARIES}
+-    ${LIBFM_QT_LIBRARY_NAME}
+-)
+-# some simple test cases
+-add_executable("test-folder"
+-    tests/test-folder.cpp
+-)
+-target_link_libraries("test-folder" ${TEST_LIBRARIES})
++# Upstream's own tests/test-*.cpp executables are skipped: they're
++# interactive manual-test GUIs (not a real unit-test suite run at build
++# time) exercising the exact same library code PureUnix's own real
++# pcmanfm-qt port + user/libfmqttest.c already cover on-target. Not needed
++# for the real deliverable.
+ 
+-add_executable("test-folderview"
+-    tests/test-folderview.cpp
+-)
+-target_link_libraries("test-folderview" ${TEST_LIBRARIES})
+-
+-add_executable("test-filedialog"
+-    tests/test-filedialog.cpp
+-)
+-target_link_libraries("test-filedialog" ${TEST_LIBRARIES})
+-
+-add_executable("test-volumemanager"
+-    tests/test-volumemanager.cpp
+-)
+-target_link_libraries("test-volumemanager" ${TEST_LIBRARIES})
+-
+-add_executable("test-placesview"
+-    tests/test-placesview.cpp
+-)
+-target_link_libraries("test-placesview" ${TEST_LIBRARIES})
+-

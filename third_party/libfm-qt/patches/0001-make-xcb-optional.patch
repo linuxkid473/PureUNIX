@@ -1,0 +1,188 @@
+--- a/CMakeLists.txt	2026-07-19 20:23:24
++++ b/CMakeLists.txt	2026-07-19 20:23:24
+@@ -44,7 +44,15 @@
+ find_package(MenuCache "${LIBMENUCACHE_MINIMUM_VERSION}" REQUIRED)
+ find_package(lxqt-menu-data "${LXQTMENUDATA_MINIMUM_VERSION}" REQUIRED)
+ find_package(Exif REQUIRED)
+-find_package(XCB REQUIRED)
++# XCB is real, standard X11 machinery for one narrow feature only
++# (folderview.cpp's XDS "direct save" drag-and-drop protocol extension,
++# in xdndworkaround.cpp) -- already runtime-guarded by libfm-qt's own
++# code (`QGuiApplication::platformName() == "xcb"`) to do nothing at all
++# on any other QPA platform, PureUnix's own "pureunix" QPA plugin
++# included. Made optional here (not REQUIRED) since no X server or XCB
++# implementation exists on this platform at all; see src/CMakeLists.txt
++# and src/folderview.cpp for the matching HAVE_XCB guards this enables.
++find_package(XCB)
+ 
+ message(STATUS "Building ${PROJECT_NAME} with Qt ${Qt6Core_VERSION}")
+ 
+--- a/src/CMakeLists.txt	2026-07-19 20:23:09
++++ b/src/CMakeLists.txt	2026-07-19 20:23:43
+@@ -93,10 +93,18 @@
+     filesearchdialog.cpp
+     filedialog.cpp
+     fm-search.c # might be moved to libfm later
+-    xdndworkaround.cpp
+     filedialoghelper.cpp
+ )
+ 
++# xdndworkaround.cpp implements one narrow, real X11-only feature (XDS
++# "direct save" drag-and-drop) that folderview.cpp's own code already
++# runtime-guards behind `QGuiApplication::platformName() == "xcb"` --
++# only compiled/linked when a real XCB was actually found (see the
++# top-level CMakeLists.txt's own comment on why XCB is optional here).
++if(XCB_FOUND)
++    list(APPEND libfm_SRCS xdndworkaround.cpp)
++endif()
++
+ set(libfm_UIS
+     file-props.ui
+     file-operation-dialog.ui
+@@ -151,6 +159,18 @@
+     SOVERSION ${LIBFM_QT_SOVERSION}
+ )
+ 
++# XCB_INCLUDE_DIRS is only ever non-empty in upstream because XCB was
++# unconditionally REQUIRED there; with it optional (see this project's own
++# XCB-optional patch), a not-found XCB leaves XCB_INCLUDE_DIRS empty, and
++# passing "" (a quoted, so still-present empty list element) to
++# target_include_directories() makes CMake resolve it as a relative path
++# against the current source dir — i.e. literally CMAKE_CURRENT_SOURCE_DIR
++# itself, which then trips a real, separate CMake error at generate time
++# ("Target ... INTERFACE_INCLUDE_DIRECTORIES property contains path ...
++# which is prefixed in the source directory") once this target is
++# install(EXPORT)-ed. Guarding it behind XCB_FOUND (matching every other
++# XCB guard already added by that same patch) avoids ever passing the
++# empty string at all.
+ target_include_directories(${LIBFM_QT_LIBRARY_NAME}
+     PRIVATE "${Qt6Gui_PRIVATE_INCLUDE_DIRS}"
+         core/legacy
+@@ -158,7 +178,6 @@
+         "${GLIB_INCLUDE_DIRS}"
+         "${GLIB_GIO_UNIX_INCLUDE_DIR}"
+         "${MENUCACHE_INCLUDE_DIRS}"
+-        "${XCB_INCLUDE_DIRS}"
+         "${EXIF_INCLUDE_DIRS}"
+     INTERFACE
+         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+@@ -171,6 +190,10 @@
+     PUBLIC "QT_NO_KEYWORDS"
+ )
+ 
++if(XCB_FOUND)
++    target_compile_definitions(${LIBFM_QT_LIBRARY_NAME} PRIVATE "HAVE_XCB")
++endif()
++
+ install(FILES
+     "${CMAKE_CURRENT_BINARY_DIR}/${LIBFM_QT_LIBRARY_NAME}_export.h"
+     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/libfm-qt6"
+--- a/src/folderview.cpp	2026-07-19 20:23:24
++++ b/src/folderview.cpp	2026-07-19 20:23:24
+@@ -46,8 +46,10 @@
+ #include <QTextEdit>
+ #include <QWidgetAction> // for detailed list header context menu
+ #include <QLabel> // for detailed list header context menu
++#ifdef HAVE_XCB
+ #include <xcb/xcb.h> // for XDS support
+ #include "xdndworkaround.h" // for XDS support
++#endif
+ #include "folderview_p.h"
+ 
+ #include <cmath>
+@@ -1572,6 +1574,13 @@
+     // NOTE: in theory, it's not possible to implement XDS with pure Qt.
+     // We achieved this with some dirty XCB/XDND workarounds.
+     // Please refer to XdndWorkaround::clientMessage() in xdndworkaround.cpp for details.
++    // Real, disclosed non-functional feature on platforms with no XCB at
++    // all (see this file's own HAVE_XCB #include guard above and the
++    // top-level CMakeLists.txt's own comment) -- this was already
++    // runtime-guarded to do nothing outside a real "xcb" QPA platform
++    // even upstream, so simply never compiling it here changes no real
++    // behavior for this port.
++#ifdef HAVE_XCB
+     if(QGuiApplication::platformName() == QStringLiteral("xcb") && e->mimeData()->hasFormat(QStringLiteral("XdndDirectSave0"))) {
+         e->setDropAction(Qt::CopyAction);
+         const QWidget* targetWidget = childView()->viewport();
+@@ -1610,6 +1619,7 @@
+         e->accept(); // yeah! we've done with XDS so stop Qt from further event propagation.
+         return;
+     }
++#endif
+ 
+     if(e->modifiers() == Qt::NoModifier) {
+         // If no key modifiers are used, pop up a menu
+--- a/src/libfmqt.cpp	2026-07-19 20:44:31
++++ b/src/libfmqt.cpp	2026-07-19 20:44:55
+@@ -21,7 +21,9 @@
+ #include <QLocale>
+ #include <QPixmapCache>
+ #include "core/thumbnailer.h"
++#ifdef HAVE_XCB
+ #include "xdndworkaround.h"
++#endif
+ #include "core/vfs/fm-file.h"
+ #include "core/legacy/fm-config.h"
+ 
+@@ -32,7 +34,13 @@
+     ~LibFmQtData();
+ 
+     QTranslator translator;
++    // XdndWorkaround's whole job is done by existing (RAII: its
++    // constructor installs a native X11 event filter, its destructor
++    // removes it) -- see this project's own XCB-optional patch comment
++    // for why HAVE_XCB is conditional here at all.
++#ifdef HAVE_XCB
+     XdndWorkaround workaround;
++#endif
+     int refCount;
+     Q_DISABLE_COPY(LibFmQtData)
+ };
+--- a/src/applaunchcontext.cpp	2026-07-19 20:46:48
++++ b/src/applaunchcontext.cpp	2026-07-19 20:47:08
+@@ -20,7 +20,9 @@
+ 
+ #include "applaunchcontext.h"
+ #include <QApplication>
++#ifdef HAVE_XCB
+ #include <X11/Xlib.h>
++#endif
+ 
+ typedef struct _FmAppLaunchContext {
+   GAppLaunchContext parent;
+@@ -29,6 +31,7 @@
+ G_DEFINE_TYPE(FmAppLaunchContext, fm_app_launch_context, G_TYPE_APP_LAUNCH_CONTEXT)
+ 
+ static char* fm_app_launch_context_get_display(GAppLaunchContext * /*context*/, GAppInfo * /*info*/, GList * /*files*/) {
++#ifdef HAVE_XCB
+   if(auto x11NativeInterface = qApp->nativeInterface<QNativeInterface::QX11Application>()) {
+     Display* dpy = x11NativeInterface->display();
+     if(dpy) {
+@@ -36,6 +39,14 @@
+       return g_strdup(xstr);
+     }
+   }
++#endif
++  // qApp->nativeInterface<QNativeInterface::QX11Application>() already
++  // returns nullptr on any non-X11 QPA platform (a real, portable Qt6
++  // mechanism, not something this project added) -- PureUnix's own QPA
++  // plugin isn't one, so this whole block was always unreachable/a no-op
++  // here even when it did compile. Guarded out entirely (rather than left
++  // to rely on that runtime null-check alone) purely to drop the compile-
++  // time <X11/Xlib.h> dependency; behavior is unchanged.
+   return nullptr;
+ }
+ 
+--- a/src/fontbutton.cpp	2026-07-19 20:49:34
++++ b/src/fontbutton.cpp	2026-07-19 20:50:00
+@@ -20,7 +20,9 @@
+ 
+ #include "fontbutton.h"
+ #include <QFontDialog>
+-#include <X11/X.h>
++// <X11/X.h> was unused dead cruft in this file (nothing here references
++// any of its symbols) — dropped, not guarded, since it's a real system
++// header PureUnix has no equivalent of at all.
+ 
+ namespace Fm {
+ 

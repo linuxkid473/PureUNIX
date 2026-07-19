@@ -1,0 +1,51 @@
+[Desktop Entry]
+Type=Directory
+Icon=preferences-system
+
+
+# Translations
+Name=LXQt Settings
+Name[ar]=إعدادات LXQt
+Name[bg]=LXQt настройки
+Name[ca]=Paràmetres de LXQt
+Name[cs]=Nastavení pro LXQt
+Name[da]=LXQt Indstillinger
+Name[de]=LXQt-Systemeinstellungen
+Name[el]=Ρυθμίσεις LXQt
+Name[es]=Configuración de LXQt
+Name[et]=LXQt seadistused
+Name[eu]=LXQt-ren konfigurazioa
+Name[fi]=LXQt:n asetukset
+Name[fr]=Paramètres de LXQt
+Name[gl]=Configuración do LXQt
+Name[he]=הגדרות LXQt
+Name[hr]=LXQt postavke
+Name[hu]=LXQt beállítások
+Name[it]=Impostazioni di LXQt
+Name[ja]=LXQt 設定
+Name[ka]=LXQt-ის მორგება
+Name[kab]=Iɣewwaṛen n LXQt
+Name[kk]=LXQt баптаулары
+Name[ko]=LXQt 설정
+Name[lg]=Enteekateeka za LXQt
+Name[lt]=LXQt nustatymai
+Name[lv]=LXQt iestatījumi
+Name[nb_NO]=LXQt-innstillinger
+Name[nl]=LXQt-instellingen
+Name[oc]=Paramètres del LXQt
+Name[pa]=LXQt ਸੈਟਿੰਗਾਂ
+Name[pl]=Ustawienia LXQt
+Name[pt]=Configurações do LXQt
+Name[pt_BR]=Configurações do LXQt
+Name[ru]=Настройки LXQt
+Name[si]=LXQt සැකසුම්
+Name[sk]=Nastavenia LXQt
+Name[sl]=Nastavitve LXQt
+Name[sr]=LXQt поставке
+Name[sr@ijekavian]=LXQt подешавања
+Name[sv]=LXQt-inställningar
+Name[tr]=LXQt Ayarları
+Name[uk]=Налаштування LXQt
+Name[vi]=Cài đặt LXQt
+Name[zh_CN]=LXQt 设置
+Name[zh_TW]=LXQt 設定

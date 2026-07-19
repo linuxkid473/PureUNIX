@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libmenu-cache
+Description: Cache for freedesktop.org menu spec
+Requires: glib-2.0
+Version: 1.1.0
+Libs: -L${libdir} -lmenu-cache
+Cflags: -I${includedir}/menu-cache

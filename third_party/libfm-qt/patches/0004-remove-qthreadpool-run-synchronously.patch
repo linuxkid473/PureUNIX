@@ -1,0 +1,83 @@
+--- a/src/core/thumbnailjob.h	2026-07-19 20:37:19
++++ b/src/core/thumbnailjob.h	2026-07-19 20:37:58
+@@ -5,7 +5,6 @@
+ #include "fileinfo.h"
+ #include "gioptrs.h"
+ #include "job.h"
+-#include <QThreadPool>
+ 
+ namespace Fm {
+ 
+@@ -21,8 +20,6 @@
+         return size_;
+     }
+ 
+-    static QThreadPool* threadPool();
+-
+     static void setLocalFilesOnly(bool value);
+ 
+     static bool localFilesOnly() {
+@@ -74,8 +71,6 @@
+     GCancellablePtr cancellable_;
+     GChecksum* md5Calc_;
+ 
+-    static QThreadPool* threadPool_;
+-
+     static bool localFilesOnly_;
+     static int maxThumbnailFileSize_;
+     static int maxExternalThumbnailFileSize_;
+--- a/src/core/thumbnailjob.cpp	2026-07-19 20:37:19
++++ b/src/core/thumbnailjob.cpp	2026-07-19 20:37:19
+@@ -12,8 +12,6 @@
+ #include "core/legacy/fm-config.h"
+ 
+ namespace Fm {
+-
+-QThreadPool* ThumbnailJob::threadPool_ = nullptr;
+ 
+ bool ThumbnailJob::localFilesOnly_ = true;
+ int ThumbnailJob::maxThumbnailFileSize_ = 4096; // in KiB
+@@ -295,14 +293,6 @@
+         }
+     }
+     return result;
+-}
+-
+-QThreadPool* ThumbnailJob::threadPool() {
+-    if(Q_UNLIKELY(threadPool_ == nullptr)) {
+-        threadPool_ = new QThreadPool();
+-        threadPool_->setMaxThreadCount(1);
+-    }
+-    return threadPool_;
+ }
+ 
+ void ThumbnailJob::setLocalFilesOnly(bool value) {
+--- a/src/foldermodel.cpp	2026-07-19 20:37:19
++++ b/src/foldermodel.cpp	2026-07-19 20:37:19
+@@ -145,9 +145,23 @@
+             auto job = new Fm::ThumbnailJob(std::move(item.pendingThumbnails_), item.size_, folder_ != nullptr && folder_->isValid() && folder_->info()->isRemoteDirectory());
+             pendingThumbnailJobs_.push_back(job);
+             job->setAutoDelete(true);
+-            connect(job, &Fm::ThumbnailJob::thumbnailLoaded, this, &FolderModel::onThumbnailLoaded, Qt::BlockingQueuedConnection);
+-            connect(job, &Fm::ThumbnailJob::finished, this, &FolderModel::onThumbnailJobFinished, Qt::BlockingQueuedConnection);
+-            Fm::ThumbnailJob::threadPool()->start(job);
++            // PureUnix has no real background threading (Qt's own "thread"
++            // feature was disabled when qtbase was cross-built — see
++            // third_party/libfm-qt/patches/0004's own comment). Upstream
++            // already ran this exact job queue on a QThreadPool capped to
++            // a single worker thread; here it just runs synchronously on
++            // the calling (GUI) thread instead of a second one.
++            // Qt::BlockingQueuedConnection (upstream's choice, correct for
++            // a real cross-thread worker->GUI handoff) would deadlock a
++            // same-thread emitter/receiver pair, so DirectConnection is
++            // used instead - behaviorally identical here since there's
++            // only ever one thread to begin with.
++            connect(job, &Fm::ThumbnailJob::thumbnailLoaded, this, &FolderModel::onThumbnailLoaded, Qt::DirectConnection);
++            connect(job, &Fm::ThumbnailJob::finished, this, &FolderModel::onThumbnailJobFinished, Qt::DirectConnection);
++            job->run();
++            if(job->autoDelete()) {
++                delete job;
++            }
+         }
+     }
+ }
