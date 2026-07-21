@@ -517,6 +517,16 @@ LIBEXIF_TEST_JPG := third_party/libexif/libexif-0.6.26/test/testdata/pentax_make
 MENU_CACHE_DIR := third_party/menu-cache/i686-elf
 MENU_CACHE_FIXTURES := third_party/menu-cache/pureunix-fixtures
 
+# PCManFM-Qt (docs/pcmanfm-port.md) — the real upstream file manager
+# itself, cross-compiled by tools/build-pcmanfm-qt.sh against libfm-qt6.a
+# (see PCMANFM_QT_DIR below). Unlike every other *_ELF above, this one is
+# never built directly by a Makefile rule — it's a vendored build-script
+# output (same pattern as menu-cache-gen/menu-cached), so it's wired in
+# purely as an --extra-file, launched by PUDE via
+# qtclient_pcmanfm_app_class (user/pude_qtclient.c).
+PCMANFM_QT_DIR := third_party/pcmanfm-qt/i686-elf
+PCMANFM_QT_ELF := $(PCMANFM_QT_DIR)/bin/pcmanfm-qt
+
 MENUCACHETEST_ELF := $(BUILD)/user/menucachetest.elf
 
 $(BUILD)/user/menucachetest.o: user/menucachetest.c
@@ -949,6 +959,32 @@ CHOCDOOM_ELF := $(BUILD)/user/chocolate-doom.elf
 # directory with zero setup on a freshly booted image.
 CHOCDOOM_IWAD := third_party/chocolate-doom/doom1.wad
 
+# Real DejaVu Sans TTF (Bitstream Vera-derived, freely redistributable --
+# see third_party/dejavu-fonts/LICENSE), shipped at /lib/fonts/DejaVuSans.ttf
+# and pointed to via QT_QPA_FONTDIR (set in user/pude_qtclient.c before
+# execve()) -- fixes the "tofu box" glyph rendering every Qt app showed
+# since no font files existed anywhere on the image (docs/qt-port.md's
+# Known gap #3: `QFontDatabase: Cannot find font directory`, confirmed via
+# `strings` on the built libs to be QBasicFontDatabase's real, compiled-in
+# QT_QPA_FONTDIR env-var override -- exactly what the warning's own text
+# suggests: "Deploy some [fonts] ... or switch to fontconfig").
+DEJAVU_FONT := third_party/dejavu-fonts/DejaVuSans.ttf
+
+# Minimal, real hicolor-spec icon theme (simple generated flat-shape PNGs,
+# not artwork, at 16/22/24/32/48px -- see third_party/hicolor-icons/
+# index.theme) covering the icon names PCManFM-Qt/libfm-qt and our own new
+# .desktop entries actually reference (folder, generic file, computer,
+# hard disk, network, a few app icons). Deployed via tools/mkext2.py's
+# --extra-dir (a whole-tree version of --extra-file, added alongside this)
+# rather than one --extra-file per icon. Fixes icons never rendering at
+# all: pcmanfm-qt falls back to a theme named "oxygen" that was never
+# deployed, and Qt's own QFreeTypeFontDatabase-adjacent icon loader
+# (QIconLoader) always checks "hicolor" as its own universal last-resort
+# fallback regardless of the app's chosen theme name, so a real hicolor
+# theme is picked up automatically without patching pcmanfm-qt itself.
+HICOLOR_ICONS_DIR := third_party/hicolor-icons
+HICOLOR_ICONS_FILES := $(shell find $(HICOLOR_ICONS_DIR) -type f 2>/dev/null)
+
 $(CHOCDOOM_ELF): $(CHOCDOOM_OBJS) $(SDL_LIB) $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o user/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(NEWLIB_LDFLAGS) -Wl,--gc-sections $(BUILD)/user/newlib_crt0_asm.o $(BUILD)/user/newlib_crt0.o $(BUILD)/user/newlib_syscalls.o \
@@ -1297,6 +1333,20 @@ $(BUILD)/user/qpa_pureunix/pureunixplugin.o: user/qpa_pureunix/pureunixplugin.cp
 
 DEPS += $(QT_PUREUNIX_QPA_OBJS:.o=.d)
 
+# Same 4 object files, archived, for any Qt consumer built by a *separate*
+# build system that can't reference $(QT_PUREUNIX_QPA_OBJS) directly --
+# currently just pcmanfm-qt (tools/build-pcmanfm-qt.sh's CMake build, see
+# tools/pureunix-pcmanfm-toolchain.cmake, which links this .a in via
+# CMAKE_CXX_STANDARD_LIBRARIES the same way it already sandwiches
+# -lstdc++/-lc/-lm). qtwindowtest.elf/qtwidgetstest.elf below keep linking
+# the raw .o's directly; this archive is purely an alternate packaging of
+# the exact same objects, not a second implementation.
+PUREUNIX_QPA_STATIC_LIB := $(BUILD)/user/qpa_pureunix/libpureunix-qpa.a
+
+$(PUREUNIX_QPA_STATIC_LIB): $(QT_PUREUNIX_QPA_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(QT_PUREUNIX_QPA_OBJS)
+
 # QtWidgets (docs/qt-port.md Phase 6's own "Phase 5" sub-step,
 # user/qtwidgetstest.cpp): adds the QtWidgets include path and its own 3
 # compiled-in resource object files (Qt6WidgetsTargets.cmake's real
@@ -1459,9 +1509,21 @@ disk: $(DISK) $(DISK2)
 # actually ends up as the writable root partition in $(ISO) below, as
 # opposed to $(DISK2) which still only ever travels as an ephemeral GRUB
 # ramdisk module in $(LIVE_ISO).
-$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) $(LIBEXIF_TEST_JPG) $(MENU_CACHE_DIR)/bin/menu-cache-gen $(MENU_CACHE_DIR)/bin/menu-cached $(MENU_CACHE_FIXTURES)/applications.menu $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
+#
+# Also the ONE place pcmanfm-qt (docs/pcmanfm-port.md) gets added, at a
+# bumped --num-groups 10 (80 MB, vs the shared 56 MB default) — safe here
+# specifically because $(ISO) (below) writes this image as a real on-disk
+# EXT2 partition via tools/mkdiskimg.py, read by GRUB/the kernel through
+# normal disk I/O, not loaded whole into RAM as a GRUB module the way
+# $(DISK2) is for $(LIVE_ISO). Adding pcmanfm-qt (~21 MB stripped) to
+# $(DISK2) at the same bumped size was tried first and produced a real,
+# confirmed GRUB "error: out of memory" during LIVE_ISO boot (see
+# tools/mkext2.py's own NUM_GROUPS comment) — this image has no such
+# ceiling, so `make run` (which boots $(ISO) via a real `-drive`, not
+# `-cdrom`+GRUB-module) is the right way to test PCManFM-Qt end-to-end.
+$(DISK_PERSISTENT): $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(TCC_ELF) $(TCC_SYSROOT_FILES) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(CHOCDOOM_IWAD) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) $(LIBEXIF_TEST_JPG) $(MENU_CACHE_DIR)/bin/menu-cache-gen $(MENU_CACHE_DIR)/bin/menu-cached $(MENU_CACHE_FIXTURES)/applications.menu $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop $(MENU_CACHE_FIXTURES)/pcmanfm-qt.desktop $(MENU_CACHE_FIXTURES)/htop.desktop $(MENU_CACHE_FIXTURES)/chocolate-doom.desktop $(MENU_CACHE_FIXTURES)/imgview.desktop $(MENU_CACHE_FIXTURES)/ncdemo.desktop $(MENU_CACHE_FIXTURES)/desktop-readme.txt $(HICOLOR_ICONS_FILES) $(PCMANFM_QT_ELF) $(DEJAVU_FONT) $(ZLIB_LIBPNG_EXTRA_DEPS) $(EXTRA_FILES_HOST) $(KERNEL) tools/mkext2.py $(DOCS_MD)
 	$(PYTHON) tools/mkext2.py $@ --docs $(DOCS_DIR) $(USER_ELFS) $(NEWLIB_ELFS) $(NEWLIB_CXX_ELFS) $(QT_ELFS) $(BUSYBOX_ELF) $(LUA_ELF) $(LUAC_ELF) $(SQLITE_ELF) $(NCDEMO_ELF) $(HTOP_ELF) $(SDLTEST_ELF) $(PUDE_ELF) $(CHOCDOOM_ELF) $(IMGVIEW_ELF) $(ZIPTEST_ELF) $(LIBFFITEST_ELF) $(PCRE2TEST_ELF) $(GLIBTEST_ELF) $(LIBEXIFTEST_ELF) $(UNIXSOCKTEST_ELF) $(MENUCACHETEST_ELF) \
-		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg --extra-file $(MENU_CACHE_DIR)/bin/menu-cache-gen:/usr/libexec/menu-cache/menu-cache-gen --extra-file $(MENU_CACHE_DIR)/bin/menu-cached:/usr/libexec/menu-cache/menu-cached --extra-file $(MENU_CACHE_FIXTURES)/applications.menu:/etc/xdg/menus/applications.menu --extra-file $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop:/usr/share/applications/pureunix-test-app.desktop $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
+		--tcc-elf $(TCC_ELF) --tcc-sysroot $(TCC_SYSROOT) --persistent-boot $(KERNEL) --num-groups 10 --extra-file $(CHOCDOOM_IWAD):/bin/doom1.wad --extra-file $(LIBEXIF_TEST_JPG):/pentax-exif-test.jpg --extra-file $(MENU_CACHE_DIR)/bin/menu-cache-gen:/usr/libexec/menu-cache/menu-cache-gen --extra-file $(MENU_CACHE_DIR)/bin/menu-cached:/usr/libexec/menu-cache/menu-cached --extra-file $(MENU_CACHE_FIXTURES)/applications.menu:/etc/xdg/menus/applications.menu --extra-file $(MENU_CACHE_FIXTURES)/pureunix-test-app.desktop:/usr/share/applications/pureunix-test-app.desktop --extra-file $(MENU_CACHE_FIXTURES)/pcmanfm-qt.desktop:/usr/share/applications/pcmanfm-qt.desktop --extra-file $(MENU_CACHE_FIXTURES)/htop.desktop:/usr/share/applications/htop.desktop --extra-file $(MENU_CACHE_FIXTURES)/chocolate-doom.desktop:/usr/share/applications/chocolate-doom.desktop --extra-file $(MENU_CACHE_FIXTURES)/imgview.desktop:/usr/share/applications/imgview.desktop --extra-file $(MENU_CACHE_FIXTURES)/ncdemo.desktop:/usr/share/applications/ncdemo.desktop --extra-file $(MENU_CACHE_FIXTURES)/desktop-readme.txt:/root/Desktop/readme.txt --extra-dir $(HICOLOR_ICONS_DIR):/usr/share/icons/hicolor --extra-file $(PCMANFM_QT_ELF):/bin/pcmanfm-qt --extra-file $(DEJAVU_FONT):/lib/fonts/DejaVuSans.ttf $(ZLIB_LIBPNG_EXTRA_FILES) $(EXTRA_FILES_ARGS)
 
 # Build-time GRUB core.img (i386-pc BIOS target): embeds boot/grub-
 # embedded.cfg as its prefix config, which just `search`es for the
@@ -1494,14 +1556,14 @@ $(GRUB_BOOT_IMG):
 # it exactly the way a real BIOS boots a flashed USB stick — no -cdrom, no
 # separate module files, no ramdisk.
 run: $(ISO)
-	$(QEMU) -m 128M -drive file=$(ISO),format=raw -boot c \
+	$(QEMU) -m 256M -drive file=$(ISO),format=raw -boot c \
 		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 
 # The original ISO9660+ramdisk-module boot, preserved unchanged for anyone
 # who wants the old fast/ephemeral dev loop (root discarded every boot).
 run-live: $(LIVE_ISO)
-	$(QEMU) -m 128M -cdrom $(LIVE_ISO) -boot d \
+	$(QEMU) -m 256M -cdrom $(LIVE_ISO) -boot d \
 		-netdev user,id=net0 -device e1000,netdev=net0 \
 		-serial stdio -no-reboot -no-shutdown
 

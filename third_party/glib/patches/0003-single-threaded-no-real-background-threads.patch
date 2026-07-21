@@ -1,0 +1,226 @@
+diff --git a/gio/gcontextspecificgroup.c b/gio/gcontextspecificgroup.c
+index 41a35de..36fab35 100644
+--- a/gio/gcontextspecificgroup.c
++++ b/gio/gcontextspecificgroup.c
+@@ -148,8 +148,27 @@ g_context_specific_group_request_state (GContextSpecificGroup *group,
+           group->requested_state = requested_state;
+           group->requested_func = requested_func;
+ 
+-          g_main_context_invoke (GLIB_PRIVATE_CALL(g_get_worker_context) (),
+-                                 g_context_specific_group_change_state, group);
++          /* PureUnix has no real background threading at all -- the
++           * worker context this normally posts to (g_get_worker_context())
++           * is deliberately never pumped by a real background thread here
++           * (see that function's own comment: on this platform,
++           * pthread_create() runs synchronously, so the thread that would
++           * normally drain it can never legitimately be a persistent
++           * "keep pumping forever" loop). g_main_context_invoke() posting
++           * an idle source there and returning immediately, followed by
++           * this function's own g_cond_wait() below, would then deadlock
++           * forever waiting for a signal nothing can ever send (real,
++           * reproduced: g_unix_volume_monitor_init() ->
++           * g_unix_mount_monitor_get() -> here, the first time any
++           * GVolumeMonitor is ever requested). Since there is only ever
++           * one real thread on this platform, running the state-change
++           * function directly, synchronously, right here is the faithful
++           * implementation, not an approximation of a "real" background
++           * transition -- this mirrors the identical fix already applied
++           * to Fm::Job::runAsync() (third_party/libfm-qt/patches/0006)
++           * and GTask's own thread pool (see g_thread_pool_new_full()'s
++           * own comment) for the same class of problem. */
++          g_context_specific_group_change_state (group);
+         }
+     }
+ 
+diff --git a/gio/gtask.c b/gio/gtask.c
+index 45006c2..bd065c0 100644
+--- a/gio/gtask.c
++++ b/gio/gtask.c
+@@ -1625,6 +1625,61 @@ task_thread_cancelled_disconnect_notify (gpointer  task,
+   g_object_unref (task);
+ }
+ 
++/* PureUnix has no real background threading at all -- pthread_create()
++ * (which g_thread_new()/GThreadPool worker threads are ultimately built
++ * on, see user/newlib_syscalls.c's own pthread section comment) runs its
++ * entry point synchronously, inline, before returning. GLib's shared
++ * task_pool is a real, persistent keep-alive thread pool: the first push
++ * to an empty pool spawns a real worker thread whose own loop
++ * (g_thread_pool_thread_proxy -> g_thread_pool_wait_for_new_task ->
++ * g_async_queue_pop on an otherwise-empty queue) blocks forever waiting
++ * for the *next* task after finishing this one -- a real, deliberate,
++ * infinite "keep this thread alive for reuse" design. Running that
++ * synchronously deadlocks the very first g_task_run_in_thread() caller
++ * forever (reproduced directly: g_file_monitor_file()'s polling
++ * fallback calls g_file_query_info_async(), which is exactly this path).
++ *
++ * An *inline* synchronous call (the first real version of this fix) is
++ * NOT correct either, and was found the hard way via a real, reproduced
++ * crash: g_task_run_in_thread() is always called from *inside* a real
++ * public GIO entry point (g_file_query_info_async(), etc.) that the
++ * caller expects to return before any callback fires -- exactly like
++ * every other real async API. Running the task's own worker function AND
++ * its completion callback fully inline, reentrantly, before that outer
++ * call has even returned, meant the callback could run (and free/replace
++ * a GCancellable or GFile the caller was still in the middle of storing
++ * a reference to) *before* the caller's own bookkeeping for this exact
++ * operation had finished -- observed as real, intermittent
++ * g_object_ref()/g_file_query_info_async() "assertion ... failed"
++ * warnings immediately followed by a genuine use-after-free page fault
++ * inside PCManFM-Qt's own folder-listing code (docs/pcmanfm-port.md's
++ * dated entry). Deferred-to-next-main-loop-iteration execution (a real
++ * GSource attached to the task's own thread-default context, task->context,
++ * exactly what g_task_return() itself already uses to schedule the
++ * *completion* callback) fixes this the same way this project's own
++ * Fm::Job::runAsync() fix (third_party/libfm-qt/patches/0006,
++ * QTimer::singleShot(0, ...) instead of inline synchronous execution)
++ * already fixed the identical class of problem one layer up the stack --
++ * the caller always gets to finish returning first, just like a real
++ * background thread would give it, before anything can call back in. */
++static gboolean
++g_task_run_in_thread_idle_cb (gpointer user_data)
++{
++  GTask *task = user_data;
++  g_task_thread_pool_thread (task, NULL);
++  return G_SOURCE_REMOVE;
++}
++
++static void
++g_task_run_in_thread_synchronously (GTask *task)
++{
++  GSource *source = g_idle_source_new ();
++  g_object_ref (task);
++  g_source_set_callback (source, g_task_run_in_thread_idle_cb, task, NULL);
++  g_source_attach (source, task->context);
++  g_source_unref (source);
++}
++
+ static void
+ g_task_start_task_thread (GTask           *task,
+                           GTaskThreadFunc  task_func)
+@@ -1646,7 +1672,7 @@ g_task_start_task_thread (GTask           *task,
+         {
+           task->thread_cancelled = task->thread_complete = TRUE;
+           TRACE (GIO_TASK_AFTER_RUN_IN_THREAD (task, task->thread_cancelled));
+-          g_thread_pool_push (task_pool, g_object_ref (task), NULL);
++          g_task_run_in_thread_synchronously (task);
+           return;
+         }
+ 
+@@ -1667,7 +1693,7 @@ g_task_start_task_thread (GTask           *task,
+ 
+   if (g_private_get (&task_private))
+     task->blocking_other_task = TRUE;
+-  g_thread_pool_push (task_pool, g_object_ref (task), NULL);
++  g_task_run_in_thread_synchronously (task);
+ }
+ 
+ /**
+diff --git a/glib/gmain.c b/glib/gmain.c
+index 94dcb7c..027a74d 100644
+--- a/glib/gmain.c
++++ b/glib/gmain.c
+@@ -6814,7 +6814,27 @@ g_get_worker_context (void)
+       pthread_sigmask (SIG_SETMASK, &all, &prev_mask);
+ #endif
+       glib_worker_context = g_main_context_new ();
+-      g_thread_new ("gmain", glib_worker_main, NULL);
++      /* PureUnix has no real background threading at all -- pthread_create()
++       * runs its entry point synchronously, inline, before returning (see
++       * user/newlib_syscalls.c's own pthread section comment), because
++       * nothing on this platform can ever genuinely run two threads
++       * concurrently. That's a correct simplification for a job that
++       * eventually finishes, but glib_worker_main() above is a real,
++       * deliberate *infinite* loop (`while (TRUE) g_main_context_iteration
++       * (..., TRUE)`) -- its whole purpose is to run forever pumping this
++       * shared worker context. Spawning it synchronously would mean the
++       * first caller of g_get_worker_context() (e.g. glocalfileinfo.c's
++       * file_is_hidden(), reached by any g_file_query_info() call that
++       * requests "standard::is-hidden") blocks forever on its very first
++       * call, never returning -- a real, reproduced deadlock, not a
++       * hypothetical one. Skip spawning it: glib_worker_context is still a
++       * real, valid, attachable GMainContext (safe for callers that just
++       * want a shared context to add a GSource to), it's simply never
++       * pumped by a background thread -- any source attached to it (idle
++       * timeouts, GTask async completions) will just never fire, a real,
++       * disclosed limitation matching this codebase's existing "disable
++       * unsupported feature" precedent (e.g. -no-feature-thread for Qt). */
++      (void) glib_worker_main;
+ #ifdef G_OS_UNIX
+       pthread_sigmask (SIG_SETMASK, &prev_mask, NULL);
+ #endif
+diff --git a/glib/gthreadpool.c b/glib/gthreadpool.c
+index 8441b9d..abd37a1 100644
+--- a/glib/gthreadpool.c
++++ b/glib/gthreadpool.c
+@@ -437,11 +437,27 @@ g_thread_pool_start_thread (GRealThreadPool  *pool,
+       GThread *thread;
+ 
+       /* No thread was found, we have to start a new one */
+-      if (pool->pool.exclusive)
++      if (pool->pool.exclusive || spawn_thread_queue == NULL)
+         {
+           /* For exclusive thread-pools this is directly called from new() and
+            * we simply start new threads that inherit the scheduler settings
+            * from the current thread.
++           *
++           * PureUnix also always takes this branch even for non-exclusive
++           * pools (spawn_thread_queue is never created here -- see
++           * g_thread_pool_new_full()'s own comment): this platform has no
++           * real background threading at all (pthread_create() runs its
++           * entry point synchronously, inline, before returning -- see
++           * user/newlib_syscalls.c's own pthread section comment), so the
++           * "go via a dedicated pool-spawner helper thread to inherit
++           * scheduler settings" indirection that real non-exclusive pools
++           * use is a distinction without a difference here: there is only
++           * ever one thread, so this thread's own scheduler settings ARE
++           * the settings any new "thread" would need anyway. Going via the
++           * real pool-spawner mechanism instead deadlocks immediately, since
++           * that helper thread's own body is a genuine infinite loop (see
++           * g_thread_pool_spawn_thread()) that a synchronous pthread_create()
++           * can never return from.
+            */
+           char name[16];
+ 
+@@ -624,27 +640,20 @@ g_thread_pool_new_full (GFunc           func,
+    * created immediately below and are running forever, so they will
+    * automatically inherit the scheduler settings from this very thread.
+    */
+-  if (!exclusive && !spawn_thread_queue)
+-    {
+-      GThread *pool_spawner = NULL;
+-
+-      spawn_thread_queue = g_async_queue_new ();
+-      g_cond_init (&spawn_thread_cond);
+-      pool_spawner = g_thread_try_new ("pool-spawner", g_thread_pool_spawn_thread, NULL, &local_error);
+-      if (pool_spawner == NULL)
+-        {
+-          /* The only way to know that the pool_spawner exists is
+-           * if (spawn_thread_queue != NULL), so if creating the pool_spawner
+-           * failed, we must destroy the queue.
+-           */
+-          g_clear_pointer (&spawn_thread_queue, g_async_queue_unref);
+-          /* We must also clear spawn_thread_cond, so that a future attempt
+-           * to create a non-exclusive pool can safely initialize it.
+-           */
+-          g_cond_clear (&spawn_thread_cond);
+-        }
+-      g_ignore_leak (pool_spawner);
+-    }
++  /* PureUnix: never spawn the real pool-spawner helper thread at all --
++   * spawn_thread_queue is left permanently NULL, so g_thread_pool_
++   * start_thread()'s own `spawn_thread_queue == NULL` check (see that
++   * function's own comment) always takes the direct/synchronous
++   * thread-creation path instead, for every non-exclusive pool, not just
++   * this one. g_thread_pool_spawn_thread() (the function that would have
++   * run here) is a genuine infinite loop (`while (TRUE)
++   * g_async_queue_pop_unlocked(...)`) -- this platform's synchronous
++   * pthread_create() (see user/newlib_syscalls.c's own pthread section
++   * comment) would run it inline and never return, deadlocking the very
++   * first g_thread_pool_new_full() call for ANY non-exclusive pool
++   * (reproduced directly: GTask's own shared task_pool, created on the
++   * first-ever g_task_new(), e.g. from g_file_query_info_async() as used
++   * by GPollFileMonitor). */
+   G_UNLOCK (init);
+ 
+   if (retval->pool.exclusive && local_error == NULL)

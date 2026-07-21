@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ncurses Demo
+Comment=ncurses feature demonstration
+Exec=/bin/ncdemo
+Icon=utilities-terminal
+Categories=Utility;
+Terminal=true

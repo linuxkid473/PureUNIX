@@ -1898,6 +1898,25 @@ uint32_t syscall_dispatch(interrupt_regs_t *regs)
                         if (f->pipe_is_write_end && pb->read_ends == 0) {
                             revents |= POLLERR;
                         }
+                    } else if (f->kind == FD_KIND_SOCKET) {
+                        /* Real readiness (unix_socket.c's own rx/tx rings) —
+                         * see unix_socket_poll_readable()'s own comment for
+                         * the real hang this fixes: a connected AF_UNIX
+                         * socket used to fall into the generic "always
+                         * ready" branch below like every other non-pipe fd
+                         * kind, which is fine for callers that block
+                         * directly in read()/accept() (every socket user so
+                         * far) but genuinely wrong for a caller that polls
+                         * first and only reads because poll() said so
+                         * (PCManFM-Qt's real upstream SIGTERM self-pipe,
+                         * deliberately a blocking socket — a real read()
+                         * would then hang forever on a false "ready"). */
+                        if ((events & POLLIN) && unix_socket_poll_readable(f->usock)) {
+                            revents |= POLLIN;
+                        }
+                        if ((events & POLLOUT) && unix_socket_poll_writable(f->usock)) {
+                            revents |= POLLOUT;
+                        }
                     } else {
                         /* No real readiness tracking exists yet for any
                          * other fd kind (regular file/tty/pty/procfs) —

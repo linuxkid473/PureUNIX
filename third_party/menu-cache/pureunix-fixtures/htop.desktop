@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=System Monitor
+Comment=Interactive process viewer (htop)
+Exec=/bin/htop
+Icon=utilities-system-monitor
+Categories=System;Monitor;
+Terminal=true

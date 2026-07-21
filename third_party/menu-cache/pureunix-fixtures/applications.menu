@@ -5,5 +5,10 @@
   <DefaultDirectoryDirs/>
   <Include>
     <Filename>pureunix-test-app.desktop</Filename>
+    <Filename>pcmanfm-qt.desktop</Filename>
+    <Filename>htop.desktop</Filename>
+    <Filename>chocolate-doom.desktop</Filename>
+    <Filename>imgview.desktop</Filename>
+    <Filename>ncdemo.desktop</Filename>
   </Include>
 </Menu>

@@ -35,8 +35,13 @@ command -v i686-elf-grub-mkrescue >/dev/null 2>&1 || {
 make -C "${REPO_ROOT}" "${BUILD}/pureunix.elf" "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/qtwidgetstest.elf" "${BUILD}/user/pude.elf"
 
 echo "==> Building scratch EXT2 (BusyBox + qtwindowtest.elf + qtwidgetstest.elf + pude.elf)"
+# DejaVuSans.ttf at /lib/fonts/ + QT_QPA_FONTDIR (set in user/pude_qtclient.c
+# before execve()) is what fixes every Qt app's "tofu box" glyph rendering
+# (docs/qt-port.md's Known gap #3) -- included here too so this is the one
+# place that actually exercises real Qt widget/text rendering in QEMU.
 python3 "${SCRIPT_DIR}/mkext2.py" "${BUILD}/qpa-scratch-root.img" \
-  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/qtwidgetstest.elf" "${BUILD}/user/pude.elf"
+  "${BUILD}/user/busybox.elf" "${BUILD}/user/qtwindowtest.elf" "${BUILD}/user/qtwidgetstest.elf" "${BUILD}/user/pude.elf" \
+  --extra-file "${REPO_ROOT}/third_party/dejavu-fonts/DejaVuSans.ttf:/lib/fonts/DejaVuSans.ttf"
 
 echo "==> Assembling build/qpa-scratch.iso"
 # Deliberately NO fat.img GRUB module here (unlike the shared LIVE_ISO's

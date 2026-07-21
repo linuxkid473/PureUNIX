@@ -1,0 +1,86 @@
+diff --git a/src/core/job.cpp b/src/core/job.cpp
+index e597975..08fef68 100644
+--- a/src/core/job.cpp
++++ b/src/core/job.cpp
+@@ -1,5 +1,5 @@
+ #include "job.h"
+-#include "job_p.h"
++#include <QTimer>
+ 
+ namespace Fm {
+ 
+@@ -16,12 +16,40 @@ Job::~Job() {
+ }
+ 
+ void Job::runAsync(QThread::Priority priority) {
+-    auto thread = new JobThread(this);
+-    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
++    Q_UNUSED(priority);
++    // PureUnix has no real background threading at all -- Qt's own
++    // "thread" feature was disabled when qtbase was cross-built (see
++    // docs/qt-port.md), so QThread::start() can't actually run anything
++    // here. Every real caller that then blocks on a QEventLoop waiting
++    // for this job's finished() signal (e.g.
++    // Fm::BasicFileLauncher::launchPaths(), the very entry point behind
++    // opening any folder at all) would otherwise hang forever waiting for
++    // a signal that structurally can never fire.
++    //
++    // Running run() synchronously and immediately (the first fix tried
++    // here) unblocked that hang but traded it for a real, observed busy
++    // spin: many real call sites (e.g. Fm::Folder::onFileInfoFinished(),
++    // via a DirectConnection -- see
++    // third_party/libfm-qt/patches/0007) start a *new* Job directly from
++    // inside a previous Job's own finished() handler. Running the new Job
++    // immediately, inline, nests that inside the same C++ call frame,
++    // which can chain arbitrarily deep for a large/busy directory and
++    // never gives Qt's own event loop a turn to actually paint anything
++    // in between -- the window sat there permanently black even though
++    // the process was genuinely busy, not hung.
++    //
++    // Deferring via a real, already-idiomatic-in-this-codebase zero-delay
++    // QTimer::singleShot (see e.g. Fm::Folder::queueReload()'s identical
++    // pattern) instead runs this job on the *next* event loop iteration:
++    // still no real concurrency (there never can be, on this platform),
++    // but each Job's run() gets its own turn through the event loop
++    // instead of nesting inside the previous one's call stack, so paint/
++    // expose events and this app's own GLib-main-context pump (see
++    // pcmanfm-qt's own patches/0002) get to interleave normally.
+     if(autoDelete()) {
+         connect(this, &Job::finished, this, &Job::deleteLater);
+     }
+-    thread->start(priority);
++    QTimer::singleShot(0, this, &Job::run);
+ }
+ 
+ void Job::cancel() {
+diff --git a/src/core/job_p.h b/src/core/job_p.h
+index d893d5f..e69de29 100644
+--- a/src/core/job_p.h
++++ b/src/core/job_p.h
+@@ -1,26 +0,0 @@
+-#ifndef JOB_P_H
+-#define JOB_P_H
+-
+-#include <QThread>
+-#include "job.h"
+-
+-namespace Fm {
+-
+-class JobThread: public QThread {
+-    Q_OBJECT
+-public:
+-    JobThread(Job* job): job_{job} {
+-    }
+-
+-protected:
+-
+-    void run() override {
+-        job_->run();
+-    }
+-
+-    Job* job_;
+-};
+-
+-} // namespace Fm
+-
+-#endif // JOB_P_H

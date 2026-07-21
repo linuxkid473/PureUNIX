@@ -519,3 +519,294 @@ itself against everything built so far, then pcmanfm-qt itself. Each
 phase gets its own real, working, tested artifact before moving to the
 next, the same incremental methodology that got Qt6 and GLib themselves
 working.
+
+## 2026-07-20 update: real end-to-end render + click fixes (tofu-box glyphs, font deployment)
+
+Following the deep GLib/libfm-qt threading-deadlock investigation above
+(now resolved — pcmanfm-qt genuinely launches, renders its real UI, and
+browses the real root filesystem), the user reported the live app showed
+every string as an empty "tofu" box and asked for it to "look normal" and
+"accept clicks". Two real, separate fixes:
+
+**1. Font deployment (`QT_QPA_FONTDIR` + a real bundled TTF).** This was
+actually docs/qt-port.md's own pre-existing, disclosed "Known gap #3"
+(`QFontDatabase: Cannot find font directory`) — no font files were ever
+deployed onto any disk image. Fixed by vendoring a real DejaVu Sans TTF
+(`third_party/dejavu-fonts/DejaVuSans.ttf`, freely redistributable, see
+its own `LICENSE`) at `/lib/fonts/DejaVuSans.ttf` on both
+`$(DISK_PERSISTENT)` and the dedicated `build/qpa-scratch.iso`
+(`tools/build-qpa-scratch-disk.sh` — NOT on the shared `$(DISK2)`/
+LIVE_ISO, which is RAM-ceiling-constrained per that image's own gotcha
+and never actually runs Qt apps anyway), and setting `QT_QPA_FONTDIR=
+/lib/fonts` via `setenv()` in `user/pude_qtclient.c`'s `spawn_client()` —
+the one fork/exec point every Qt client goes through, so this applies
+platform-wide, not just to pcmanfm-qt.
+
+**2. The real, deeper bug: a stale prebuilt Qt object file.** Deploying
+the font alone wasn't enough — `QFreeTypeFontDatabase::populateFontDatabase()`
+found the directory (confirmed via a real standalone FreeType-only test
+program, `FT_New_Face()`/`FT_Load_Glyph()` succeeding perfectly against
+the deployed TTF) but `QDir::entryInfoList()` always reported **zero**
+files, silently, even with no filters at all. Root-caused via the same
+splice-one-.o-into-the-static-archive technique developed during the
+GLib deadlock hunt above: recompiling upstream Qt 6.5.3's
+`src/corelib/io/qfilesystemiterator_unix.cpp` fresh (fetched via `gh api`
+from `qt/qtbase`, unchanged logic) against this repo's *current*
+`user/newlib_compat/dirent.h`/headers and splicing the result into
+`third_party/qt/i686-elf/lib/libQt6Core.a` fixed it completely — proving
+the original vendored `libQt6Core.a` (built earlier in this port's
+history, likely predating some later dirent.h refinement) contained a
+**stale object file compiled against an outdated header layout**, not a
+live logic bug. `nm` confirmed `qfilesystemiterator_unix.cpp.o` is the
+*only* object anywhere in the vendored Qt libs that calls `readdir()`, so
+this one-file fix is complete, not partial. The real, permanent fix is
+now committed directly to the vendored `libQt6Core.a` (a real, tracked
+binary artifact per this project's existing "vendored build output"
+convention, same as `third_party/qt/i686-elf/lib/*.a` generally) —
+`qtcoretest`/`qtguitest`/`qtwindowtest`/`qtwidgetstest`/`pcmanfm-qt` were
+all relinked against it and QEMU-reverified: real, readable DejaVu-Sans-
+rendered text throughout every one of them (menu bar, sidebar, toolbar,
+file listing, `QLineEdit`/`QTextEdit` content) — confirmed via direct
+screenshot comparison, not asserted.
+
+**Clicks**: confirmed working at the transport/widget level —
+`qtwidgetstest`'s `QPushButton::clicked` fired exactly 2/2 times for 2
+real injected clicks, and `QLineEdit` text entry round-tripped correctly.
+The user then reported a real, separate, more severe issue: after the
+font fix, the very first click on the menu bar or the Places sidebar
+permanently froze the whole app (every further click silently dropped).
+See the next dated update below for the real root cause and fix.
+
+## 2026-07-21 update: real click-freeze root cause found and fixed — a genuine kernel `poll()` gap for `FD_KIND_SOCKET`
+
+Reproduced the freeze directly: clicking the menu bar or Places sidebar
+worked exactly once, then the whole app went permanently silent forever
+(every later input event dropped). `/proc/<pid>/stat` sampling (same
+technique as the earlier GLib deadlock hunt) showed genuine `S`
+(sleeping) state with **flat** `utime` across many seconds — a real
+block, not a busy-spin — which at first looked like a fifth instance of
+this session's GLib/threading deadlock class. It wasn't.
+
+Methodically ruled out, one at a time, via targeted `fprintf` tracing
+spliced into the exact syscalls involved (same technique as the earlier
+GLib bug hunt, applied to this project's own `user/newlib_syscalls.c`
+this time): `g_thread_new()` (never called at all — no thread-spawn
+involved), `pthread_cond_wait()` (a real, correct no-op on this
+single-threaded platform, confirmed by reading its own implementation),
+`fork()`/`execve()`/`waitpid()` (none block), `nanosleep()` (never
+called). The actual blocked call, found by instrumenting `read()`
+itself: a `read(fd=10, ..., len=1)` that begins and never returns.
+
+Tracing `pipe()`/`socketpair()` directly identified fd 9/10 as a
+`socketpair(AF_UNIX, SOCK_STREAM)` pair — and grepping libfm-qt/
+pcmanfm-qt source for `socketpair` found the real, single call site:
+`pcmanfm/application.cpp`'s `installSigtermHandler()` — a completely
+standard, real upstream Unix "self-pipe trick" for handling `SIGTERM`
+safely (the signal handler writes 1 byte; a `QSocketNotifier` on the
+other end reacts to it outside signal-handler context). This socket is
+**deliberately left blocking** in real upstream code, which is correct
+on a real OS: `QSocketNotifier`'s callback only ever calls `read()`
+*after* `poll()` has already reported the fd genuinely readable, so a
+blocking `read()` there normally can't stall.
+
+The real bug: this kernel's `SYS_POLL` (`arch/i386/syscall.c`) only ever
+had genuine per-fd readiness tracking for `FD_KIND_PIPE`. Every other fd
+kind — including `FD_KIND_SOCKET`, used by AF_UNIX sockets — fell into an
+"optimistic fallback" (`revents = events & (POLLIN|POLLOUT)`, i.e.
+*always* reports ready) that was an honest, disclosed limitation
+(`project_af_unix_sockets` memory) since real AF_UNIX support was added —
+harmless for every socket user up to now (`unix_socktest.c`/
+`menucachetest.c` both block directly in `read()`/`accept()`, never
+`poll()` a socket first). PCManFM-Qt's SIGTERM self-pipe is the first
+real code in this whole project to `poll()` a socket and trust the
+result: `poll()` lying "always ready" fired the `QSocketNotifier` on
+every single event-loop cycle regardless of whether `SIGTERM` was ever
+actually sent, and its callback's `read()` then genuinely blocked
+forever on an actually-empty blocking socket, permanently starving Qt's
+own event loop (it never got to run its idle `poll()` again — hence
+"works exactly once, then dead").
+
+**Fix**: gave `FD_KIND_SOCKET` real readiness tracking in `SYS_POLL`,
+mirroring the existing `FD_KIND_PIPE` case exactly (both are backed by
+the same `pipe_buf_t` ring — see `kernel/unix_socket.c`'s own top
+comment). Added two small accessors (`unix_socket_poll_readable()`/
+`unix_socket_poll_writable()`, `kernel/unix_socket.c` +
+`include/pureunix/unix_socket.h`) since `unix_socket_t` is opaque outside
+that file, then wired them into `arch/i386/syscall.c`'s `SYS_POLL`
+alongside the pipe case. Real, general kernel fix — benefits any future
+code that `poll()`s an AF_UNIX socket, not just this one call site.
+
+QEMU-reverified end to end: the File menu now opens with its full real
+contents (New Tab/New Window/Create New/Recent Files/Properties/Close,
+correct greying, real keyboard-accelerator underlines) and stays
+interactive across repeated opens; clicking "root" in the Places
+sidebar navigates and highlights-selects correctly, updates the window
+title/tab/breadcrumb, and the File menu still works again afterward —
+confirmed via direct screenshot comparison, not asserted.
+
+## 2026-07-21 update: no icons, no real sidebar folders, and a recurring
+## crash — all three root-caused and fixed
+
+Direct user report after using the app for real (not just clicking
+through a scripted test): "icons do not display", the sidebar
+folders (Desktop/Computer/Applications/Network) had no real content,
+and the whole thing "kernel panics randomly". All three turned out to
+be real, separate, fully fixable bugs — none of them were the same bug
+wearing different hats.
+
+### The recurring crash: a GTask reentrancy bug in this session's own earlier patch
+
+The crash (`g_task_propagate_pointer: assertion 'task->result_set'
+failed` / `g_object_ref: assertion 'G_IS_OBJECT (object)' failed` /
+`g_file_query_info_async: assertion 'G_IS_FILE (file)' failed`,
+eventually a real SIGSEGV) reproduced reliably during ordinary folder
+navigation. It traced back to this project's own
+`third_party/glib/patches/0003-single-threaded-no-real-background-threads.patch`:
+`g_task_run_in_thread_synchronously()` called
+`g_task_thread_pool_thread(task, NULL)` directly and synchronously —
+which runs the task's worker function *and* its completion callback
+fully inline, before the original `g_file_query_info_async()`-style
+call that started it all has even returned to its own caller. Every
+real async GIO API promises the opposite: the callback fires *later*,
+never before the call that scheduled it returns. Running it reentrantly
+let a completion callback free/replace a `GCancellable`/`GFile` the
+caller was still in the middle of storing a reference to.
+
+Fix: defer the actual worker-thread call via a real `GSource`
+(`g_idle_source_new()`) attached to the task's own `context` field —
+the exact same field GTask itself already uses to schedule its
+*completion* callback — instead of calling it inline. Mirrors the
+identical fix already applied to `Fm::Job::runAsync()`
+(`third_party/libfm-qt/patches/0006`,
+`QTimer::singleShot(0, ...)`) for the same class of problem one layer
+up the stack. QEMU-reverified via the exact same click sequence that
+used to reproduce the crash (double-click into `bin`, back, click
+through every sidebar item) run repeatedly with no crash and no kernel
+panic; `ps` on a second VT confirms `pcmanfm-qt` stays alive the whole
+time.
+
+### No icons: the QPA plugin never provided a `QPlatformTheme` at all
+
+Deployed a real, from-scratch hicolor icon theme (71 PNGs across 5
+sizes × 14 names, plus a real `index.theme`) to `/usr/share/icons/hicolor`
+— but nothing rendered. Root cause, found by reading real upstream
+`qtbase/src/gui/image/qiconloader.cpp`: every icon-theme search path
+Qt has (`QIconLoader::themeSearchPaths()`) comes from
+`QGuiApplicationPrivate::platformTheme()`. If that's null — which it
+always was here, since `user/qpa_pureunix/` never implemented
+`createPlatformTheme()` at all — the search path list is permanently
+empty (just the always-empty compiled-in `:/icons` Qt resource path).
+No search paths means every single `QIcon::fromTheme()` call anywhere
+in libfm-qt/pcmanfm-qt returns null, forever, regardless of what's
+actually deployed on disk.
+
+Fix: real upstream Qt already ships `QGenericUnixTheme`
+(`src/gui/platform/unix/qgenericunixthemes.cpp`, compiled into
+`libQt6Gui.a` already — no new vendoring needed) for exactly this "no
+native desktop shell to query" situation; it's what qtbase's own
+minimal QPA plugins (linuxfb, eglfs) use. Wired
+`QPureUnixIntegration::createPlatformTheme()` to return `new
+QGenericUnixTheme`. That alone wasn't enough — a first attempt only
+overrode `createPlatformTheme()` and silently never got called at all,
+because `QGuiApplicationPrivate::createPlatformTheme()`
+(`qguiapplication.cpp`) only ever tries names that appear in
+`QPlatformIntegration::themeNames()`, whose base-class default returns
+an empty list. Had to override `themeNames()` too, returning
+`{"generic"}`. Also set `XDG_DATA_DIRS=/usr/share` explicitly at spawn
+time (`user/pude_qtclient.c`) rather than relying on this
+cross-compiled platform's `QStandardPaths` fallback default, since
+`QGenericUnixTheme::xdgIconThemePaths()` reads it via
+`QStandardPaths::GenericDataLocation`.
+
+QEMU-reverified: real folder/file icons now render in both the file
+view and the sidebar. Disclosed cost: the very first icon lookup after
+launch now does a real, uncached theme/directory scan, adding roughly
+a minute to first-launch startup (subsequent navigation is fast again,
+matching pre-fix timing) — a real, un-optimized tradeoff, not
+addressed further this pass.
+
+### Sidebar folders: Desktop was real, Computer/Network are honestly unsupported, Applications was silently broken
+
+`Desktop` already pointed at a real local directory
+(`/root/Desktop`, populated via `desktop-readme.txt`) and works
+correctly — confirmed showing real content with correct breadcrumbs.
+`Network` points at the virtual `network:///` GIO URI scheme; clicking
+it correctly surfaces a real `"Operation not supported"` error dialog
+(no GVfs network backend exists here, same as any real Linux system
+without one running) — a real, honest failure mode, left as-is.
+`Computer` (`computer:///`) shows no content and no error; not touched
+this pass since it's a virtual-only concept on a single-disk system,
+lower priority than the other two, and not reachable via
+`FilePath::fromLocalPath()` without a deeper look at libfm-qt's
+special-casing for it (`placesmodel.cpp:590`, `placesview.cpp:357`).
+
+`Applications` was the real hidden bug: it also pointed at a virtual
+GIO URI (`menu:///applications/`), resolved by a GVfs "menu" backend
+(`gvfsd-menu`) that depends on a running D-Bus session bus — which
+doesn't exist on PureUnix at all. Unlike `Network`, this failed
+*silently*: the sidebar row highlighted, but the file view just stayed
+on whatever was showing before, with no crash and no error dialog —
+arguably a worse experience than an honest error. Since this project's
+own `Makefile` already deploys real `.desktop` files to
+`/usr/share/applications` (`MENU_CACHE_FIXTURES`), patched
+`third_party/libfm-qt/patches/0008-applications-sidebar-real-directory.patch`
+to point `Applications` at that real local directory instead of the
+unimplemented virtual scheme. QEMU-reverified: clicking `Applications`
+now shows all 6 real `.desktop` files with correct breadcrumbs
+(`/ > usr > share > applications`), no crash.
+
+## 2026-07-21 update #2: "Computer" made the whole app disappear — a real
+## single-window-per-client architecture gap, not a crash
+
+Direct user report: clicking "Computer" in the sidebar showed an error
+dialog, and dismissing it made the *entire* file manager window
+vanish from the desktop. `ps` on a second VT showed `pcmanfm-qt` was
+still running the whole time — so nothing actually crashed. The real
+bug: `user/pude_qtclient.c`'s `qtclient_state_t` has exactly one
+content buffer/window frame per client process, with no window-ID
+concept in the wire protocol at all (a known, disclosed scope limit
+since Phase 6). `QPureUnixWindow` didn't know about that limit either:
+every window it created (including a `QMessageBox` error dialog, a
+real second top-level `QWindow`) unconditionally sent
+`PU_QPA_C2S_WINDOW_CREATE` (resizing the *shared* canvas down to the
+dialog's small size), `PU_QPA_C2S_SET_TITLE` (overwriting the real
+window's titlebar), and — worst of all — its destructor sent
+`PU_QPA_C2S_CLOSE` on the dialog's own dismissal, which is exactly the
+message `pude` uses to mean "this client is done" (`qtclient_state_t
+.child_alive = false`). Dismissing an error dialog looked, from
+`pude`'s side, identical to the whole app quitting.
+
+Fix: `user/qpa_pureunix/pureunixwindow.{h,cpp}` and
+`pureunixintegration.h` now track which window is "primary" (the
+first one any client process ever creates — always the real
+`QMainWindow`, since every dialog is constructed later) versus
+"secondary" (anything after that). Only the primary window's
+constructor/destructor/`setGeometry()`/`setWindowTitle()` talk to
+`pude` about window-create/resize/title/close at all; a secondary
+window's own `QBackingStore::flush()` still sends real
+`PU_QPA_C2S_DAMAGE`, but paints into the *same* shared buffer at its
+own window-local (0,0) origin — a real, visible simplification (a
+dialog "overlay" in the corner rather than a properly centered,
+separately-decorated second window) rather than a proper multi-window
+protocol, but an honest one that doesn't corrupt or close the primary
+window. When a secondary window is destroyed, input routing reverts to
+the primary window (rather than going to nobody) and a full repaint of
+the primary window is forced to clear whatever stale pixels the
+dialog left behind.
+
+QEMU-reverified: clicking "Computer" now shows the (still-honest)
+"Operation not supported" dialog as a small overlay while the real
+file manager window keeps its full size in the background; clicking
+"OK" dismisses it cleanly with the original window content restored,
+no shrink, no disappearance, `ps` confirms `pcmanfm-qt` alive
+throughout.
+
+Also stress-tested repeated real launch/close cycles per direct user
+request ("I wanna be able to close and open pcmanfm multiple times
+like a normal desktop app"): 4 full cycles of launching pcmanfm-qt from
+PUDE's menu and closing it via its real titlebar X button, checking
+`ps` after every launch and every close. Every cycle: the previous
+`pcmanfm-qt` process is fully reaped (no zombies, no leaked PIDs) by
+the time the next one launches, the new instance renders correctly
+with real folder icons, and PUDE's own launcher menu stays responsive
+throughout — no accumulation, no degradation across cycles.

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Chocolate Doom
+Comment=Play Doom
+Exec=/bin/chocolate-doom -iwad /bin/doom1.wad
+Icon=applications-games
+Categories=Game;
+Terminal=false

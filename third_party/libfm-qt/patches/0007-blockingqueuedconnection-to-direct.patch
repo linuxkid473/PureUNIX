@@ -1,0 +1,63 @@
+diff --git a/src/core/basicfilelauncher.cpp b/src/core/basicfilelauncher.cpp
+index 01ea819..a9f5d20 100644
+--- a/src/core/basicfilelauncher.cpp
++++ b/src/core/basicfilelauncher.cpp
+@@ -162,7 +162,12 @@ bool BasicFileLauncher::launchPaths(FilePathList paths, GAppLaunchContext* ctx)
+             // the user handled the error and ask for retry
+             act = Job::ErrorAction::RETRY;
+         }
+-    }, Qt::BlockingQueuedConnection);  // BlockingQueuedConnection is required here to pause the job and wait for user response
++    }, Qt::DirectConnection);  // DirectConnection: job->runAsync() below is guaranteed synchronous/
++                               // same-thread on this platform (see job.cpp's own comment), so this
++                               // runs inline during Q_EMIT error() -- correctly propagating the `act`
++                               // out-parameter back to the emitter with no marshaling involved at all,
++                               // which is what upstream's BlockingQueuedConnection was trying to
++                               // achieve across a real thread boundary that doesn't exist here.
+ 
+     QObject::connect(job, &FileInfoJob::finished,
+             [&eventLoop]() {
+diff --git a/src/dirtreemodel.cpp b/src/dirtreemodel.cpp
+index 0d88295..4e9ce7f 100644
+--- a/src/dirtreemodel.cpp
++++ b/src/dirtreemodel.cpp
+@@ -37,7 +37,7 @@ DirTreeModel::~DirTreeModel() {
+ void DirTreeModel::addRoots(Fm::FilePathList rootPaths) {
+     auto job = new Fm::FileInfoJob{std::move(rootPaths)};
+     job->setAutoDelete(true);
+-    connect(job, &Fm::FileInfoJob::finished, this, &DirTreeModel::onFileInfoJobFinished, Qt::BlockingQueuedConnection);
++    connect(job, &Fm::FileInfoJob::finished, this, &DirTreeModel::onFileInfoJobFinished, Qt::DirectConnection);
+     job->runAsync();
+ }
+ 
+diff --git a/src/fileoperation.cpp b/src/fileoperation.cpp
+index e36eea9..eec787c 100644
+--- a/src/fileoperation.cpp
++++ b/src/fileoperation.cpp
+@@ -81,11 +81,11 @@ FileOperation::FileOperation(Type type, Fm::FilePathList srcPaths, QObject* pare
+         // new C++ jobs
+         connect(job_, &Fm::Job::finished, this, &Fm::FileOperation::onJobFinish);
+         connect(job_, &Fm::Job::cancelled, this, &Fm::FileOperation::onJobCancalled);
+-        connect(job_, &Fm::Job::error, this, &Fm::FileOperation::onJobError, Qt::BlockingQueuedConnection);
+-        connect(job_, &Fm::FileOperationJob::fileExists, this, &Fm::FileOperation::onJobFileExists, Qt::BlockingQueuedConnection);
++        connect(job_, &Fm::Job::error, this, &Fm::FileOperation::onJobError, Qt::DirectConnection);
++        connect(job_, &Fm::FileOperationJob::fileExists, this, &Fm::FileOperation::onJobFileExists, Qt::DirectConnection);
+ 
+         // we block the job deliberately until we prepare to start (initiailize the timer) so we can calculate elapsed time correctly.
+-        connect(job_, &Fm::FileOperationJob::preparedToRun, this, &Fm::FileOperation::onJobPrepared, Qt::BlockingQueuedConnection);
++        connect(job_, &Fm::FileOperationJob::preparedToRun, this, &Fm::FileOperation::onJobPrepared, Qt::DirectConnection);
+     }
+ }
+ 
+diff --git a/src/filepropsdialog.cpp b/src/filepropsdialog.cpp
+index 12f36bd..d910f92 100644
+--- a/src/filepropsdialog.cpp
++++ b/src/filepropsdialog.cpp
+@@ -371,7 +371,7 @@ void FilePropsDialog::initGeneralPage() {
+     connect(fileSizeTimer, &QTimer::timeout, this, &FilePropsDialog::onFileSizeTimerTimeout);
+     fileSizeTimer->start(600);
+ 
+-    connect(totalSizeJob, &Fm::TotalSizeJob::finished, this, &FilePropsDialog::onDeepCountJobFinished, Qt::BlockingQueuedConnection);
++    connect(totalSizeJob, &Fm::TotalSizeJob::finished, this, &FilePropsDialog::onDeepCountJobFinished, Qt::DirectConnection);
+     totalSizeJob->setAutoDelete(true);
+     totalSizeJob->runAsync();
+ 

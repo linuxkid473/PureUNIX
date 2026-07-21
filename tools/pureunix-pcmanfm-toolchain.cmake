@@ -37,4 +37,19 @@ list(APPEND CMAKE_PREFIX_PATH "${LIBFMQT_DIR}")
 # sandwiched inside one real --start-group/--end-group pair exactly like
 # the Makefile's own version.
 string(APPEND CMAKE_EXE_LINKER_FLAGS_INIT " -Wl,--start-group")
-set(CMAKE_CXX_STANDARD_LIBRARIES "-lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc")
+
+# PUREUNIX_QPA_STATIC_LIB (Makefile's own libpureunix-qpa.a target,
+# archiving the exact same 4 object files user/qtwindowtest.elf/
+# qtwidgetstest.elf link directly): pcmanfm-qt's real upstream main()
+# (pcmanfm/pcmanfm.cpp) has no idea PureUnix or its QPA plugin exist, so
+# without this it links fine but fails at runtime with Qt's real
+# "no Qt platform plugin could be initialized" error, exactly like
+# qtwindowtest/qtwidgetstest would without their own Q_IMPORT_PLUGIN(...)
+# + "-platform pureunix" argv (see patches/0002-static-qpa-plugin.patch,
+# which adds the same two things to pcmanfm.cpp). Placed inside the same
+# --start-group/--end-group pair as -lstdc++ etc. below so its own
+# QtGui/QtCore symbol references resolve against whatever's already in
+# the group (Qt6::Gui et al, pulled in by the target's own
+# target_link_libraries()) regardless of link order.
+set(PUREUNIX_QPA_STATIC_LIB "${CMAKE_CURRENT_LIST_DIR}/../build/user/qpa_pureunix/libpureunix-qpa.a")
+set(CMAKE_CXX_STANDARD_LIBRARIES "${PUREUNIX_QPA_STATIC_LIB} -lstdc++ -lsupc++ -lc -lm -Wl,--end-group -lgcc")

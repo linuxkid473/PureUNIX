@@ -106,6 +106,7 @@ static const app_class_t *const g_apps[] = {
     &settings_app_class,
     &qtclient_app_class,
     &qtclient_widgets_app_class,
+    &qtclient_pcmanfm_app_class,
 };
 #define NUM_APPS (int)(sizeof(g_apps) / sizeof(g_apps[0]))
 
@@ -737,6 +738,8 @@ int main(int argc, char *argv[])
                                 pude_qtclient_set_exec_path("/bin/qtwindowtest.elf");
                             } else if (g_apps[idx] == &qtclient_widgets_app_class) {
                                 pude_qtclient_set_exec_path("/bin/qtwidgetstest.elf");
+                            } else if (g_apps[idx] == &qtclient_pcmanfm_app_class) {
+                                pude_qtclient_set_exec_path("/bin/pcmanfm-qt");
                             }
                             spawn_window(g_apps[idx], screen_w, screen_h);
                         }

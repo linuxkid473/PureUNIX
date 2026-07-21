@@ -43,9 +43,9 @@ size hint exceeds the window's initially granted size drives the QPA
 plugin into an infinite repaint loop** (`user/qtwidgetstest.cpp` builds
 and links fine; deliberately NOT wired into `pude`'s live launcher menu
 until this is root-caused — see the Phase 6 section's own writeup for
-the full bisection and next debugging steps). Font deployment is also
-still pending (glyphs currently render as tofu boxes, no font files are
-on the disk image yet). This
+the full bisection and next debugging steps — since resolved, see Phase
+6/pcmanfm-port.md). Font deployment tofu-box issue also fixed 2026-07-20
+(see the dated update further down and docs/pcmanfm-port.md). This
 document is the living record of the Qt 6 port (pinned version,
 toolchain, patches, protocol, architecture, limitations) required by the
 port's own acceptance criteria.
@@ -872,10 +872,21 @@ Widgets application can create, display, and interact with a real
    `QPainter::fillRect()`/`drawText()` output is now visually confirmed
    on real `pude` screendumps: a solid `QColor(40,40,120)` fill renders
    correctly at the right position and size inside the native window.
-   Glyphs currently render as empty boxes (tofu) — Qt's `QFontDatabase`
-   warns `Cannot find font directory .../lib/fonts` at startup, since no
-   font files are bundled onto the disk image; a real but separate
-   deployment gap (see "Known gaps" below), not a rendering-pipeline bug.
+   **Fixed 2026-07-20** (see docs/pcmanfm-port.md's own dated update for
+   the full story) — glyphs used to render as empty boxes (tofu). Two
+   real, separate causes: (a) no font files were ever deployed onto any
+   disk image (fixed: a real DejaVu Sans TTF now ships at
+   `/lib/fonts/DejaVuSans.ttf`, `QT_QPA_FONTDIR` set in
+   `user/pude_qtclient.c`'s one fork/exec point so it applies platform-
+   wide); (b) the vendored `third_party/qt/i686-elf/lib/libQt6Core.a`
+   contained a *stale* `qfilesystemiterator_unix.cpp.o` — compiled
+   against an older `dirent.h` layout — that silently made
+   `QDir::entryInfoList()` return zero results always, regardless of
+   filters; recompiling that one file fresh against this repo's current
+   headers and splicing it into the real committed archive fixed it
+   completely (confirmed: it's the only object anywhere in the vendored
+   Qt libs that calls `readdir()`). Real, readable text now confirmed via
+   QEMU screenshot in `qtwidgetstest`/`qtwindowtest`/`pcmanfm-qt` alike.
 4. **Protocol/plumbing done and exercised without incident** (real
    keydown/keyup and mouse-move/click messages were sent to a live Qt
    window via `pude_qtclient.c`'s `on_key`/`on_mouse_*` callbacks and
@@ -1247,6 +1258,13 @@ without blocking indefinitely).
    if so, that's strong confirmation of the size-mismatch theory above
    and narrows the real fix to specifically the resize-acknowledgement
    path.
+
+(Historical "next steps" list below, kept as the living record of how
+this port actually proceeded — all three items it names are now done:
+the repaint bug was fixed, input was visually round-trip-verified via
+`qtwidgetstest`'s real `QPushButton`/`QLineEdit`, and the tofu-box font
+issue was fixed 2026-07-20, see this file's own dated update above and
+docs/pcmanfm-port.md.)
 
 Next when resuming, in priority order: (1) the QtWidgets infinite-repaint
 bug above — the real remaining blocker for Phase 5; (2) Phase 4 (input)

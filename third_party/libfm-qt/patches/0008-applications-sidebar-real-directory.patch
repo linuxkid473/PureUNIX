@@ -1,0 +1,23 @@
+diff --git a/src/placesmodel.cpp b/src/placesmodel.cpp
+index 49a5bfe..77aea60 100644
+--- a/src/placesmodel.cpp
++++ b/src/placesmodel.cpp
+@@ -65,7 +65,17 @@ PlacesModel::PlacesModel(QObject* parent):
+         // NOTE: g_themed_icon_new_from_names() accepts char**, but actually const char** is OK.
+         Fm::GIconPtr gicon{g_themed_icon_new_from_names((char**)application_icon_names, G_N_ELEMENTS(application_icon_names)), false};
+         auto fmicon = Fm::IconInfo::fromGIcon(std::move(gicon));
+-        applicationsItem = new PlacesModelItem(fmicon, tr("Applications"), Fm::FilePath::fromUri("menu:///applications/"));
++        // PureUnix has no D-Bus session bus at all, so the real "menu"
++        // GVfs backend (gvfsd-menu) that would normally resolve
++        // menu:///applications/ can never run here -- confirmed the hard
++        // way: clicking "Applications" highlighted the sidebar row but
++        // silently never navigated (no crash, no error dialog, just stuck
++        // showing whatever was there before). Point this at the real
++        // directory this project's own Makefile already deploys real
++        // .desktop files into (MENU_CACHE_FIXTURES) instead: a real,
++        // working, navigable folder, at the cost of losing menu:///'s
++        // category-grouping presentation (see docs/pcmanfm-port.md).
++        applicationsItem = new PlacesModelItem(fmicon, tr("Applications"), Fm::FilePath::fromLocalPath("/usr/share/applications"));
+         placesRoot->appendRow(applicationsItem);
+     }
+ 

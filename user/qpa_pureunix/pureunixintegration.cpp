@@ -8,6 +8,7 @@ extern "C" {
 }
 
 #include <QtGui/private/qgenericunixfontdatabase_p.h>
+#include <QtGui/private/qgenericunixthemes_p.h>
 #include <QtGui/private/qunixeventdispatcher_qpa_p.h>
 #include <QtGui/qpa/qwindowsysteminterface.h>
 #include <QtCore/QByteArray>
@@ -167,6 +168,42 @@ QPlatformFontDatabase *QPureUnixIntegration::fontDatabase() const
         const_cast<QPureUnixIntegration *>(this)->m_fontDatabase.reset(new QGenericUnixFontDatabase);
     }
     return m_fontDatabase.data();
+}
+
+QStringList QPureUnixIntegration::themeNames() const
+{
+    // QGuiApplicationPrivate::createPlatformTheme() (qguiapplication.cpp)
+    // only ever calls createPlatformTheme(name) below for names that show
+    // up in this list -- the base QPlatformIntegration::themeNames() default
+    // returns an empty list, which means createPlatformTheme() below is
+    // simply never invoked at all (confirmed the hard way: a first attempt
+    // at this fix that only overrode createPlatformTheme() silently never
+    // ran). "generic" is QGenericUnixTheme::name (qgenericunixthemes_p.h) --
+    // any string works here since createPlatformTheme() below ignores it,
+    // but matching the real name avoids confusion.
+    return QStringList{QStringLiteral("generic")};
+}
+
+QPlatformTheme *QPureUnixIntegration::createPlatformTheme(const QString &name) const
+{
+    // Without a QPlatformTheme at all, QIconLoader::themeSearchPaths()
+    // (qtbase's src/gui/image/qiconloader.cpp) has no way to learn about
+    // any real icon directory -- every one of its lookups goes through
+    // QGuiApplicationPrivate::platformTheme(), and if that's null the
+    // search path list stays permanently empty (just the compiled-in,
+    // always-empty ":/icons" Qt resource path). That's the real reason
+    // PCManFM-Qt's file list/sidebar rendered with no icons at all even
+    // after a real hicolor theme was deployed to /usr/share/icons/hicolor:
+    // this plugin never provided a theme for Qt to ask. QGenericUnixTheme
+    // (already compiled into libQt6Gui.a -- real upstream code, used by
+    // qtbase's own minimal QPA plugins like linuxfb/eglfs for exactly this
+    // "no native desktop shell to query" situation) wires
+    // IconThemeSearchPaths up to QStandardPaths::GenericDataLocation +
+    // "icons" (finds /usr/share/icons since XDG_DATA_DIRS defaults to
+    // "/usr/share" when unset) and SystemIconFallbackThemeName to
+    // "hicolor", matching this project's own deployed theme exactly.
+    Q_UNUSED(name);
+    return new QGenericUnixTheme;
 }
 
 void QPureUnixIntegration::sendMessage(uint32_t type, const void *payload, uint32_t len) const

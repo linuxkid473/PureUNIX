@@ -1,0 +1,60 @@
+diff --git a/pcmanfm/pcmanfm.cpp b/pcmanfm/pcmanfm.cpp
+index c62645b..158ffa6 100644
+--- a/pcmanfm/pcmanfm.cpp
++++ b/pcmanfm/pcmanfm.cpp
+@@ -1,12 +1,54 @@
+ #include "application.h"
+ #include <libfm-qt6/libfmqt.h>
++#include <QtPlugin>
++#include <QTimer>
++#include <glib.h>
++
++// PureUnix has no dynamic Qt platform-plugin loading at all (no shared
++// library loading of any kind), so every real Qt GUI program on this
++// platform has to statically import the "pureunix" QPA plugin and select
++// it explicitly -- exactly what user/qtwindowtest.cpp/qtwidgetstest.cpp
++// already do. Upstream pcmanfm-qt has no idea this platform exists
++// (hence patching it in here rather than anywhere upstream-owned):
++// without this, the binary links fine but fails at runtime with Qt's
++// real "no Qt platform plugin could be initialized" error.
++Q_IMPORT_PLUGIN(QPureUnixIntegrationPlugin)
+ 
+ int main(int argc, char** argv) {
+     // ensure that glib integration of Qt is not turned off
+     // This fixes #168: https://github.com/lxqt/pcmanfm-qt/issues/168
+     qunsetenv("QT_NO_GLIB");
+ 
+-    PCManFM::Application app(argc, argv);
++    static char argPlatform[] = "-platform";
++    static char argPureUnix[] = "pureunix";
++    static char* realArgv[] = { argv[0], argPlatform, argPureUnix, nullptr };
++    int realArgc = 3;
++    (void)argc;
++    (void)argv;
++
++    PCManFM::Application app(realArgc, realArgv);
++
++    // Pump the default GLib main context by hand: our vendored Qt build
++    // has no QEventDispatcherGlib at all (qtbase was cross-built without
++    // glib event-loop integration -- see docs/qt-port.md), so
++    // unsetenv("QT_NO_GLIB") above has no real effect here. Without this,
++    // any GIO async operation relying on the default GMainContext being
++    // iterated (e.g. GFileMonitor's folder-change notifications, used by
++    // libfm-qt's Fm::Folder) would never get its callback fired at all.
++    QTimer glibPump;
++    QObject::connect(&glibPump, &QTimer::timeout, []() {
++        // A single non-blocking iteration per tick, NOT a `while` loop --
++        // some real GSource (e.g. a repeating idle source that always
++        // re-reports itself ready) can make g_main_context_iteration()
++        // return TRUE indefinitely, which turned this into a real,
++        // observed busy spin (100% CPU, /proc/PID/stat's utime climbing
++        // every tick) that starved Qt's own event loop of any chance to
++        // ever process a paint/expose event -- the window would then
++        // sit there permanently black even though the process was very
++        // much alive and "running", not hung.
++        g_main_context_iteration(nullptr, FALSE);
++    });
++    glibPump.start(10);
+ 
+     app.init();
+     return app.exec();

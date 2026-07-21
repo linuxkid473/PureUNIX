@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Image Viewer
+Comment=View PNG images
+Exec=/bin/imgview
+Icon=image-viewer
+Categories=Graphics;Viewer;
+Terminal=false

@@ -321,6 +321,24 @@ static pid_t spawn_client(const char *path, int child_read_fd, int child_write_f
         }
         char *argv[] = { (char *)path, NULL };
         extern char **environ;
+        /* Qt's QBasicFontDatabase (this build has no fontconfig) refuses to
+         * populate any glyphs at all -- every string renders as an empty
+         * "tofu" box -- unless it finds real font files. It checks
+         * QT_QPA_FONTDIR before falling back to a compiled-in prefix that
+         * doesn't exist on this platform's real root filesystem (confirmed
+         * via `strings` on the built libs: "QT_QPA_FONTDIR" and "QFontDatabase:
+         * Cannot find font directory %s" are both really compiled in). Set
+         * here, the one spawn point every Qt client goes through, so it
+         * applies platform-wide rather than per-app. See Makefile's
+         * DEJAVU_FONT for where the actual font file is deployed. */
+        setenv("QT_QPA_FONTDIR", "/lib/fonts", 1);
+        /* Real hicolor icon theme lives at /usr/share/icons/hicolor
+         * (Makefile's HICOLOR_ICONS_DIR). QGenericUnixTheme::xdgIconThemePaths()
+         * (user/qpa_pureunix/pureunixintegration.cpp's createPlatformTheme())
+         * finds it via QStandardPaths::GenericDataLocation, which reads
+         * XDG_DATA_DIRS -- set explicitly rather than relying on this
+         * cross-compiled platform's QStandardPaths fallback default. */
+        setenv("XDG_DATA_DIRS", "/usr/share", 1);
         execve(path, argv, environ);
         _exit(127);
     }
@@ -633,6 +651,28 @@ const app_class_t qtclient_widgets_app_class = {
     .default_client_h = 320,
     .min_client_w = 200,
     .min_client_h = 150,
+    .create = qtclient_create,
+    .destroy = qtclient_destroy,
+    .render = qtclient_render,
+    .on_key = qtclient_on_key,
+    .on_mouse_down = qtclient_on_mouse_down,
+    .on_mouse_up = qtclient_on_mouse_up,
+    .on_mouse_move = qtclient_on_mouse_move,
+    .on_resize = qtclient_on_resize,
+    .poll = qtclient_poll,
+    .is_alive = qtclient_is_alive,
+    .icon_draw = NULL,
+    .graphical = true,
+    .pinned_default = false,
+};
+
+/* See this struct's own comment in user/pude_qtclient.h. */
+const app_class_t qtclient_pcmanfm_app_class = {
+    .name = "File Manager",
+    .default_client_w = 640,
+    .default_client_h = 460,
+    .min_client_w = 300,
+    .min_client_h = 200,
     .create = qtclient_create,
     .destroy = qtclient_destroy,
     .render = qtclient_render,

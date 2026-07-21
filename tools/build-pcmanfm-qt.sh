@@ -27,6 +27,35 @@
 #   translations (Qt6LinguistTools/qttools was never cross-built either,
 #   same as libfm-qt's own patch).
 #
+#   0002-static-qpa-plugin-and-glib-pump.patch — two real, unrelated
+#   runtime (not link-time) bugs found by actually booting the linked
+#   binary in QEMU under `pude` (see docs/pcmanfm-port.md):
+#     - Real upstream pcmanfm.cpp has no idea the "pureunix" QPA plugin
+#       exists (nothing upstream does -- it's this platform's own
+#       out-of-tree plugin, user/qpa_pureunix/), so it linked fine but
+#       failed at runtime with Qt's real "no Qt platform plugin could be
+#       initialized" error (no dynamic plugin loading exists here at
+#       all). Fixed with the same Q_IMPORT_PLUGIN(QPureUnixIntegrationPlugin)
+#       + forced "-platform pureunix" argv that
+#       user/qtwindowtest.cpp/qtwidgetstest.cpp already use. Requires
+#       `make build/user/qpa_pureunix/libpureunix-qpa.a` to have been run
+#       first (checked below) -- tools/pureunix-pcmanfm-toolchain.cmake
+#       links that archive in.
+#     - Once the platform plugin issue was fixed, the window appeared but
+#       stayed permanently black/empty. Real root cause (confirmed via
+#       fprintf tracing and /proc/PID/stat, not guessed): Qt's own "thread"
+#       feature is disabled in this cross-built qtbase (see
+#       docs/qt-port.md), so QThread::start() can't actually run anything;
+#       Fm::Job::runAsync() (used generically by any Fm::Job, including the
+#       FileInfoJob behind Fm::BasicFileLauncher::launchPaths() -- the
+#       entry point behind opening ANY folder) span up a real QThread that
+#       could never run, so the caller's QEventLoop::exec() blocked forever
+#       waiting for a finished() signal that could structurally never fire.
+#       Fixed at the source in libfm-qt (see
+#       third_party/libfm-qt/patches/0006), not here -- this patch only
+#       adds the manual GLib main-context pump main() otherwise needs
+#       since qtbase also has no QEventDispatcherGlib at all.
+#
 # Real dependency graph (this project's own top-level CMakeLists.txt,
 # checked directly): Qt6Widgets, fm-qt6 (libfm-qt6.a, just cross-built),
 # lxqt2-build-tools (for its find-modules + LXQt CMake macros).
@@ -59,6 +88,7 @@ command -v cmake >/dev/null || { echo "cmake not found on PATH" >&2; exit 1; }
 [ -d "${QT_DIR}/lib" ] || { echo "missing ${QT_DIR} — run tools/build-qt.sh first" >&2; exit 1; }
 [ -d "${LIBFMQT_DIR}/lib" ] || { echo "missing ${LIBFMQT_DIR} — run tools/build-libfm-qt.sh first" >&2; exit 1; }
 [ -d "${LXQT_BUILD_TOOLS_DIR}" ] || { echo "missing ${LXQT_BUILD_TOOLS_DIR} — run tools/build-lxqt-build-tools.sh first" >&2; exit 1; }
+[ -f "${REPO_ROOT}/build/user/qpa_pureunix/libpureunix-qpa.a" ] || { echo "missing build/user/qpa_pureunix/libpureunix-qpa.a — run 'make build/user/qpa_pureunix/libpureunix-qpa.a' first" >&2; exit 1; }
 
 echo "==> Building link-probe helper objects"
 mkdir -p "${REPO_ROOT}/build/qt-linkstub"
@@ -115,5 +145,15 @@ echo "==> Vendoring into ${VENDOR_DIR}"
 rm -rf "${VENDOR_DIR}"
 mkdir -p "${VENDOR_DIR}"
 cp -R "${INSTALL_ROOT}/usr/." "${VENDOR_DIR}/"
+
+# CMAKE_BUILD_TYPE=Release above doesn't strip a static-everything binary
+# this large on its own (libfm-qt6.a/Qt6/GLib were all built independently,
+# some with debug info baked in) -- real ext2.img capacity is a hard fixed
+# ceiling (tools/mkext2.py's NUM_GROUPS), so a stripped, still fully
+# functional executable is the difference between fitting on the image or
+# not. `strip` only removes symbol/debug metadata, never code or data the
+# program actually runs.
+echo "==> Stripping debug info from the final binary"
+i686-elf-strip --strip-debug --strip-unneeded "${VENDOR_DIR}/bin/pcmanfm-qt"
 
 echo "==> Done. Review changes under ${VENDOR_DIR} and commit them."

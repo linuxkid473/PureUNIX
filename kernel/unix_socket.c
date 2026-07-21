@@ -321,3 +321,21 @@ int unix_socket_write(unix_socket_t *s, const char *buf, size_t len, bool nonblo
     }
     return (int)written;
 }
+
+bool unix_socket_poll_readable(unix_socket_t *s)
+{
+    if (!s || !s->connected) {
+        return false;
+    }
+    pipe_buf_t *p = s->rx;
+    return p->count > 0 || p->write_ends == 0;
+}
+
+bool unix_socket_poll_writable(unix_socket_t *s)
+{
+    if (!s || !s->connected) {
+        return false;
+    }
+    pipe_buf_t *p = s->tx;
+    return p->count < PUREUNIX_PIPE_SIZE || p->read_ends == 0;
+}

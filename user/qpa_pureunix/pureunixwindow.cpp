@@ -21,23 +21,42 @@ QPureUnixWindow::QPureUnixWindow(QWindow *window, QPureUnixIntegration *integrat
     , m_integration(integration)
     , m_winId(nextWinId())
 {
-    // Real upstream QPlatformWindow's own constructor already recorded
-    // window->geometry() as this window's initial rect (accessible via
-    // geometry() below) -- that's exactly the size `pude` should create
-    // its own real window at, so it's sent once here rather than waiting
-    // for a later setGeometry() call (docs/qt-port.md Phase 6: `pude`
-    // owns every *subsequent* resize/move; this is only the initial
-    // size hint a real WM needs from any client).
-    QRect rect = geometry();
-    pu_qpa_window_create_t create;
-    create.default_w = rect.width() > 0 ? rect.width() : 400;
-    create.default_h = rect.height() > 0 ? rect.height() : 300;
-    m_integration->sendMessage(PU_QPA_C2S_WINDOW_CREATE, &create, sizeof(create));
+    // See this class's own header comment: pude has exactly one real
+    // window per client, so only the FIRST QPureUnixWindow ever created
+    // (pcmanfm-qt's own QMainWindow, always constructed before any
+    // QDialog/QMessageBox) gets to be it. Every later one is "secondary"
+    // and skips WINDOW_CREATE/SET_TITLE entirely below -- it still paints
+    // (QPureUnixBackingStore's flush() sends PU_QPA_C2S_DAMAGE
+    // unconditionally), but into the *same* shared buffer at its own
+    // window-local (0,0) origin, i.e. the top-left corner of the primary
+    // window's real on-screen area. That's a real, visible simplification
+    // (a dialog "overlay" isn't centered or separately decorated) rather
+    // than a proper second window, but it's honest and it doesn't corrupt
+    // or close the primary window -- seeing docs/pcmanfm-port.md's
+    // 2026-07-21 entry for the real bug (a secondary window's own close
+    // used to tell pude the whole client had exited) this replaces.
+    m_isPrimary = !integration->primaryWindow();
+    if (m_isPrimary) {
+        integration->setPrimaryWindow(this);
 
-    const QString title = window->title();
-    if (!title.isEmpty()) {
-        QByteArray utf8 = title.toUtf8();
-        m_integration->sendMessage(PU_QPA_C2S_SET_TITLE, utf8.constData(), (uint32_t)utf8.size());
+        // Real upstream QPlatformWindow's own constructor already recorded
+        // window->geometry() as this window's initial rect (accessible via
+        // geometry() below) -- that's exactly the size `pude` should create
+        // its own real window at, so it's sent once here rather than waiting
+        // for a later setGeometry() call (docs/qt-port.md Phase 6: `pude`
+        // owns every *subsequent* resize/move; this is only the initial
+        // size hint a real WM needs from any client).
+        QRect rect = geometry();
+        pu_qpa_window_create_t create;
+        create.default_w = rect.width() > 0 ? rect.width() : 400;
+        create.default_h = rect.height() > 0 ? rect.height() : 300;
+        m_integration->sendMessage(PU_QPA_C2S_WINDOW_CREATE, &create, sizeof(create));
+
+        const QString title = window->title();
+        if (!title.isEmpty()) {
+            QByteArray utf8 = title.toUtf8();
+            m_integration->sendMessage(PU_QPA_C2S_SET_TITLE, utf8.constData(), (uint32_t)utf8.size());
+        }
     }
 
     m_integration->setActiveWindow(this);
@@ -46,11 +65,41 @@ QPureUnixWindow::QPureUnixWindow(QWindow *window, QPureUnixIntegration *integrat
 
 QPureUnixWindow::~QPureUnixWindow()
 {
-    if (m_created) {
+    if (m_created && m_isPrimary) {
+        // Only the primary window's own close means the client is
+        // actually going away -- see the constructor's comment. A
+        // secondary (dialog) window closing must NOT send this: pude
+        // treats PU_QPA_C2S_CLOSE as "this client is done" (sets
+        // qtclient_state_t.child_alive = false), which used to make the
+        // *entire* app disappear from the desktop the instant a
+        // QMessageBox/QDialog was dismissed, even though the process
+        // itself (confirmed via `ps`) was still very much alive.
         m_integration->sendMessage(PU_QPA_C2S_CLOSE, nullptr, 0);
     }
     if (m_integration) {
-        m_integration->setActiveWindow(nullptr);
+        if (m_isPrimary) {
+            m_integration->setActiveWindow(nullptr);
+            if (m_integration->primaryWindow() == this) {
+                m_integration->setPrimaryWindow(nullptr);
+            }
+        } else {
+            // A secondary window closing hands input routing back to the
+            // primary window (if it's still around) instead of nulling it
+            // out -- otherwise the whole app would silently stop
+            // receiving keyboard/mouse input the moment any dialog closed.
+            QPureUnixWindow *primary = m_integration->primaryWindow();
+            if (m_integration->activeWindow() == this) {
+                m_integration->setActiveWindow(primary);
+            }
+            // The dialog's own DAMAGE painted directly into the shared
+            // buffer's top-left corner (see constructor comment); force a
+            // full repaint of the primary window now so those stale
+            // pixels don't linger on screen after the dialog is gone.
+            if (primary) {
+                QWindowSystemInterface::handleExposeEvent(
+                    primary->window(), QRect(QPoint(0, 0), primary->geometry().size()));
+            }
+        }
     }
 }
 
@@ -64,6 +113,19 @@ void QPureUnixWindow::setGeometry(const QRect &rect)
     // visible), same as every other QPlatformWindow implementation does.
     QPlatformWindow::setGeometry(rect);
     QWindowSystemInterface::handleGeometryChange(window(), rect);
+
+    // Only the primary window's geometry maps to pude's one real window
+    // frame -- see the constructor's "primary vs secondary" comment. A
+    // secondary (dialog) window calling this (e.g. a QMessageBox sizing
+    // itself to fit its own text before showing) must NOT resize pude's
+    // actual on-screen window down to the dialog's own small size, which
+    // is exactly what happened before this guard existed: clicking
+    // "Computer" in pcmanfm-qt's sidebar shrank the whole file manager
+    // window down to a tiny error-dialog-sized box (docs/pcmanfm-port.md's
+    // 2026-07-21 entry).
+    if (!m_isPrimary) {
+        return;
+    }
 
     // Tell PUDE for real (docs/qt-port.md's Phase 5 "genuine architectural
     // blocker" -- see PU_QPA_C2S_RESIZE_REQUEST's own comment,
@@ -92,6 +154,12 @@ void QPureUnixWindow::setVisible(bool visible)
 
 void QPureUnixWindow::setWindowTitle(const QString &title)
 {
+    // A secondary (dialog) window's own title (e.g. a QMessageBox's
+    // "Error") must not overwrite pude's real titlebar text, which
+    // belongs to the primary window -- see the constructor's comment.
+    if (!m_isPrimary) {
+        return;
+    }
     QByteArray utf8 = title.toUtf8();
     m_integration->sendMessage(PU_QPA_C2S_SET_TITLE, utf8.constData(), (uint32_t)utf8.size());
 }

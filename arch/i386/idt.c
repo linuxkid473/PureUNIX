@@ -205,19 +205,43 @@ void isr_dispatch(interrupt_regs_t *regs)
             handlers[regs->int_no][i](regs);
         }
     } else if (regs->int_no < 32) {
+        /* Real per-process fault isolation: a CPL3 (ring-3, RPL=3 in the
+         * saved CS selector) exception is an ordinary userspace program bug
+         * (a bad pointer, a corrupt stack, jumping to garbage) — killing
+         * just that one task, the same real outcome a SIGSEGV/SIGILL/etc.
+         * default action has on any real Unix, is correct and sufficient.
+         * It must NOT bring down the rest of the system (PUDE, every other
+         * VT, the kernel itself) the way it used to (this kernel had no
+         * such isolation until a real userspace GLib/GObject use-after-free
+         * in PCManFM-Qt's own async file-info code produced a genuine ring-3
+         * page fault that halted the whole machine — see
+         * docs/pcmanfm-port.md's dated entry). A CPL0 (ring-0, kernel-mode)
+         * exception is still fatal to the whole system: an addressing bug
+         * in the kernel's own code has no isolation boundary to fall back
+         * on, and the machine state it corrupts may not even be safe to
+         * task_exit() out of. Double fault (8), invalid TSS (10), and
+         * machine check (18) are excluded even from ring-3 isolation: real
+         * hardware/structural failures this kernel has no graceful
+         * recovery path for regardless of which ring triggered them. */
+        bool from_ring3 = (regs->cs & 3) == 3;
+        bool isolatable = from_ring3 &&
+            regs->int_no != 8 && regs->int_no != 10 && regs->int_no != 18;
+
         if (regs->int_no == 14) {
             /* Page fault: CR2 holds the faulting linear address (the CPU's
              * own contract, independent of anything the trap frame itself
              * carries) -- essential for diagnosing *what* was being
              * accessed, not just *where the code was* (regs->eip alone
              * leaves "wrote through a bad pointer" and "jumped to garbage"
-             * indistinguishable). This kernel has no per-process fault
-             * isolation yet (any ring-3 page fault panics the whole
-             * system, same as a kernel one), so this is the only diagnostic
-             * a ring-3 crash like a stack overflow or a bad pointer
-             * ever gets. */
+             * indistinguishable). */
             uint32_t cr2;
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            if (isolatable) {
+                printf("SIGSEGV: pid=%d CPU exception %u (%s), err=%x eip=%p cr2=%p -- terminating process\n",
+                       (int)task_current()->id, regs->int_no, exception_names[regs->int_no],
+                       regs->err_code, (void *)regs->eip, (void *)cr2);
+                task_exit(-SIGSEGV);
+            }
             panic("CPU exception %u (%s), err=%x eip=%p cr2=%p",
                   regs->int_no, exception_names[regs->int_no], regs->err_code,
                   (void *)regs->eip, (void *)cr2);
@@ -227,8 +251,7 @@ void isr_dispatch(interrupt_regs_t *regs)
              * above -- the bytes actually at eip (not what any on-disk ELF
              * copy says should be there) are the one diagnostic that can
              * distinguish "jumped to garbage" from "the CPU genuinely
-             * can't decode legitimate code here", and this kernel has no
-             * per-process fault isolation to fall back on either way.
+             * can't decode legitimate code here".
              * Real precedent: this exact dump is what found a genuine
              * memory-layout bug during the Qt QPA port (task_t.heap_base's
              * own comment, include/pureunix/task.h) -- a fixed HEAP_VA
@@ -242,6 +265,28 @@ void isr_dispatch(interrupt_regs_t *regs)
                 printf(" %02x", p[i]);
             }
             printf("\n");
+            if (isolatable) {
+                printf("SIGILL: pid=%d CPU exception %u (%s), err=%x eip=%p -- terminating process\n",
+                       (int)task_current()->id, regs->int_no, exception_names[regs->int_no],
+                       regs->err_code, (void *)regs->eip);
+                task_exit(-SIGILL);
+            }
+        }
+        if (isolatable) {
+            /* Every other isolatable vector: divide-by-zero(0)/overflow(4)/
+             * x87(16)/SIMD(19) fp -> SIGFPE, bound-range(5)/segment-not-
+             * present(11)/stack-fault(12)/GPF(13) -> SIGSEGV (all "bad
+             * address/limit" in spirit), alignment-check(17) -> SIGBUS. */
+            int sig;
+            switch (regs->int_no) {
+            case 0: case 4: case 16: case 19: sig = SIGFPE; break;
+            case 17: sig = SIGBUS; break;
+            default: sig = SIGSEGV; break;
+            }
+            printf("signal %d: pid=%d CPU exception %u (%s), err=%x eip=%p -- terminating process\n",
+                   sig, (int)task_current()->id, regs->int_no, exception_names[regs->int_no],
+                   regs->err_code, (void *)regs->eip);
+            task_exit(-sig);
         }
         panic("CPU exception %u (%s), err=%x eip=%p",
               regs->int_no, exception_names[regs->int_no], regs->err_code, (void *)regs->eip);

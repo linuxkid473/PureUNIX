@@ -16,6 +16,10 @@ extern const app_class_t qtclient_app_class;
  * user/pude.c's g_apps[]. */
 extern const app_class_t qtclient_widgets_app_class;
 
+/* Same generic adapter again, a third time, for the real upstream
+ * PCManFM-Qt file manager (docs/pcmanfm-port.md) -> /bin/pcmanfm-qt. */
+extern const app_class_t qtclient_pcmanfm_app_class;
+
 /* One-shot mailbox, same pattern as user/pude_term.h's
  * puterm_set_startup_command(): set right before requesting a spawn of
  * qtclient_app_class, consumed by the very next qtclient_create() call.

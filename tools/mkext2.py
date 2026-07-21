@@ -63,7 +63,27 @@ NUM_GROUPS        = 7              # see the module docstring's "Why 3 block
                                    # groups" (purely additive extra
                                    # capacity, same reasoning applies to
                                    # every group added since) -- 56 MB
-                                   # total. Raised from 6 (48 MB) for the
+                                   # total; overridable per invocation via
+                                   # --num-groups (see main()) for images
+                                   # that don't travel through the shared
+                                   # LIVE_ISO RAM ceiling below (e.g.
+                                   # tools/build-pcmanfm-scratch-disk.sh,
+                                   # docs/pcmanfm-port.md) -- a real attempt
+                                   # to just raise this shared default to
+                                   # 10 (80 MB) so the real pcmanfm-qt
+                                   # binary (~21 MB even stripped) could
+                                   # join the shared build/ext2.img failed
+                                   # with a real, confirmed GRUB "error: out
+                                   # of memory" (same failure class as the
+                                   # NUM_GROUPS=12 attempt described below),
+                                   # even though 10 groups' raw arithmetic
+                                   # (80 MB + fat.img's 32 MB = 112 MB)
+                                   # looks like it should fit under the
+                                   # 128 MB ceiling -- GRUB's own real
+                                   # runtime/relocation overhead eats
+                                   # further into that budget than the
+                                   # naive per-module sum suggests. Raised
+                                   # from 6 (48 MB) for the
                                    # PCManFM-Qt port's MenuCache phase
                                    # (docs/pcmanfm-port.md): the real
                                    # image filled up exactly (RuntimeError:
@@ -993,7 +1013,8 @@ def add_extra_file(fs, dir_cache: dict, host_path: str, dest_path: str):
 def main(argv):
     if len(argv) < 2:
         print("usage: mkext2.py OUT.img [--docs DIR] [--tcc-elf PATH --tcc-sysroot DIR] "
-              "[--persistent-boot KERNEL.elf] [--extra-file HOST:DEST ...] [program.elf ...]",
+              "[--persistent-boot KERNEL.elf] [--extra-file HOST:DEST ...] "
+              "[--num-groups N] [program.elf ...]",
               file=sys.stderr)
         return 2
 
@@ -1023,6 +1044,31 @@ def main(argv):
         elif rest[i] == '--extra-file' and i + 1 < len(rest):
             host_path, _, dest_path = rest[i + 1].partition(':')
             extra_files.append((host_path, dest_path))
+            i += 2
+        elif rest[i] == '--extra-dir' and i + 1 < len(rest):
+            # Recursively stages every file under HOST_DIR onto the image
+            # at DEST_DIR, preserving relative paths -- the same generic
+            # add_extra_file() mechanism as --extra-file, just for a whole
+            # directory tree at once (e.g. a real icon theme's ~70 files,
+            # docs/qt-port.md's own icon-deployment gap) instead of one
+            # Makefile --extra-file per file.
+            host_dir, _, dest_dir = rest[i + 1].partition(':')
+            for root, _dirs, files in os.walk(host_dir):
+                for fname in sorted(files):
+                    host_path = os.path.join(root, fname)
+                    rel = os.path.relpath(host_path, host_dir)
+                    dest_path = dest_dir.rstrip('/') + '/' + rel.replace(os.sep, '/')
+                    extra_files.append((host_path, dest_path))
+            i += 2
+        elif rest[i] == '--num-groups' and i + 1 < len(rest):
+            # Overrides the module-level NUM_GROUPS/TOTAL_BLOCKS default
+            # (see that constant's own comment) -- for images that don't
+            # share the shared LIVE_ISO's RAM ceiling and can afford (or
+            # need) a different capacity, e.g.
+            # tools/build-pcmanfm-scratch-disk.sh.
+            global NUM_GROUPS, TOTAL_BLOCKS
+            NUM_GROUPS = int(rest[i + 1])
+            TOTAL_BLOCKS = NUM_GROUPS * BLOCKS_PER_GROUP
             i += 2
         else:
             programs.append(rest[i])

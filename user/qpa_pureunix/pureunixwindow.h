@@ -35,6 +35,19 @@ private:
     WId m_winId;
     bool m_visible = false;
     bool m_created = false;
+
+    // `pude` (user/pude_qtclient.c) has exactly one content buffer/window
+    // frame per client process -- no window-ID concept exists in the wire
+    // protocol at all (docs/qt-port.md Phase 6 scope). The first window
+    // this process ever creates (pcmanfm-qt's own QMainWindow) is the
+    // "primary" one that owns that single real pude-side window; every
+    // window after that (QMessageBox/QDialog/etc.) is "secondary" and
+    // renders as a same-buffer overlay instead of a real separate pude
+    // window -- see the constructor/destructor's own comments for why,
+    // and third_party/pcmanfm-qt's docs entry for the real bug this fixes
+    // (a secondary window's own close used to make pude think the whole
+    // client had exited).
+    bool m_isPrimary = false;
 };
 
 #endif

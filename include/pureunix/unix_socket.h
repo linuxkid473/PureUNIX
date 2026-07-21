@@ -80,4 +80,23 @@ int unix_socket_connect(unix_socket_t *s, const char *path);
 int unix_socket_read(unix_socket_t *s, char *buf, size_t len, bool nonblock);
 int unix_socket_write(unix_socket_t *s, const char *buf, size_t len, bool nonblock);
 
+/* Real SYS_POLL readiness for a connected socket's rx/tx rings — same
+ * pipe_readable()/pipe_writable() logic arch/i386/syscall.c's own
+ * FD_KIND_PIPE case uses, exposed here since unix_socket_t is opaque
+ * outside this file. Added when a real hang was found: SYS_POLL's
+ * pre-existing "no readiness tracking for any fd kind but pipes"
+ * fallback (an honest, disclosed gap until now) always reported
+ * FD_KIND_SOCKET fds as readable regardless of real data — harmless for
+ * every socket use up to now (unix_socktest.c/menucachetest.c never
+ * poll() a socket, they block directly in read()/accept()), until
+ * PCManFM-Qt's real upstream SIGTERM self-pipe (a socketpair(), watched
+ * via QSocketNotifier/poll() and deliberately left blocking, matching
+ * real Unix self-pipe-trick conventions) became the first real caller:
+ * poll() lying "readable" on every cycle fired the notifier spuriously,
+ * whose read() then genuinely blocked forever on an actually-empty
+ * blocking socket. False for an unconnected socket (nothing meaningful
+ * to report). */
+bool unix_socket_poll_readable(unix_socket_t *s);
+bool unix_socket_poll_writable(unix_socket_t *s);
+
 #endif
