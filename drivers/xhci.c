@@ -93,6 +93,11 @@ static void xfer_lock_acquire(xhci_xfer_lock_t *lock)
             return;
         }
         arch_restore_interrupts(flags);
+        /* See bulk_transfer()'s own guard, just below, for why this needs
+         * arch_enable_interrupts() before it can safely block -- same
+         * reasoning, applies here too since this wait can itself be
+         * entered before bulk_transfer()'s own guard ever runs. */
+        arch_enable_interrupts();
         wait_queue_sleep(&lock->wq, xfer_lock_is_free, lock);
     }
 }
@@ -836,10 +841,10 @@ static void portsc_clear_changes(uint32_t offset)
 /* Resets a connected port (sec 4.3.1): clears any stale change bits, sets
  * PORTSC.PR, and polls (bounded) for PORTSC.PRC (Port Reset Change) to
  * confirm the reset actually completed, then clears that change bit and
- * confirms PED (Port Enabled) came up. USB2-port procedure only -- see
- * xhci.h's Supported Protocol Capability comment on why USB3 ports (which
- * auto-enable via link training and should not have a software reset
- * forced on them) are out of this driver's scope entirely. */
+ * confirms PED (Port Enabled) came up. USB2-port procedure only -- USB3
+ * (SuperSpeed) ports auto-enable via link training instead and must never
+ * have a software Port Reset forced on them; see enable_ss_port() below
+ * for their (structurally different) enable path. */
 static bool reset_port(uint32_t port)
 {
     uint32_t offset = XHCI_OP_PORTSC_BASE + (port - 1) * XHCI_OP_PORTSC_STRIDE;
@@ -864,6 +869,69 @@ static bool reset_port(uint32_t port)
     portsc = op_read32(offset);
     if (!(portsc & XHCI_PORTSC_PED)) {
         printf("xhci: port %u did not enable after reset (portsc=%x)\n", port, portsc);
+        return false;
+    }
+    return true;
+}
+
+/* Brings up a connected USB3 (SuperSpeed) port -- the structurally
+ * different counterpart to reset_port() above. Unlike a USB2 port, a
+ * SuperSpeed port never needs (and must never receive) a software Port
+ * Reset: link training (LTSSM) runs automatically once a device is
+ * physically connected, and PED comes up on its own as soon as that
+ * finishes -- forcing PORTSC.PR on an SS port is undefined per spec and,
+ * on real silicon observed during this port's bring-up, actively prevents
+ * the link from ever reaching U0.
+ *
+ * Two-step: (1) give link training a bounded chance to finish on its own
+ * (the common, fast case -- real SuperSpeed link training completes in
+ * low single-digit milliseconds, well inside XHCI_POLL_ITERATIONS' budget,
+ * and QEMU's qemu-xhci reports PED=1 immediately). (2) if PED still isn't
+ * set, the link is stuck (e.g. resuming from a previous session's odd
+ * link state, or silicon that needs a nudge) -- issue a Warm Port Reset
+ * (sec 4.19.5.1, PORTSC.WPR), the SS-native recovery reset, and wait for
+ * its own completion signal (WRC, not PRC -- WPR doesn't self-clear the
+ * way PR does) before rechecking PED once more. */
+static bool enable_ss_port(uint32_t port)
+{
+    uint32_t offset = XHCI_OP_PORTSC_BASE + (port - 1) * XHCI_OP_PORTSC_STRIDE;
+    portsc_clear_changes(offset);
+
+    bool enabled = false;
+    for (uint32_t i = 0; i < XHCI_POLL_ITERATIONS; ++i) {
+        if (op_read32(offset) & XHCI_PORTSC_PED) {
+            enabled = true;
+            break;
+        }
+    }
+    if (enabled) {
+        portsc_clear_changes(offset);
+        return true;
+    }
+
+    printf("xhci: port %u: SuperSpeed link did not train to U0 on its own within the poll "
+           "bound -- attempting Warm Port Reset\n",
+           port);
+
+    uint32_t portsc = op_read32(offset);
+    op_write32(offset, (portsc & XHCI_PORTSC_PRESERVE_MASK) | XHCI_PORTSC_WPR);
+
+    bool warm_reset_done = false;
+    for (uint32_t i = 0; i < XHCI_POLL_ITERATIONS; ++i) {
+        if (op_read32(offset) & XHCI_PORTSC_WRC) {
+            warm_reset_done = true;
+            break;
+        }
+    }
+    if (!warm_reset_done) {
+        printf("xhci: port %u: Warm Port Reset timed out\n", port);
+        return false;
+    }
+    portsc_clear_changes(offset);
+
+    portsc = op_read32(offset);
+    if (!(portsc & XHCI_PORTSC_PED)) {
+        printf("xhci: port %u did not enable after Warm Port Reset (portsc=%x)\n", port, portsc);
         return false;
     }
     return true;
@@ -1003,11 +1071,25 @@ static bool address_device(uint32_t slot_id, uint32_t port, uint32_t speed)
     slot_ctx->dword1 = port << XHCI_SLOT_ROOT_HUB_PORT_SHIFT;
     slot_ctx->dword2 = 0U << XHCI_SLOT_INTERRUPTER_TARGET_SHIFT; /* interrupter 0 */
 
+    /* Any Speed ID other than the three spec-fixed LS/FS/HS values (see
+     * xhci.h's comment on XHCI_SPEED_* for why this, rather than an exact
+     * `speed == XHCI_SPEED_SUPER` check, is the correct test even under a
+     * controller-defined custom PSI table) is SuperSpeed-family, where
+     * EP0's max packet size is a USB3-spec-fixed 512 bytes -- unlike
+     * LS/FS/HS, a SuperSpeed device's bMaxPacketSize0 descriptor field
+     * doesn't even encode a literal byte count (see real_max_packet0
+     * below), so there's nothing to "guess" here beyond the one legal
+     * value. */
+    bool is_super_speed_family =
+        speed != XHCI_SPEED_LOW && speed != XHCI_SPEED_FULL && speed != XHCI_SPEED_HIGH;
+
     /* Conservative first guess at bMaxPacketSize0 by speed (sec 4.3's
      * table): Low Speed is always exactly 8, High Speed is always exactly
      * 64, Full Speed varies (8/16/32/64) so 8 is used as a safe minimum
-     * every FS device accepts for an initial 8-byte read. */
-    uint8_t max_packet_guess = (speed == XHCI_SPEED_HIGH) ? 64U : 8U;
+     * every FS device accepts for an initial 8-byte read, SuperSpeed-family
+     * is always exactly 512 (see is_super_speed_family above). */
+    uint16_t max_packet_guess =
+        is_super_speed_family ? 512U : ((speed == XHCI_SPEED_HIGH) ? 64U : 8U);
 
     xhci_endpoint_context_t *ep0_ctx =
         (xhci_endpoint_context_t *)input_context_entry(st->input_ctx, XHCI_EP0_DCI);
@@ -1037,7 +1119,18 @@ static bool address_device(uint32_t slot_id, uint32_t port, uint32_t speed)
         return false;
     }
 
-    uint8_t real_max_packet0 = desc8[7]; /* bMaxPacketSize0 is byte offset 7 */
+    /* bMaxPacketSize0 is byte offset 7 in every USB device descriptor, but
+     * its *meaning* differs by speed class: for LS/FS/HS it's the literal
+     * max packet size in bytes (8/16/32/64), while for SuperSpeed-family
+     * devices the USB3 spec always encodes it as an exponent (2^n) instead
+     * -- always 9 in practice (2^9 = 512, the one legal SS value), but
+     * decoded properly here rather than hardcoding 512 so a genuinely
+     * nonstandard device is still handled instead of silently ignored. A
+     * raw exponent value misread as a literal byte count (e.g. 9 taken to
+     * mean a 9-byte max packet) would corrupt this slot's EP0 max packet
+     * size to something no real control transfer beyond the initial 8-byte
+     * probe could ever complete on. */
+    uint16_t real_max_packet0 = is_super_speed_family ? (uint16_t)(1U << desc8[7]) : desc8[7];
     if (real_max_packet0 != 0 && real_max_packet0 != max_packet_guess) {
         ep0_ctx->dword1 = (ep0_ctx->dword1
                             & ~(XHCI_EP_MAX_PACKET_SIZE_MASK << XHCI_EP_MAX_PACKET_SIZE_SHIFT))
@@ -1082,9 +1175,9 @@ static bool address_device(uint32_t slot_id, uint32_t port, uint32_t speed)
  *   - HS interrupt endpoints: bInterval already *is* that same exponent,
  *     just 1-based (actual interval = 2^(bInterval-1) microframes) where
  *     xHCI's Interval field is 0-based -- so Interval = bInterval - 1.
- * (SuperSpeed uses the same 0-based encoding as HS, but SS ports are out of
- * this driver's scope entirely -- see the Supported Protocol Capability
- * comment in xhci.h.) */
+ * (SuperSpeed interrupt endpoints use this same 0-based encoding as HS, so
+ * the `else` branch below is correct for both -- no separate SS case
+ * needed.) */
 static uint32_t compute_interval(uint32_t speed, uint8_t b_interval)
 {
     if (speed == XHCI_SPEED_LOW || speed == XHCI_SPEED_FULL) {
@@ -1327,6 +1420,34 @@ static bool configure_bulk_endpoints(uint32_t slot_id, uint8_t in_addr, uint16_t
 static bool bulk_transfer(uint32_t slot_id, uint8_t endpoint_address, void *buf, uint16_t length,
                            uint32_t *out_bytes)
 {
+    /* wait_queue_sleep()'s own documented invariant (include/pureunix/
+     * wait.h) and docs/process-management.md's "Interrupts stay masked
+     * across a whole syscall": `int $0x80` is a 32-bit interrupt gate --
+     * entering it clears IF, and nothing restores it until the syscall's
+     * own `iret`. This function is reachable from disk-touching syscalls
+     * (SYS_OPEN, SYS_READDIR, SYS_EXEC's ELF loader, ...) via usb_msd.c,
+     * and unconditionally blocks below in two ways: xfer_lock_acquire()
+     * if another task is mid-transfer, and unconditionally afterward via
+     * its own pit_sleep()-based wait for the real DMA completion -- the
+     * second one runs even on the *uncontended* fast path, so guarding
+     * only the lock isn't enough. Either wait's `hlt` can only ever be
+     * woken by a PIT tick or this controller's own IRQ, neither of which
+     * can fire while IF is still clear from syscall entry -- without this,
+     * the wait (and, single-core, the entire machine, since nothing else
+     * can be scheduled either) halts forever, not just times out. Every
+     * *other* blocking syscall handler in this kernel remembers to do
+     * this individually at its own call site (SYS_WAIT, SYS_PING,
+     * tty_read(), ...); guaranteed here instead, unconditionally, so
+     * every current and future disk-I/O syscall is safe without each one
+     * having to remember the incantation. Harmless no-op if interrupts
+     * were already enabled (every non-syscall caller, e.g. boot-time
+     * enumeration). This path was untested until now: QEMU's near-
+     * instant emulated bulk transfers essentially never leave the
+     * uncontended fast path *and* complete before this wait would ever
+     * actually need waking, and real hardware never reached this code at
+     * all before SuperSpeed enumeration existed. */
+    arch_enable_interrupts();
+
     if (out_bytes) {
         *out_bytes = 0;
     }
@@ -1472,20 +1593,34 @@ static const usb_hc_ops_t xhci_hc_ops = {
     .reset_endpoint = reset_endpoint,
 };
 
-/* Walks the extended capabilities list for a Supported Protocol Capability
- * whose Major Revision is 2 (USB2 -- covers LS/FS/HS, i.e. every Boot
- * Protocol keyboard), returning its Compatible Port Offset/Count and
- * Protocol Slot Type. Any USB3-major capability found along the way is
- * logged and skipped -- see xhci.h's comment on this driver's USB2-only
- * enumeration scope. Returns false if no USB2 capability exists at all
- * (would mean a controller with no low/full/high-speed ports, unusual but
- * not itself an error worth failing bring-up over). */
-static bool find_usb2_protocol(uint32_t *port_offset, uint32_t *port_count, uint32_t *slot_type)
+/* One Supported Protocol Capability's worth of what xhci_enumerate() needs
+ * to actually enumerate the ports it covers: the Compatible Port
+ * Offset/Count, the Protocol Slot Type to pass to Enable Slot, and whether
+ * this range is SuperSpeed-family (major revision 3) -- which selects
+ * enable_ss_port() over reset_port() for bring-up, and (via address_device()
+ * reading `speed` straight off PORTSC) the EP0 max-packet handling. */
+typedef struct xhci_protocol_range {
+    uint32_t port_offset;
+    uint32_t port_count;
+    uint32_t slot_type;
+    bool is_super_speed;
+} xhci_protocol_range_t;
+
+/* Walks the extended capabilities list once, collecting the USB2 (major
+ * revision 2 -- LS/FS/HS) and USB3 (major revision 3 -- SuperSpeed)
+ * Supported Protocol Capability ranges into `out_ranges` (caller-sized for
+ * at most one of each). Any *other* major revision found along the way
+ * (e.g. a controller that splits USB 3.2 into its own separate capability
+ * entry) is logged and skipped -- this driver has no behavior beyond the
+ * USB2/SuperSpeed split every call site already makes. Returns the number
+ * of ranges written (0, 1, or 2). */
+static uint32_t find_protocol_ranges(xhci_protocol_range_t *out_ranges, uint32_t max_ranges)
 {
     uint32_t hccparams1 = reg_read32(ctrl.mmio, XHCI_CAP_HCCPARAMS1);
     uint32_t xecp_dwords = XHCI_HCCPARAMS1_XECP(hccparams1);
     uint32_t offset = xecp_dwords * 4U;
     uint32_t guard = 0;
+    uint32_t found = 0;
 
     while (offset != 0 && guard < 64) {
         uint32_t dw0 = reg_read32(ctrl.mmio, offset);
@@ -1499,17 +1634,19 @@ static bool find_usb2_protocol(uint32_t *port_offset, uint32_t *port_count, uint
             uint32_t p_off = XHCI_SUPPORTED_PROTOCOL_PORT_OFFSET(dw2);
             uint32_t p_cnt = XHCI_SUPPORTED_PROTOCOL_PORT_COUNT(dw2);
 
-            if (major == 2) {
-                *port_offset = p_off;
-                *port_count = p_cnt;
-                *slot_type = XHCI_SUPPORTED_PROTOCOL_SLOT_TYPE(dw3);
-                printf("xhci: USB2 ports %u..%u (slot type %u)\n", p_off, p_off + p_cnt - 1,
-                       *slot_type);
-                return true;
+            if ((major == 2 || major == 3) && found < max_ranges) {
+                out_ranges[found].port_offset = p_off;
+                out_ranges[found].port_count = p_cnt;
+                out_ranges[found].slot_type = XHCI_SUPPORTED_PROTOCOL_SLOT_TYPE(dw3);
+                out_ranges[found].is_super_speed = (major == 3);
+                printf("xhci: USB%u ports %u..%u (slot type %u)%s\n", major, p_off,
+                       p_off + p_cnt - 1, out_ranges[found].slot_type,
+                       (major == 3) ? " -- SuperSpeed" : "");
+                ++found;
+            } else {
+                printf("xhci: USB%u ports %u..%u -- out of scope, skipped\n", major, p_off,
+                       p_off + p_cnt - 1);
             }
-            printf("xhci: USB%u ports %u..%u -- out of scope, skipped (no SuperSpeed "
-                   "enumeration; see docs/usb.md)\n",
-                   major, p_off, p_off + p_cnt - 1);
         }
 
         if (next_dwords == 0) {
@@ -1518,7 +1655,7 @@ static bool find_usb2_protocol(uint32_t *port_offset, uint32_t *port_count, uint
         offset += next_dwords * 4U;
         ++guard;
     }
-    return false;
+    return found;
 }
 
 void xhci_enumerate(void)
@@ -1540,80 +1677,96 @@ void xhci_enumerate(void)
     }
     printf("xhci: interrupt-driven command self-test OK\n");
 
-    uint32_t port_offset = 0;
-    uint32_t port_count = 0;
-    uint32_t slot_type = 0;
-    if (!find_usb2_protocol(&port_offset, &port_count, &slot_type)) {
-        printf("xhci: no USB2 Supported Protocol Capability found; nothing to enumerate\n");
+    xhci_protocol_range_t ranges[2];
+    uint32_t num_ranges = find_protocol_ranges(ranges, 2U);
+    if (num_ranges == 0) {
+        printf("xhci: no USB2/USB3 Supported Protocol Capability found; nothing to enumerate\n");
         return;
     }
 
-    for (uint32_t port = port_offset; port < port_offset + port_count; ++port) {
-        if (port == 0 || port > ctrl.max_ports) {
-            continue;
-        }
-        uint32_t offset = XHCI_OP_PORTSC_BASE + (port - 1) * XHCI_OP_PORTSC_STRIDE;
-        uint32_t portsc = op_read32(offset);
-        usb_debugf("xhci: port %u: initial scan portsc=%x (ccs=%u ped=%u pls=%u speed=%u)\n", port,
-                   portsc, (portsc & XHCI_PORTSC_CCS) != 0, (portsc & XHCI_PORTSC_PED) != 0,
-                   (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK,
-                   XHCI_PORTSC_GET_SPEED(portsc));
+    for (uint32_t r = 0; r < num_ranges; ++r) {
+        const xhci_protocol_range_t *range = &ranges[r];
 
-        /* CCS reflects real analog device-presence detection, not something
-         * this driver's own reset/bring-up sequence should need to wait on
-         * -- but unlike QEMU's virtual device (CCS=1 from the very first
-         * read after HCRST, with no signal-integrity/link-training delay to
-         * model), real silicon's port state can take a short, variable time
-         * to settle after this controller's own HCRST tears down and
-         * retrains the downstream link, especially right after a BIOS/SMM
-         * Legacy Support handoff was actively using the same port. A single
-         * unconditional read here would misclassify that transient window
-         * as "nothing plugged in" with no way to tell the two apart from the
-         * boot log alone -- so retry (bounded) before giving up, logging
-         * every raw portsc value seen along the way. */
-        if (!(portsc & XHCI_PORTSC_CCS)) {
-            bool became_connected = false;
-            for (uint32_t i = 0; i < XHCI_POLL_ITERATIONS; ++i) {
-                portsc = op_read32(offset);
-                if (portsc & XHCI_PORTSC_CCS) {
-                    became_connected = true;
-                    break;
-                }
-            }
-            if (!became_connected) {
-                usb_debugf("xhci: port %u: no device connected after settle-wait (final "
-                           "portsc=%x) -- skipping\n",
-                           port, portsc);
+        for (uint32_t port = range->port_offset; port < range->port_offset + range->port_count;
+             ++port) {
+            if (port == 0 || port > ctrl.max_ports) {
                 continue;
             }
-            printf("xhci: port %u: device connected after settle-wait (portsc=%x)\n", port,
-                   portsc);
-        } else {
-            printf("xhci: port %u: device connected (portsc=%x)\n", port, portsc);
-        }
+            uint32_t offset = XHCI_OP_PORTSC_BASE + (port - 1) * XHCI_OP_PORTSC_STRIDE;
+            uint32_t portsc = op_read32(offset);
+            usb_debugf("xhci: port %u: initial scan portsc=%x (ccs=%u ped=%u pls=%u speed=%u)\n",
+                       port, portsc, (portsc & XHCI_PORTSC_CCS) != 0,
+                       (portsc & XHCI_PORTSC_PED) != 0,
+                       (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK,
+                       XHCI_PORTSC_GET_SPEED(portsc));
 
-        if (!reset_port(port)) {
-            continue;
-        }
-        printf("xhci: port %u: reset complete\n", port);
+            /* CCS reflects real analog device-presence detection, not
+             * something this driver's own reset/bring-up sequence should
+             * need to wait on -- but unlike QEMU's virtual device (CCS=1
+             * from the very first read after HCRST, with no signal-
+             * integrity/link-training delay to model), real silicon's port
+             * state can take a short, variable time to settle after this
+             * controller's own HCRST tears down and retrains the
+             * downstream link, especially right after a BIOS/SMM Legacy
+             * Support handoff was actively using the same port. A single
+             * unconditional read here would misclassify that transient
+             * window as "nothing plugged in" with no way to tell the two
+             * apart from the boot log alone -- so retry (bounded) before
+             * giving up, logging every raw portsc value seen along the
+             * way. Applies equally to USB3 ports: SuperSpeed link training
+             * (LTSSM) needs this same settling time before CCS is even
+             * meaningful, on top of enable_ss_port()'s own separate wait
+             * below for PED specifically. */
+            if (!(portsc & XHCI_PORTSC_CCS)) {
+                bool became_connected = false;
+                for (uint32_t i = 0; i < XHCI_POLL_ITERATIONS; ++i) {
+                    portsc = op_read32(offset);
+                    if (portsc & XHCI_PORTSC_CCS) {
+                        became_connected = true;
+                        break;
+                    }
+                }
+                if (!became_connected) {
+                    usb_debugf("xhci: port %u: no device connected after settle-wait (final "
+                               "portsc=%x) -- skipping\n",
+                               port, portsc);
+                    continue;
+                }
+                printf("xhci: port %u: device connected after settle-wait (portsc=%x)\n", port,
+                       portsc);
+            } else {
+                printf("xhci: port %u: device connected (portsc=%x)\n", port, portsc);
+            }
 
-        uint32_t speed = XHCI_PORTSC_GET_SPEED(op_read32(offset));
-        usb_device_t dev;
-        if (!usb_enumerate_port(&xhci_hc_ops, port, speed, slot_type, &dev)) {
-            continue;
+            /* USB2 ports need a software Port Reset to enable; USB3 ports
+             * auto-enable via link training and must never receive one --
+             * see reset_port()'s and enable_ss_port()'s own comments. */
+            bool port_ready = range->is_super_speed ? enable_ss_port(port) : reset_port(port);
+            if (!port_ready) {
+                continue;
+            }
+            printf("xhci: port %u: %s complete\n", port,
+                   range->is_super_speed ? "SuperSpeed link-up" : "reset");
+
+            uint32_t speed = XHCI_PORTSC_GET_SPEED(op_read32(offset));
+            usb_device_t dev;
+            if (!usb_enumerate_port(&xhci_hc_ops, port, speed, range->slot_type, &dev)) {
+                continue;
+            }
+            /* Silently a no-op for any device that isn't a Boot Protocol
+             * keyboard (checked internally via dev.interface_class/
+             * subclass/protocol) -- future class drivers (mice, storage)
+             * would get their own hid_try_attach()-shaped hook called here
+             * too. */
+            hid_try_attach(&xhci_hc_ops, &dev);
+            /* Same shape, for a Boot Protocol mouse (interface_protocol ==
+             * HID_PROTOCOL_MOUSE rather than HID_PROTOCOL_KEYBOARD). */
+            hid_mouse_try_attach(&xhci_hc_ops, &dev);
+            /* Same shape, for Mass Storage (checked internally via
+             * dev.has_bulk_endpoints, already gated on interface class 0x08
+             * by parse_configuration()). */
+            usb_msd_try_attach(&xhci_hc_ops, &dev);
         }
-        /* Silently a no-op for any device that isn't a Boot Protocol
-         * keyboard (checked internally via dev.interface_class/subclass/
-         * protocol) -- future class drivers (mice, storage) would get
-         * their own hid_try_attach()-shaped hook called here too. */
-        hid_try_attach(&xhci_hc_ops, &dev);
-        /* Same shape, for a Boot Protocol mouse (interface_protocol ==
-         * HID_PROTOCOL_MOUSE rather than HID_PROTOCOL_KEYBOARD). */
-        hid_mouse_try_attach(&xhci_hc_ops, &dev);
-        /* Same shape, for Mass Storage (checked internally via
-         * dev.has_bulk_endpoints, already gated on interface class 0x08 by
-         * parse_configuration()). */
-        usb_msd_try_attach(&xhci_hc_ops, &dev);
     }
 }
 

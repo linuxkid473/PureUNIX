@@ -83,6 +83,16 @@ static void msd_lock_acquire(msd_lock_t *lock)
             return;
         }
         arch_restore_interrupts(flags);
+        /* Same reasoning as drivers/xhci.c's identical guard on
+         * bulk_xfer_lock -- see that comment for the full explanation.
+         * `int $0x80` enters with interrupts masked; blocking here without
+         * re-enabling them first means the wait's own `hlt` can never be
+         * woken by any interrupt at all, freezing the whole single-core
+         * machine, not just this task. Guaranteed here rather than relying
+         * on every syscall handler that transitively reaches msd_transact()
+         * (SYS_OPEN, SYS_READDIR, SYS_EXEC, ...) to remember it themselves.
+         * Harmless no-op if interrupts were already enabled. */
+        arch_enable_interrupts();
         wait_queue_sleep(&lock->wq, msd_lock_is_free, lock);
     }
 }

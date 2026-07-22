@@ -309,6 +309,11 @@ typedef struct __attribute__((packed)) xhci_trb {
 #define XHCI_PORTSC_PRC    (1U << 21) /* Port Reset Change (RW1C) */
 #define XHCI_PORTSC_PLC    (1U << 22) /* Port Link State Change (RW1C) */
 #define XHCI_PORTSC_CEC    (1U << 23) /* Config Error Change (RW1C) */
+#define XHCI_PORTSC_WPR    (1U << 31) /* Warm Port Reset (RW) -- SS-port-only recovery reset;
+                                        * see enable_ss_port() in xhci.c. Unlike PR (USB2 Port
+                                        * Reset), WPR doesn't self-clear into a "reset in
+                                        * progress" bit of its own -- completion is signaled by
+                                        * WRC instead. */
 
 #define XHCI_PORTSC_CHANGE_BITS \
     (XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_WRC | XHCI_PORTSC_OCC | \
@@ -323,22 +328,33 @@ typedef struct __attribute__((packed)) xhci_trb {
 
 /* Default USB Speed ID values (sec 7.2.1, Table 7-13) -- the mapping every
  * port uses unless the Supported Protocol Capability defines custom
- * Protocol Speed ID entries, a USB3-only feature this driver's USB2-only
- * scope never needs to parse (see find_usb2_protocol() in xhci.c). */
+ * Protocol Speed ID entries (PSIC != 0 -- sec 7.2.2.1.1). This driver
+ * deliberately does not parse custom PSI tables (only relevant to
+ * SuperSpeedPlus/Gen2 dual-lane controllers advertising IDs beyond this
+ * default set): IDs 1-3 are spec-guaranteed to always keep this exact
+ * default meaning regardless of PSIC (custom tables only ever *add* IDs
+ * 4+, never redefine LS/FS/HS), and every xhci.c call site that cares
+ * whether a device is SuperSpeed-family (address_device()'s EP0 max-packet
+ * handling) tests `speed` against these three known-fixed IDs rather than
+ * assuming SuperSpeed is always exactly ID 4 -- so an unparsed custom PSI
+ * table degrades to "still correctly recognized as SuperSpeed-family",
+ * not silently misconfigured. */
 #define XHCI_SPEED_FULL  1U /* 12 Mbps */
 #define XHCI_SPEED_LOW   2U /* 1.5 Mbps */
 #define XHCI_SPEED_HIGH  3U /* 480 Mbps */
-#define XHCI_SPEED_SUPER 4U /* 5 Gbps -- USB3, out of this driver's scope */
+#define XHCI_SPEED_SUPER 4U /* 5 Gbps -- USB3 default Speed ID; see xhci_enumerate() */
 
 /* ---- Supported Protocol Capability (sec 7.2): maps a contiguous PORTSC
  * index range to a USB major revision (2 vs 3) and a Slot Type value
- * required by the Enable Slot Command. This driver only enumerates devices
- * on USB2-labeled port ranges (LS/FS/HS -- covers every Boot Protocol
- * keyboard); USB3-only ranges are logged and skipped (see docs/usb.md's
- * "no SuperSpeed enumeration" limitation). Capability layout: dword0 =
- * standard cap-ID/next-pointer header plus Minor/Major Revision; dword1 =
- * "USB " name string (unused here); dword2 = Compatible Port Offset/Count;
- * dword3 = Protocol Slot Type. */
+ * required by the Enable Slot Command. xhci_enumerate() (xhci.c) walks
+ * this once and enumerates both the USB2-labeled range (LS/FS/HS) and the
+ * USB3-labeled range (SuperSpeed) it finds; any *other* major revision
+ * (e.g. a future USB3.2-only capability entry some controllers split out
+ * separately) is logged and skipped -- this driver has no speed-specific
+ * behavior beyond the USB2/SuperSpeed split address_device() already
+ * makes. Capability layout: dword0 = standard cap-ID/next-pointer header
+ * plus Minor/Major Revision; dword1 = "USB " name string (unused here);
+ * dword2 = Compatible Port Offset/Count; dword3 = Protocol Slot Type. */
 #define XHCI_SUPPORTED_PROTOCOL_MAJOR(dw0)        (((uint32_t)(dw0) >> 24) & 0xFFU)
 #define XHCI_SUPPORTED_PROTOCOL_PORT_OFFSET(dw2)  ((uint32_t)(dw2) & 0xFFU)
 #define XHCI_SUPPORTED_PROTOCOL_PORT_COUNT(dw2)   (((uint32_t)(dw2) >> 8) & 0xFFU)
