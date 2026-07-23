@@ -2,6 +2,8 @@
 
 A from-scratch operating system kernel for the i686 (IA-32) architecture, written in C99 and x86 assembly. PureUNIX boots via GRUB (Multiboot1/2), provides a permission-aware, mount-table VFS over EXT2 and FAT16, runs ELF32 user programs in ring 3, and ships a modal text editor and an interactive shell with pipes and I/O redirection.
 
+<img width="640" height="428" alt="image" src="https://github.com/user-attachments/assets/2858314e-cb89-40e5-92ef-30a9047a90eb" />
+
 ---
 
 ## Features
