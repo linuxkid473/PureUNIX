@@ -39,6 +39,8 @@ This release marks the completion of a full graphical desktop environment with Q
 
 See commits `a4000ea` (PCManFM-Qt port), `1e8febc` (libfm-qt), and `64c61dd` (MenuCache) for details.
 
+<img width="640" height="428" alt="image" src="https://github.com/user-attachments/assets/2858314e-cb89-40e5-92ef-30a9047a90eb" />
+
 ---
 
 ## Features
