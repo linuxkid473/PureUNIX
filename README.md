@@ -2,6 +2,8 @@
 
 A complete from-scratch operating system kernel for the i686 (IA-32) architecture, written in C99 and x86 assembly. PureUNIX boots via GRUB (Multiboot1/2), provides a permission-aware, mount-table VFS over EXT2 and FAT16, runs ELF32 user programs in ring 3 with preemptive scheduling and multi-process job control, and ships a graphical window manager (PUDE), file manager, real network stack, and a growing ecosystem of real-world UNIX applications including SQLite, ncurses, htop, SDL2, Chocolate Doom, and Qt6.
 
+<img width="640" height="428" alt="image" src="https://github.com/user-attachments/assets/e118e4e2-9673-4286-8c20-69bb029f1ecc" />
+
 ---
 
 ## What Makes PureUNIX Unique
